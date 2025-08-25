@@ -1,0 +1,41 @@
+# ---- Python ----
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+
+# ---- Віртуальні середовища ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- Логи ----
+*.log
+
+# ---- Конфіг/секрети ----
+.env
+.env.*
+*.ini
+*.cfg
+*.json
+
+# ключові секрети
+service_account.json
+*.session
+*.session-journal
+*.sqlite3
+*.sqlite3-journal
+
+# ---- IDE ----
+.idea/
+.vscode/
+*.iml
+
+# ---- Системні файли ----
+.DS_Store
+Thumbs.db
