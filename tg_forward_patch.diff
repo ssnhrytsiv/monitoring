@@ -1,0 +1,155 @@
+*** Begin Patch
+*** Update File: tg_post_watchdog.py
+@@
+-import re
++import re
++import asyncio
++import random
+@@
+-from telethon.tl.types import Message, MessageEntityUrl, MessageEntityTextUrl
++from telethon.tl.types import Message, MessageEntityUrl, MessageEntityTextUrl
++try:
++    # Optional types used in forwarded-message support
++    from telethon.tl.types import PeerChannel, MessageFwdHeader
++except Exception:  # pragma: no cover
++    PeerChannel = None
++    MessageFwdHeader = None
++
++try:
++    # Flood wait handling (Telethon)
++    from telethon.errors.rpcerrorlist import FloodWaitError
++except Exception:  # pragma: no cover
++    class FloodWaitError(Exception):
++        def __init__(self, seconds=30): self.seconds = seconds
+@@
+ load_dotenv()
+@@
+ NEEDLE_TEXT: Optional[str] = None
+ NEEDLE_MODE: str = DEFAULT_MODE
+ NEEDLE_FUZZ: int = int(DEFAULT_FUZZ)
+
++# ---------------- forwarded-message helpers ----------------
++# Extract and normalize Telegram links from any message (including hidden hyperlinks)
++TG_LINK_RE = re.compile(r'(https?://t\.me/[^\s)]+)', re.IGNORECASE)
++
++def _norm_tg_link(url: str) -> Optional[str]:
++    """Normalize any t.me URL to a channel-style link when possible.
++    - https://t.me/username/123 -> https://t.me/username
++    - https://t.me/c/<id>/<msg> -> https://t.me/c/<id>
++    - https://t.me/+invite -> leave as is
++    - https://t.me/username -> as is
++    Returns None if not recognized.
++    """
++    if not url:
++        return None
++    u = url.strip()
++    if not u.lower().startswith("http"):
++        u = "https://" + u.lstrip("/")
++    m = re.match(r'https?://t\.me/([A-Za-z0-9_]+)/?\d*$', u)
++    if m:
++        return f"https://t.me/{m.group(1)}"
++    # internal private c/ links
++    m2 = re.match(r'https?://t\.me/c/(\d+)(/\d+)?$', u)
++    if m2:
++        return f"https://t.me/c/{m2.group(1)}"
++    # invite (+...)
++    if re.match(r'https?://t\.me/\+\w+', u):
++        return u
++    # plain username
++    if re.match(r'https?://t\.me/[A-Za-z0-9_]+$', u):
++        return u
++    return None
++
++def extract_tg_links_from_event(event) -> list:
++    """Collect ALL Telegram links from a message (text + hidden hyperlinks)."""
++    links = set()
++    raw = event.raw_text or ""
++
++    # 1) entities (visible urls + hidden hyperlinks)
++    msg = getattr(event, 'message', None)
++    entities = getattr(msg, 'entities', None) if msg else None
++    if entities:
++        for e in entities:
++            if isinstance(e, MessageEntityUrl):
++                try:
++                    s = raw[e.offset:e.offset + e.length]
++                    if 't.me/' in s:
++                        n = _norm_tg_link(s)
++                        if n: links.add(n)
++                except Exception:
++                    pass
++            elif isinstance(e, MessageEntityTextUrl):
++                url = getattr(e, 'url', '') or ''
++                if 't.me/' in url:
++                    n = _norm_tg_link(url)
++                    if n: links.add(n)
++
++    # 2) fallback: regex over raw text
++    for m in TG_LINK_RE.finditer(raw):
++        n = _norm_tg_link(m.group(1))
++        if n: links.add(n)
++
++    return list(links)
++
++# ---------------- handlers: forward-based link add & needle from reply ----------------
++
++@client.on(events.NewMessage(chats=[control_peer]))
++async def _fw_auto_add_links(event):
++    """When link-intake mode is active, forward any message containing t.me links and I'll add them."""
++    try:
++        active = getattr(MONITOR_BUFFER, 'active', False)
++    except NameError:
++        active = False
++    if not active:
++        return
++
++    links = extract_tg_links_from_event(event)
++    if not links:
++        return
++
++    added, skipped = [], []
++    for link in links:
++        try:
++            ok = await add_monitor_link(link)  # your existing util
++            if ok:
++                added.append(link)
++            else:
++                skipped.append(f"{link} (duplicate)")
++            await asyncio.sleep(random.uniform(0.6, 1.2))
++        except FloodWaitError as fw:
++            await event.reply(f"FLOOD_WAIT {fw.seconds}s — пауза на приєднання…")
++            await asyncio.sleep(fw.seconds + 2)
++        except Exception as e:
++            skipped.append(f"{link} (error: {e})")
++
++    lines = []
++    if added:
++        lines.append("✅ Додано:")
++        lines += [f" • {x}" for x in added]
++    if skipped:
++        lines.append("↪️ Пропущено:")
++        lines += [f" • {x}" for x in skipped]
++    if lines:
++        await event.reply("\n".join(lines))
++
++@client.on(events.NewMessage(pattern=r'^/_needle(\s|$)', chats=[control_peer]))
++async def needle_from_reply(event):
++    """Set NEEDLE from a replied/forwarded message (caption/text)."""
++    global NEEDLE_TEXT, NEEDLE_MODE, NEEDLE_FUZZ
++    if not event.is_reply:
++        return await event.reply("Зроби reply цією командою на потрібний пост (можна пересланий).\nНапр.: відповісти на пост і надіслати /_needle")
++
++    msg = await event.get_reply_message()
++    text = (getattr(msg, 'message', '') or '').strip()
++    if not text:
++        return await event.reply("У реплаї немає тексту/підпису. OCR не підтримуємо.")
++
++    NEEDLE_TEXT = text
++    NEEDLE_MODE = "exact_norm"
++    try:
++        NEEDLE_FUZZ = int(os.getenv("DEFAULT_FUZZ", "85"))
++    except Exception:
++        NEEDLE_FUZZ = 85
++    await event.reply(f"NEEDLE з пересланого. mode={NEEDLE_MODE}, fuzz={NEEDLE_FUZZ}, len={len(NEEDLE_TEXT)}")
++
+*** End Patch
