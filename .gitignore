@@ -39,3 +39,18 @@ service_account.json
 # ---- Системні файли ----
 .DS_Store
 Thumbs.db
+
+project_structure.txt
+repo_manifest.txt
+Архів.zip
+
+# Ігнор локальних артефактів
+.chat_sync_manifest.txt
+changes_ua_progress.diff
+post_watchdog.sqlite3
+tg_watchdog.service.example
+
+
+
+# Архіви
+*.zip
