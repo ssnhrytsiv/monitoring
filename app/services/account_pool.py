@@ -14,7 +14,9 @@ from telethon import TelegramClient
 from telethon.tl import types
 from telethon.tl.functions.channels import GetParticipantRequest
 
-log = logging.getLogger("services.account_pool")
+from app.logging_json import get_logger
+
+log = get_logger("services.account_pool")
 
 # ---------- env helpers ----------
 def _env(name: str, default: str = "") -> str:

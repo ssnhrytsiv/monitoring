@@ -1,13 +1,13 @@
 import re
 import asyncio
-import logging
 from telethon import events
 
 from app.services.membership_db import init as memb_init
 from app.services.link_queue import init as lq_init
 from app.flows.batch_links import process_links, run_link_queue_worker
+from app.logging_json import get_logger
 
-log = logging.getLogger("plugin.batch_links")
+log = get_logger("plugin.batch_links")
 
 _MONITOR_ENABLED = False
 _MONITOR_CHAT_ID = None

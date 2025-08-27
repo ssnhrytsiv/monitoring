@@ -2,9 +2,9 @@
 import os
 import random
 import asyncio
-import logging
+from app.logging_json import get_logger
 
-log = logging.getLogger("utils.throttle")
+log = get_logger("utils.throttle")
 
 def _f(name: str, default: str) -> float:
     try:

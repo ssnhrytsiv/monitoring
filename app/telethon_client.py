@@ -1,13 +1,13 @@
 # app/telethon_client.py
-import logging
 from types import SimpleNamespace
 from importlib import import_module
 import pkgutil
 
 from telethon import TelegramClient
 from app.config import API_ID, API_HASH, SESSION, CONTROL_PEER, PLUGINS_PACKAGE
+from app.logging_json import get_logger
 
-log = logging.getLogger("telethon_client")
+log = get_logger("telethon_client")
 
 client = TelegramClient(SESSION, API_ID, API_HASH)
 client.parse_mode = "html"

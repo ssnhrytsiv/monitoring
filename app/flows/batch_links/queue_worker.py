@@ -1,4 +1,3 @@
-import logging
 from typing import Optional
 
 from app.utils.throttle import throttle_between_links
@@ -13,8 +12,9 @@ from app.services.link_queue import (
     fetch_due as lq_fetch_due, mark_processing as lq_mark_processing,
     mark_done as lq_mark_done, mark_failed as lq_mark_failed,
 )
+from app.logging_json import get_logger
 
-log = logging.getLogger("flow.batch_links.worker")
+log = get_logger("flow.batch_links.worker")
 
 async def run_link_queue_worker(client):
     log.info("link_queue worker started")

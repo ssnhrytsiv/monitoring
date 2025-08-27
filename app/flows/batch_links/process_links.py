@@ -1,4 +1,3 @@
-import logging
 from typing import List, Optional
 
 from app.plugins.progress_live import DebouncedProgress
@@ -14,8 +13,9 @@ from app.services.membership_db import (
 )
 from app.services.link_queue import enqueue as lq_enqueue
 from .common import display_name
+from app.logging_json import get_logger
 
-log = logging.getLogger("flow.batch_links.process")
+log = get_logger("flow.batch_links.process")
 
 async def process_links(message, text: str):
     links = extract_links(text)
