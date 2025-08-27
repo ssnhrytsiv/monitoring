@@ -41,6 +41,17 @@ def _parse_accounts_env() -> List[str]:
 
 POOL_SESSIONS = _parse_accounts_env()
 
+# ---------- helpers ----------
+def _now() -> float:
+    return time.time()
+
+def _with_jitter(seconds: int | float, rel: float = 0.1, abs_max: float = 2.0) -> float:
+    """Невеликий джиттер, щоб рознести піки однотипних дій."""
+    import random
+    s = float(seconds)
+    jitter = min(abs_max, abs(s) * rel)
+    return max(0.0, s + random.uniform(-jitter, jitter))
+
 # ---------- structures ----------
 @dataclass
 class ClientSlot:
@@ -77,36 +88,59 @@ def _find_slot(obj: Union[TelegramClient, ClientSlot]) -> Optional[ClientSlot]:
             return s
     return None
 
-def _set_ready_after(slot: ClientSlot, seconds: int) -> None:
-    now = time.time()
-    until = now + max(0, int(seconds))
+def _set_ready_after(slot: ClientSlot, seconds: int | float) -> None:
+    now = _now()
+    until = now + max(0, float(seconds))
     if until > slot.next_ready:
         slot.next_ready = until
 
 def bump_cooldown(client: TelegramClient, seconds: int) -> None:
     """
     Короткий локальний кулдаун для клієнта (не FLOOD).
+    Додаємо невеликий jitter, щоб зменшити синхронні піки.
     """
     slot = _find_slot(client)
-    if not slot: return
-    _set_ready_after(slot, max(0, int(seconds)))
+    if not slot:
+        return
+    _set_ready_after(slot, _with_jitter(max(0, int(seconds))))
     log.debug("bump_cooldown: %s +%ss (ready @ %.0f)", slot.name, seconds, slot.next_ready)
 
-def mark_flood(client: TelegramClient, seconds: int) -> None:
+def mark_flood(
+    client: TelegramClient,
+    seconds: int,
+    *,
+    strategy: str = "hard",
+) -> None:
     """
     Позначає клієнт як "сплячий" через FLOOD_WAIT.
+
+    strategy:
+      - "hard" (за замовч.) — повний сон на `seconds` (використовувати із чергою, щоб слот реально випав з пулу)
+      - "soft"             — мʼякий локальний сон (≈20% від seconds, в межах 5..60 c),
+                             коли основний бекоф робить черга (link_queue)
     """
     slot = _find_slot(client)
-    if not slot: return
-    _set_ready_after(slot, max(0, int(seconds)))
-    log.warning("mark_flood: %s sleeps until %.0f (+%ss)", slot.name, slot.next_ready, seconds)
+    if not slot:
+        return
+
+    sec = max(0, int(seconds))
+    if strategy == "soft":
+        # Короткий локальний «охолоджувач»; черга робить реальний бекоф
+        sec = min(60, max(5, int(round(sec * 0.2))))
+
+    _set_ready_after(slot, _with_jitter(sec, rel=0.05, abs_max=3.0))
+    log.warning(
+        "mark_flood(%s): %s sleeps until %.0f (+%ss, strategy=%s)",
+        slot.name, slot.name, slot.next_ready, sec, strategy
+    )
 
 def mark_limit(client_or_slot: Union[TelegramClient, ClientSlot], days: int = 2) -> None:
     """
     Довгий "сон" при ліміті каналів (Too many channels).
     """
     slot = _find_slot(client_or_slot)
-    if not slot: return
+    if not slot:
+        return
     seconds = int(days * 86400)
     _set_ready_after(slot, seconds)
     log.warning("mark_limit: %s sleeps until %.0f (+%ss, ~%d days)", slot.name, slot.next_ready, seconds, days)
@@ -144,7 +178,9 @@ async def start_pool() -> None:
     """
     global _POOL
     if not POOL_SESSIONS:
-        log.info("Accounts pool is empty (ACCOUNTS not set)."); _POOL = []; return
+        log.info("Accounts pool is empty (ACCOUNTS not set).")
+        _POOL = []
+        return
     if not API_ID or not API_HASH:
         raise RuntimeError("API_ID/API_HASH must be set in .env for pool")
 
@@ -160,15 +196,20 @@ async def start_pool() -> None:
 
 async def stop_pool() -> None:
     for s in _POOL:
-        try: await s.client.disconnect()
-        except Exception: pass
-    _POOL.clear(); log.info("account_pool stopped")
+        try:
+            await s.client.disconnect()
+        except Exception:
+            pass
+    _POOL.clear()
+    log.info("account_pool stopped")
 
 def iter_pool_clients() -> List[ClientSlot]:
     """
-    Повертає знімок слотів пулу (read-only).
+    Повертає знімок *готових* слотів пулу (read-only).
+    Ті, що сплять (next_ready > now) або busy — не повертаємо.
     """
-    return list(_POOL)
+    now = _now()
+    return [s for s in _POOL if (not s.busy) and (s.next_ready <= now)]
 
 @asynccontextmanager
 async def _lease_ctx(slot: ClientSlot):
@@ -176,23 +217,28 @@ async def _lease_ctx(slot: ClientSlot):
     Контекст для позначки busy під час короткої «оренди» клієнта.
     """
     slot.busy = True
-    try: yield slot.client
-    finally: slot.busy = False
+    try:
+        yield slot.client
+    finally:
+        slot.busy = False
 
 async def lease() -> Optional[asyncio.AbstractAsyncContextManager]:
     """
     Видає async context manager з "найближчим" готовим клієнтом.
     Повертає None, якщо наразі *усі* сплять або зайняті.
     """
-    if not _POOL: return None
-    now = time.time()
+    if not _POOL:
+        return None
+    now = _now()
     async with _POOL_LOCK:
         n = len(_POOL); global _rr
         for k in range(n):
             idx = (_rr + k) % n
             s = _POOL[idx]
-            if s.busy: continue
-            if s.next_ready > now: continue
+            if s.busy:
+                continue
+            if s.next_ready > now:
+                continue
             _rr = (idx + 1) % n
             return _lease_ctx(s)
     return None
@@ -202,7 +248,8 @@ async def is_already_subscribed(url: str) -> Optional[str]:
     Перевіряє, чи хоча б один акаунт з пулу вже підписаний на канал (за url).
     Повертає session_name клієнта, якщо знайдено, інакше None.
     """
-    if not _POOL: return None
+    if not _POOL:
+        return None
     for slot in _POOL:
         try:
             client = slot.client

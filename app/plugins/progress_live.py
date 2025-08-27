@@ -1,3 +1,6 @@
+# app/plugins/progress_live.py
+from __future__ import annotations
+
 import os
 import asyncio
 from dataclasses import dataclass, field
@@ -6,11 +9,12 @@ def _env(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return v if v is not None else default
 
+
 @dataclass
 class DebouncedProgress:
     """
-    Редагує службове повідомлення лише коли є зміни,
-    і робить це із затримкою (debounce), щоб не ловити rate-limit.
+    «Живе» службове повідомлення з дебаунсом редагувань.
+    Текст відправляємо в HTML-режимі; переноси — через '\n'.
     """
     client: "TelegramClient"
     peer: int
@@ -28,7 +32,7 @@ class DebouncedProgress:
     flood: int = 0
     current: str = ""    # current url
     actor: str = ""      # session/slot label
-    footer: str = ""     # optional summary
+    footer: str = ""     # optional HTML summary (із fmt_summary)
 
     # internals
     _changed: bool = False
@@ -39,7 +43,12 @@ class DebouncedProgress:
     # ---- public API ----
     async def start(self) -> None:
         text = self._render(header_suffix="— стартую…")
-        m = await self.client.send_message(self.peer, text, link_preview=False)
+        m = await self.client.send_message(
+            self.peer,
+            text,
+            link_preview=False,
+            parse_mode="HTML",   # важливо: HTML-режим
+        )
         self.msg_id = m.id
         self._last_render = text
 
@@ -66,6 +75,7 @@ class DebouncedProgress:
         self._mark_changed()
 
     def set_footer(self, text: str) -> None:
+        # text — це HTML з переносами '\n' (наприклад, із fmt_summary)
         self.footer = text
         self._mark_changed()
 
@@ -104,26 +114,42 @@ class DebouncedProgress:
         if text == self._last_render:
             return
         try:
-            await self.client.edit_message(self.peer, self.msg_id, text, link_preview=False)
+            await self.client.edit_message(
+                self.peer,
+                self.msg_id,
+                text,
+                link_preview=False,
+                parse_mode="HTML",  # важливо: HTML-режим
+            )
             self._last_render = text
         except Exception:
-            pass  # не зупиняємо весь процес
+            # не валимо весь процес через помилку редагування
+            pass
 
     # ---- render ----
     def _render(self, header_suffix: str, final: bool = False) -> str:
         bar = self._bar(self.done, self.total, width=20)
+
+        # Верхня частина (рахунки) — звичайний текст із '\n'
+        header = (
+            f"📦 <b>{self.title}</b> {header_suffix}\n"
+            f"{bar}  {self.done}/{self.total}\n"
+            f"✔ <b>joined:</b> {self.ok}    "
+            f"🔁 <b>already:</b> {self.already}\n"
+            f"❌ <b>invalid/private/error:</b> {self.bad}    "
+            f"⏳ <b>flood:</b> {self.flood}"
+        )
+
         line_now = ""
         if not final and self.current:
             who = f" • {self.actor}" if self.actor else ""
             line_now = f"\n🔄 Зараз: {self.current}{who}"
+
+        # footer — це HTML-табличка-список, у якій рядки розділені '\n'
         footer = f"\n\n{self.footer}" if self.footer else ""
-        return (
-            f"📦 <b>{self.title}</b> {header_suffix}\n"
-            f"{bar}  {self.done}/{self.total}\n"
-            f"✔ <b>joined:</b> {self.ok}   🔁 <b>already:</b> {self.already}\n"
-            f"❌ <b>invalid/private/error:</b> {self.bad}   ⏳ <b>flood:</b> {self.flood}"
-            f"{line_now}{footer}"
-        )
+
+        # Без <pre> і без <br/> — усе працює через '\n' + parse_mode="HTML"
+        return f"{header}{line_now}{footer}"
 
     @staticmethod
     def _bar(done: int, total: int, width: int = 20) -> str:
