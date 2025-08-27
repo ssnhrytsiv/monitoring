@@ -1,33 +1,25 @@
 # main.py
 import asyncio
-import logging
 
 from app.telethon_client import client, load_plugins
-from app.config import LOG_LEVEL
 from app.services.account_pool import start_pool, stop_pool
+from app.logging_json import configure_logging, get_logger
 
 def setup_logging():
-    fmt = "[%(asctime)s] %(levelname)-8s %(name)s: %(message)s"
-    datefmt = "%H:%M:%S"
-    logging.basicConfig(
-        level=getattr(logging, LOG_LEVEL, logging.INFO),
-        format=fmt,
-        datefmt=datefmt
-    )
-    # Telethon дуже “шумний” на DEBUG, тому знижуємо до INFO
-    if LOG_LEVEL == "DEBUG":
-        logging.getLogger("telethon").setLevel(logging.INFO)
-
+    # Ініціалізуємо структуроване або plain логування згідно з env:
+    # LOG_JSON=1 -> JSON формат
+    # LOG_PLAIN_FIELDS=0 -> plain без key=value полів
+    configure_logging()
 
 async def _main():
     setup_logging()
-    log = logging.getLogger("main")
+    log = get_logger("main")
 
     log.info("Запускаю головний клієнт…")
     await client.start()
 
     log.info("Запускаю пул акаунтів…")
-    await start_pool()   # піднімає всі сесії з ACCOUNTS у .env
+    await start_pool()
 
     log.info("Завантажую плагіни…")
     await load_plugins()
