@@ -11,6 +11,9 @@ CREATE TABLE IF NOT EXISTS membership (
   account    TEXT    NOT NULL,
   status     TEXT    NOT NULL,   -- joined/already/requested/invalid/private/blocked/too_many
   ts         INTEGER NOT NULL,
+  attempt_count     INTEGER NOT NULL DEFAULT 0,
+  last_error_code   TEXT,
+  next_eligible_ts  INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (channel_id, account)
 );
 CREATE INDEX IF NOT EXISTS idx_membership_channel ON membership(channel_id);
@@ -41,7 +44,7 @@ def _conn():
 
 
 def init(db_path: Optional[str] = None):
-    """Створює таблиці (якщо їх ще нема)."""
+    """Створює таблиці (якщо їх ще нема) та мігрує існуючі."""
     global DB_PATH
     if db_path:
         DB_PATH = db_path
@@ -50,6 +53,24 @@ def init(db_path: Optional[str] = None):
             s = stmt.strip()
             if s:
                 c.execute(s)
+        
+        # Migration: Add new columns to existing membership table if they don't exist
+        _migrate_membership_table(c)
+
+
+def _migrate_membership_table(c):
+    """Add new columns to membership table if they don't exist."""
+    # Check if columns exist
+    cursor = c.execute("PRAGMA table_info(membership)")
+    columns = [row[1] for row in cursor.fetchall()]
+    
+    # Add missing columns
+    if 'attempt_count' not in columns:
+        c.execute("ALTER TABLE membership ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0")
+    if 'last_error_code' not in columns:
+        c.execute("ALTER TABLE membership ADD COLUMN last_error_code TEXT")  
+    if 'next_eligible_ts' not in columns:
+        c.execute("ALTER TABLE membership ADD COLUMN next_eligible_ts INTEGER NOT NULL DEFAULT 0")
 
 
 # ---------- membership (пер-акаунтний стан у каналі) ----------
@@ -81,6 +102,44 @@ def any_final_for_channel(channel_id: int) -> Optional[str]:
         )
         row = cur.fetchone()
         return row[0] if row else None
+
+
+# ---------- scheduling helper functions ----------
+
+def upsert_membership_with_retry(account: str, channel_id: int, status: str, 
+                                attempt_count: int = 0, last_error_code: Optional[str] = None, 
+                                next_eligible_ts: int = 0):
+    """Extended upsert with retry metadata for scheduling system."""
+    with _conn() as c:
+        c.execute(
+            """INSERT OR REPLACE INTO membership(channel_id, account, status, ts, attempt_count, last_error_code, next_eligible_ts) 
+               VALUES (?,?,?,?,?,?,?)""",
+            (int(channel_id), account, status, int(time.time()), attempt_count, last_error_code, next_eligible_ts),
+        )
+
+
+def get_membership_with_retry(account: str, channel_id: int) -> Optional[tuple[str, int, Optional[str], int]]:
+    """Get membership status with retry metadata. Returns (status, attempt_count, last_error_code, next_eligible_ts)."""
+    with _conn() as c:
+        cur = c.execute(
+            """SELECT status, attempt_count, last_error_code, next_eligible_ts 
+               FROM membership WHERE channel_id=? AND account=? LIMIT 1""",
+            (int(channel_id), account),
+        )
+        row = cur.fetchone()
+        return (row[0], row[1], row[2], row[3]) if row else None
+
+
+def increment_attempt_count(account: str, channel_id: int, error_code: Optional[str] = None, 
+                           next_eligible_ts: int = 0):
+    """Increment attempt count and update retry metadata."""
+    with _conn() as c:
+        c.execute(
+            """UPDATE membership 
+               SET attempt_count = attempt_count + 1, last_error_code = ?, next_eligible_ts = ?
+               WHERE channel_id = ? AND account = ?""",
+            (error_code, next_eligible_ts, int(channel_id), account),
+        )
 
 
 # ---------- invite_map (інвайт-хеш → channel_id) ----------

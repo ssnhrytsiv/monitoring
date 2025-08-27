@@ -35,3 +35,17 @@ PLUGINS_PACKAGE = "app.plugins"
 
 # logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# Scheduling & Rate Limiting (Step 1)
+NEW_SCHEDULER_ENABLED = os.getenv("NEW_SCHEDULER_ENABLED", "false").lower() in ("1", "true", "yes")
+
+# Rate limiting configuration
+RATE_LIMIT_GLOBAL_DEFAULTS = {
+    "join": {"rate": 0.3, "capacity": 2},
+    "resolve": {"rate": 1.0, "capacity": 5},
+    "fetch_info": {"rate": 2.0, "capacity": 10},
+}
+
+RATE_LIMIT_ACCOUNT_DEFAULTS = {
+    "default": {"rate": 0.2, "capacity": 1}
+}
