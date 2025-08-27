@@ -35,3 +35,5 @@ PLUGINS_PACKAGE = "app.plugins"
 
 # logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_JSON = os.getenv("LOG_JSON", "").lower() in ("1", "true", "yes", "on")
+LOG_PLAIN_FIELDS = os.getenv("LOG_PLAIN_FIELDS", "1").lower() not in ("0", "false", "no", "off")
