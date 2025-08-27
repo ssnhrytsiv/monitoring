@@ -50,7 +50,7 @@ changes_ua_progress.diff
 post_watchdog.sqlite3
 tg_watchdog.service.example
 
-
+*.patch
 
 # Архіви
 *.zip
