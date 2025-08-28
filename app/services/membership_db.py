@@ -2,6 +2,7 @@ import os, sqlite3, time
 from typing import Optional
 
 DB_PATH = os.getenv("DB_PATH", "post_watchdog.sqlite3")
+BAD_INVITE_TTL_HOURS = int(os.getenv("BAD_INVITE_TTL_HOURS", "48"))
 
 DDL = """
 PRAGMA journal_mode=WAL;
@@ -28,6 +29,15 @@ CREATE TABLE IF NOT EXISTS url_cache (
   ts     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_urlcache_status ON url_cache(status);
+
+-- Persistent negative invite cache
+CREATE TABLE IF NOT EXISTS invite_bad (
+  invite_hash TEXT PRIMARY KEY,
+  status      TEXT    NOT NULL,  -- invalid/private/requested
+  ts          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_invite_bad_status ON invite_bad(status);
+CREATE INDEX IF NOT EXISTS idx_invite_bad_ts ON invite_bad(ts);
 """
 
 FINAL_GLOBAL = ("joined", "already", "requested", "invalid", "private")
@@ -103,15 +113,69 @@ def map_invite_get(invite_hash: str) -> Optional[int]:
 # ---------- url_cache (коли немає channel_id, але вже є фінальний статус по URL) ----------
 
 def url_put(url: str, status: str):
+    from app.utils.link_parser import normalize_url
+    normalized_url = normalize_url(url)
     with _conn() as c:
         c.execute(
             "INSERT OR REPLACE INTO url_cache(url,status,ts) VALUES (?,?,?)",
-            (url, status, int(time.time()))
+            (normalized_url, status, int(time.time()))
         )
 
 
 def url_get(url: str) -> Optional[str]:
+    from app.utils.link_parser import normalize_url
+    normalized_url = normalize_url(url)
     with _conn() as c:
-        cur = c.execute("SELECT status FROM url_cache WHERE url=? LIMIT 1", (url,))
+        cur = c.execute("SELECT status FROM url_cache WHERE url=? LIMIT 1", (normalized_url,))
         row = cur.fetchone()
         return row[0] if row else None
+
+
+# ---------- invite_bad (persistent negative invite cache) ----------
+
+def bad_invite_get(invite_hash: str) -> Optional[str]:
+    """
+    Get cached negative status for an invite hash.
+    Returns None if not found or expired.
+    """
+    if not invite_hash:
+        return None
+        
+    ttl_seconds = BAD_INVITE_TTL_HOURS * 3600
+    min_ts = int(time.time()) - ttl_seconds
+    
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT status FROM invite_bad WHERE invite_hash=? AND ts >= ? LIMIT 1", 
+            (invite_hash.lower(), min_ts)
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def bad_invite_put(invite_hash: str, status: str):
+    """
+    Cache negative status for an invite hash.
+    Status should be one of: invalid, private, requested
+    """
+    if not invite_hash or status not in ("invalid", "private", "requested"):
+        return
+        
+    with _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO invite_bad(invite_hash, status, ts) VALUES (?,?,?)",
+            (invite_hash.lower(), status, int(time.time()))
+        )
+
+
+def prune_bad_invites():
+    """
+    Remove expired entries from invite_bad table.
+    """
+    ttl_seconds = BAD_INVITE_TTL_HOURS * 3600
+    min_ts = int(time.time()) - ttl_seconds
+    
+    with _conn() as c:
+        cur = c.execute("DELETE FROM invite_bad WHERE ts < ?", (min_ts,))
+        deleted = cur.rowcount
+        return deleted
