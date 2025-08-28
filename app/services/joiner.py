@@ -14,16 +14,23 @@ log = logging.getLogger("services.joiner")
 
 def _extract_invite_hash(url: str) -> str | None:
     """
-    Витягує інвайт-хеш із URL (формати t.me/+HASH або .../joinchat/HASH).
-    Повертає None, якщо не схоже.
+    Надійно дістає invite-hash з:
+      • https://t.me/+XXXXXXXX
+      • https://t.me/joinchat/XXXXXXXX
+      • або повертає None, якщо це не інвайт.
+    Терпимо до зайвих пробілів/небачимих символів.
     """
+    if not url:
+        return None
+    s = str(url)
+    # прибираємо типові невидимі артефакти копіпаста
+    s = s.replace("\u200b", "").replace("\u200e", "").replace("\u200f", "")
+    s = s.strip()
     try:
-        if not url:
-            return None
-        if ("/+" in url) or ("joinchat" in url):
-            part = url.rstrip("/").split("")[-1]
-            part = part.replace("+", "")
-            return part or None
+        import re
+        m = re.search(r"(?:t\.me/(?:\+|joinchat/))([A-Za-z0-9_-]{5,128})", s)
+        if m:
+            return m.group(1)
         return None
     except Exception:
         return None
@@ -31,7 +38,7 @@ def _extract_invite_hash(url: str) -> str | None:
 def _plausible_invite_hash(h: str | None) -> bool:
     """
     Дуже легка локальна перевірка “схожості” на валідний інвайт-хеш, без API:
-      - тільки A-Za-z0-9_-,
+      - тільки A-Za-z0-9_- ,
       - довжина 16..64.
     """
     if not h:
@@ -52,6 +59,7 @@ async def probe_channel_id(client, url: str):
     """
     invite_hash = _extract_invite_hash(url)
     if invite_hash:
+        log.debug("probe_channel_id: invite detected (no-api) hash=%s url=%s", invite_hash, url)
         # 0) локальна форма
         if not _plausible_invite_hash(invite_hash):
             log.debug("probe_channel_id: invite hash looks invalid (local) %s", invite_hash)
@@ -65,15 +73,20 @@ async def probe_channel_id(client, url: str):
         except Exception:
             pass
 
-        # 2) більше нічого (нема мережевих викликів)
+        # 3) Більше *нічого* не робимо на probe (жодних API).
         return None, None, "invite", invite_hash
 
-    # public
+    # 3) public / username / прямий t.me/channel
     try:
-        s = (url or "").strip()
+        # Захист від хибнопозитивів: якщо це схоже на інвайт посилання, НЕ ліземо в get_entity
+        s = (url or "").replace("\u200b", "").replace("\u200e", "").replace("\u200f", "").strip()
+        if "t.me/+" in s or "joinchat/" in s:
+            log.debug("probe_channel_id: forced invite-path (guard) url=%s", url)
+            return None, None, "public", None
+        # Для публічних теж робимо мінімальну фільтрацію форми.
         if not s or " " in s:
             return None, None, "public", None
-        # TODO throttle_probe if/when introduced
+        await throttle_probe(url)
         log.debug("probe_channel_id: get_entity for %s", url)
         ent = await client.get_entity(url)
         cid = int(getattr(ent, "id", 0) or 0)
