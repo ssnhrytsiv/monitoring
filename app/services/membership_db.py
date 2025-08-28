@@ -28,28 +28,11 @@ CREATE TABLE IF NOT EXISTS url_cache (
   ts     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_urlcache_status ON url_cache(status);
-
--- Negative cache для інвайтів (невиправні або остаточно оброблені причини)
-CREATE TABLE IF NOT EXISTS invite_bad (
-  invite_hash TEXT PRIMARY KEY,
-  reason      TEXT NOT NULL,     -- invalid/expired/private/blocked/too_many/requested
-  ts          INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_invite_bad_reason ON invite_bad(reason);
 """
 
 FINAL_GLOBAL = ("joined", "already", "requested", "invalid", "private")
 FINAL_PER_ACC = ("joined", "already", "requested", "invalid", "private", "blocked", "too_many")
 
-# Причини які кешуються як остаточно негативні для інвайту
-NEGATIVE_INVITE_REASONS = (
-    "invalid",
-    "expired",
-    "private",
-    "blocked",
-    "too_many",
-    "requested",  # запит залишено на модерацію — вважаємо остаточним для URL
-)
 
 def _conn():
     c = sqlite3.connect(DB_PATH)
@@ -130,38 +113,5 @@ def url_put(url: str, status: str):
 def url_get(url: str) -> Optional[str]:
     with _conn() as c:
         cur = c.execute("SELECT status FROM url_cache WHERE url=? LIMIT 1", (url,))
-        row = cur.fetchone()
-        return row[0] if row else None
-
-
-# ---------- invite_bad (negative invite cache) ----------
-
-def invite_bad_add(invite_hash: str, reason: str):
-    """
-    Заносить інвайт у negative cache, якщо reason у NEGATIVE_INVITE_REASONS.
-    Повторні вставки оновлюють timestamp.
-    """
-    if reason not in NEGATIVE_INVITE_REASONS:
-        return
-    if not invite_hash:
-        return
-    with _conn() as c:
-        c.execute(
-            "INSERT OR REPLACE INTO invite_bad(invite_hash,reason,ts) VALUES (?,?,?)",
-            (invite_hash, reason, int(time.time()))
-        )
-
-
-def invite_bad_get(invite_hash: str) -> Optional[str]:
-    """
-    Повертає reason, якщо інвайт у negative cache. Інакше None.
-    """
-    if not invite_hash:
-        return None
-    with _conn() as c:
-        cur = c.execute(
-            "SELECT reason FROM invite_bad WHERE invite_hash=? LIMIT 1",
-            (invite_hash,)
-        )
         row = cur.fetchone()
         return row[0] if row else None
