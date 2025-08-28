@@ -2,6 +2,7 @@ import logging
 from typing import Optional
 
 from app.utils.throttle import throttle_between_links
+from app.utils.link_parser import normalize_url
 from app.services.joiner import probe_channel_id, ensure_join
 from app.services.account_pool import (
     iter_pool_clients, mark_flood, mark_limit, session_name as _session_name,
@@ -30,10 +31,13 @@ async def run_link_queue_worker(client):
 
             for item_id, url, tries, origin_chat, origin_msg in items:
                 lq_mark_processing(item_id)
+                
+                # Normalize URL for consistent caching
+                normalized_url = normalize_url(url)
 
                 channel_id: Optional[int] = None
                 try:
-                    cid, _, _, _ = await probe_channel_id(getattr(slots_now[0], "client", slots_now[0]), url)
+                    cid, _, _, _ = await probe_channel_id(getattr(slots_now[0], "client", slots_now[0]), normalized_url)
                     channel_id = cid
                 except Exception:
                     channel_id = None
@@ -43,7 +47,7 @@ async def run_link_queue_worker(client):
                     if final:
                         lq_mark_done(item_id); continue
                 else:
-                    ust = url_get(url)
+                    ust = url_get(normalized_url)
                     if ust in ("joined","already","requested","invalid","private"):
                         lq_mark_done(item_id); continue
 
@@ -63,7 +67,7 @@ async def run_link_queue_worker(client):
                         if acc_status in ("joined","already","requested","invalid","private","blocked","too_many"):
                             continue
 
-                    status, title, kind, cid_after, _ = await ensure_join(cli, url)
+                    status, title, kind, cid_after, _ = await ensure_join(cli, normalized_url)
                     last_kind = kind
                     cid_eff = channel_id or cid_after
 
@@ -71,12 +75,12 @@ async def run_link_queue_worker(client):
                         upsert_membership(who, cid_eff, status)
 
                     if cid_eff is None and status in ("joined","already","requested","invalid","private"):
-                        url_put(url, status)
+                        url_put(normalized_url, status)
 
                     if status in ("already","joined","requested","invalid","private"):
                         lq_mark_done(item_id)
                         processed = True
-                        await throttle_between_links(last_kind, url)
+                        await throttle_between_links(last_kind, normalized_url)
                         break
                     elif status == "blocked":
                         continue

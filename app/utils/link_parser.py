@@ -145,13 +145,17 @@ def extract_invite_hash(url: str) -> str:
             parts = url.split("/")
             for i, part in enumerate(parts):
                 if part.lower() == "joinchat" and i + 1 < len(parts):
-                    return parts[i + 1].strip()
+                    hash_part = parts[i + 1].strip()
+                    # Clean up query parameters and fragments
+                    hash_part = hash_part.split('?')[0].split('#')[0]
+                    return hash_part
         
         # Handle +hash format
         if "/+" in url:
             hash_part = url.split("/+", 1)[1]
-            # Remove any trailing junk
-            return hash_part.split()[0].rstrip(".,;:!?)")
+            # Remove any trailing junk including query params
+            hash_part = hash_part.split('?')[0].split('#')[0].split()[0].rstrip(".,;:!?)")
+            return hash_part
             
     except Exception:
         pass

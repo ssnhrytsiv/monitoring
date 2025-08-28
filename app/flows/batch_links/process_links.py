@@ -2,7 +2,7 @@ import logging
 from typing import List, Optional
 
 from app.plugins.progress_live import DebouncedProgress
-from app.utils.link_parser import extract_links
+from app.utils.link_parser import extract_links, normalize_url
 from app.utils.throttle import throttle_between_links
 from app.utils.formatting import fmt_result_line, fmt_summary
 from app.services.joiner import probe_channel_id, ensure_join
@@ -18,7 +18,10 @@ from .common import display_name
 log = logging.getLogger("flow.batch_links.process")
 
 async def process_links(message, text: str):
-    links = extract_links(text)
+    # Extract and normalize ALL URLs upfront for consistent caching
+    raw_links = extract_links(text)  # This now returns normalized URLs
+    links = [normalize_url(url) for url in raw_links]  # Ensure normalization
+    
     if not links:
         await message.reply("❌ Посилань не знайдено")
         return
@@ -33,7 +36,7 @@ async def process_links(message, text: str):
         total=len(links),
     )
     await progress.start()
-    log.info("batch start: raw=%d uniq=%d", len(links), len(set(links)))
+    log.info("batch start: raw=%d normalized=%d uniq=%d", len(raw_links), len(links), len(set(links)))
 
     probe_client = None
     slots_probe = list(iter_pool_clients())
