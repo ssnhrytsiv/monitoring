@@ -2,6 +2,7 @@ import re
 import asyncio
 import logging
 from telethon import events
+from telethon.tl import types as ttypes  # для перевірки entities/markup
 
 from app.services.membership_db import init as memb_init
 from app.services.link_queue import init as lq_init
@@ -12,6 +13,7 @@ log = logging.getLogger("plugin.batch_links")
 _MONITOR_ENABLED = False
 _MONITOR_CHAT_ID = None
 _CONTROL_PEER_ID = None
+
 
 def setup(client, control_peer=None, monitor_buffer=None, **kwargs):
     global _CONTROL_PEER_ID
@@ -48,6 +50,7 @@ def setup(client, control_peer=None, monitor_buffer=None, **kwargs):
 
     @client.on(events.NewMessage())
     async def _msg(evt):
+        # фільтри доступу/режиму
         if _CONTROL_PEER_ID is not None and evt.chat_id != _CONTROL_PEER_ID:
             return
         if not _MONITOR_ENABLED:
@@ -55,14 +58,48 @@ def setup(client, control_peer=None, monitor_buffer=None, **kwargs):
         if _MONITOR_CHAT_ID is not None and evt.chat_id != _MONITOR_CHAT_ID:
             return
 
+        msg = evt.message
         text = evt.raw_text or ""
-        if re.search(r"https?://t\.me/", text) or re.search(r"(?:^|\s)@\w+", text):
-            try:
-                await process_links(evt.message, text)  # живе редаговане повідомлення всередині
-            except Exception as e:
-                log.exception("batch_links error: %s", e)
-                await evt.reply(f"⚠️ Помилка обробки: {e}")
 
+        # 1) Посилання з тексту
+        has_text_link = bool(
+            re.search(r"https?://t\.me/", text, flags=re.IGNORECASE)
+            or re.search(r"(?:^|\s)@[A-Za-z0-9_]{3,}", text)
+        )
+
+        # 2) Приховані посилання у гіпертексті (MessageEntityTextUrl)
+        ents = getattr(msg, "entities", None) or []
+        has_entity_link = any(isinstance(e, ttypes.MessageEntityTextUrl) for e in ents)
+
+        # 3) URL у кнопках (inline/reply markup)
+        markup = getattr(msg, "reply_markup", None)
+        has_markup_url = False
+        try:
+            if isinstance(markup, (ttypes.ReplyInlineMarkup, ttypes.ReplyKeyboardMarkup)):
+                rows = getattr(markup, "rows", []) or []
+                for row in rows:
+                    for btn in getattr(row, "buttons", []) or []:
+                        if hasattr(btn, "url") and getattr(btn, "url", None):
+                            has_markup_url = True
+                            break
+                    if has_markup_url:
+                        break
+        except Exception:
+            # не валимо хендлер через екзотику в markup
+            pass
+
+        # Якщо взагалі немає жодного типу посилань — ігноруємо
+        if not (has_text_link or has_entity_link or has_markup_url):
+            return
+
+        try:
+            # Передаємо msg, щоб process_links мав доступ до entities/markup
+            await process_links(msg, text)
+        except Exception as e:
+            log.exception("batch_links error: %s", e)
+            await evt.reply(f"⚠️ Помилка обробки: {e}")
+
+    # воркер черги
     try:
         client.loop.create_task(run_link_queue_worker(client))
     except Exception:

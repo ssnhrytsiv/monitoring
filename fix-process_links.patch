@@ -1,0 +1,64 @@
+diff --git a/app/flows/batch_links/process_links.py b/app/flows/batch_links/process_links.py
+index 2f3d7b1..a3c51d2 100644
+--- a/app/flows/batch_links/process_links.py
++++ b/app/flows/batch_links/process_links.py
+@@ -1,6 +1,7 @@
+ import logging
+ import asyncio
+ from typing import List, Optional
++
+ from app.plugins.progress_live import DebouncedProgress
+ from app.utils.link_parser import extract_links
+ from app.utils.throttle import throttle_between_links
+@@ -16,6 +17,13 @@
+ from .common import display_name
+
+ log = logging.getLogger("flow.batch_links.process")
++
++# Коротка локальна пауза для кейсів без мережевих дій (кеш/дублі/скип).
++async def _short_pause():
++    try:
++        await asyncio.sleep(0.08)  # ~80 ms, щоб не “забивати” цикл
++    except Exception:
++        pass
+
+
+ async def process_links(message, text: str):
+@@ -57,7 +65,7 @@
+             results.append(fmt_result_line(idx, url, "duplicate"))
+             progress.add_status("already")
+-            await throttle_between_links(None, url)
++            await _short_pause()
+             continue
+         used.add(url)
+
+@@ -79,7 +87,7 @@
+                 results.append(fmt_result_line(idx, url, "cached", extra=final))
+                 progress.add_status("already" if final in ("joined", "already") else "invalid")
+-                await throttle_between_links(None, url)
++                await _short_pause()
+                 continue
+         else:
+             # ---- 4) Якщо є фінальний статус по URL — скипаємо (без мережі)
+@@ -88,7 +96,7 @@
+                 results.append(fmt_result_line(idx, url, "cached", extra=ust))
+                 progress.add_status("already" if ust in ("joined", "already") else "invalid")
+-                await throttle_between_links(None, url)
++                await _short_pause()
+                 continue
+
+         # ---- 5) Нема вільних клієнтів — додаємо решту у чергу та завершуємо
+@@ -224,7 +232,12 @@
+         results.append(line)
+
+         # ---- 7) Тротлінг між елементами:
+-        await throttle_between_links(last_kind, url)
++        # Якщо був реальний мережевий крок (last_kind встановлено) — нормальний тротл.
++        # Якщо ні (всі гілки кеш/дубль/скип) — коротка пауза.
++        if last_kind:
++            await throttle_between_links(last_kind, url)
++        else:
++            await _short_pause()
+
+     await progress.finish(footer=fmt_summary(results[-10:]))
+     log.info("batch done: total=%d uniq=%d", len(links), len(set(links)))
