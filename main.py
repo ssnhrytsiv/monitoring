@@ -4,7 +4,7 @@ from app.telethon_client import client, load_plugins
 from app.services.account_pool import start_pool, stop_pool
 from app.logging_json import configure_logging, get_logger
 from app.services.post_watch_db import init as postwatch_init  # ⇦ додано
-
+from app.services import channel_db
 
 def setup_logging():
     # Ініціалізуємо структуроване або plain логування згідно з env:
@@ -24,6 +24,8 @@ async def _main():
         log.error("post_watch_db init failed: %s", e)
         raise
 
+    log.info("Ініціалізую БД…")
+    channel_db.init()  # <— ДОДАНО
     log.info("Запускаю головний клієнт…")
     await client.start()
 

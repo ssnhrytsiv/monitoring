@@ -1,4 +1,3 @@
-# app/telethon_client.py
 import logging
 from types import SimpleNamespace
 from importlib import import_module
@@ -14,14 +13,13 @@ client.parse_mode = "html"
 
 # Shared state
 MONITOR_BUFFER = SimpleNamespace(
-    active=False,             # batch-links intake toggle
-    collected_links=set(),    # normalized links collected during intake
-    needle=None,              # captured needle text
-    monitors=[],              # list of active monitor dicts
+    active=False,
+    collected_links=set(),
+    needle=None,
+    monitors=[],
 )
 
 async def load_plugins():
-    # resolve CONTROL_PEER -> numeric peer_id if possible
     control_id = None
     if CONTROL_PEER:
         try:
@@ -30,15 +28,31 @@ async def load_plugins():
         except Exception as e:
             log.warning("Can't resolve CONTROL_PEER=%r: %s. Handlers will accept any chat.", CONTROL_PEER, e)
 
+    log.debug("Loading plugins from package: %s", PLUGINS_PACKAGE)
     package = import_module(PLUGINS_PACKAGE)
-    for _, modname, ispkg in pkgutil.iter_modules(package.__path__):
-        if ispkg or modname.startswith("_"):
+
+    discovered = []
+    for modinfo in pkgutil.iter_modules(package.__path__):
+        name = modinfo.name
+        ispkg = modinfo.ispkg
+        log.debug("Discovered plugin candidate: %s (ispkg=%s)", name, ispkg)
+        if ispkg or name.startswith("_"):
             continue
+        discovered.append(name)
+
+    log.debug("Filtered plugin module list: %s", discovered)
+
+    for modname in discovered:
         full = f"{PLUGINS_PACKAGE}.{modname}"
         try:
+            log.debug("Importing plugin module: %s", full)
             mod = import_module(full)
-            if hasattr(mod, "setup"):
-                mod.setup(client=client, control_peer=control_id, monitor_buffer=MONITOR_BUFFER)
+            setup_fn = getattr(mod, "setup", None)
+            if callable(setup_fn):
+                log.debug("Calling setup() of %s with kwargs (control_peer=%s, monitor_buffer=...)", full, control_id)
+                setup_fn(client=client, control_peer=control_id, monitor_buffer=MONITOR_BUFFER)
                 log.info("Loaded plugin: %s", full)
+            else:
+                log.debug("Module %s has no setup() – skipped", full)
         except Exception as e:
             log.exception("Failed to load plugin %s: %s", full, e)
