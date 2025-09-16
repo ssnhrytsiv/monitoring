@@ -145,40 +145,39 @@ async def ensure_join(client, url: str):
                 except Exception:
                     who = None
                 if who:
-                    # ми вже учасник — нічого не імпортуємо
+                    log.debug("ensure_join(invite): already member via %s; invite=%s, cid=%s",
+                              who, invite_hash, cid_cached)
                     invite_status_put(invite_hash, "already")
                     return "already", (title_cached or None), "invite", int(cid_cached), invite_hash
 
             # --- КРОК 0b: перевірка кешу статусу по invite_hash (без API)
             st = invite_status_get(invite_hash)
             if st in ("invalid", "private", "requested", "already", "joined", "blocked", "too_many"):
-                # Якщо є channel_id в карті — повернемо його; якщо ні — повернемо None
                 cid_known, title_known = map_invite_get(invite_hash)
+                log.debug("ensure_join(invite): cached status=%s invite=%s cid=%s", st, invite_hash, cid_known)
                 return st, (title_known or None), "invite", (int(cid_known) if cid_known else None), invite_hash
 
             # --- КРОК 1: реальна спроба приєднатися
-            log.debug("ensure_join: ImportChatInviteRequest for %s", url)
+            log.debug("ensure_join(invite): ImportChatInviteRequest invite=%s", invite_hash)
             await throttle_invite()
             try:
                 updates = await client(ImportChatInviteRequest(invite_hash))
             except FloodWaitError as e:
-                log.warning(
-                    "FLOOD in ensure_join(ImportChatInviteRequest): url=%s seconds=%s",
-                    url, e.seconds
-                )
+                log.warning("FLOOD ensure_join(ImportChatInviteRequest): invite=%s seconds=%s", invite_hash, e.seconds)
                 raise
 
-            # ДЕФЕНСИВНО: якщо апдейт без chats (join request flow) — вважаємо як 'requested'
             chats = getattr(updates, "chats", None)
             if not chats:
+                # join request flow → нас ще не прийняли
                 try:
                     invite_status_put(invite_hash, "requested")
                 except Exception:
                     pass
+                log.info("ensure_join(invite): sent join request invite=%s -> requested", invite_hash)
                 return "requested", None, "invite", None, invite_hash
 
-            ch = chats[0] if chats else None
-            cid = int(ch.id) if ch else None
+            ch = chats[0]
+            cid = int(getattr(ch, "id", 0) or 0) or None
             title = getattr(ch, "title", "?") if ch else "?"
 
             if invite_hash and cid:
@@ -187,7 +186,7 @@ async def ensure_join(client, url: str):
                     invite_status_put(invite_hash, "joined")
                 except Exception:
                     pass
-
+            log.info("ensure_join(invite): joined invite=%s cid=%s title=%r", invite_hash, cid, title)
             return "joined", title, "invite", cid, invite_hash
 
         # --- публічний канал/чат ---
@@ -197,50 +196,66 @@ async def ensure_join(client, url: str):
         await throttle_public()
         try:
             await client(JoinChannelRequest(ent))
-            # публічний сценарій — статуса інвайту немає
-            return "joined", getattr(ent, "title", "?"), "public", int(getattr(ent, "id", 0) or 0), invite_hash
+            title = getattr(ent, "title", "?")
+            cid = int(getattr(ent, "id", 0) or 0) or None
+            log.info("ensure_join(public): joined url=%s cid=%s title=%r", url, cid, title)
+            return "joined", title, "public", cid, invite_hash
         except UserAlreadyParticipantError:
-            return "already", getattr(ent, "title", None), "public", int(getattr(ent, "id", 0) or 0), invite_hash
+            title = getattr(ent, "title", None)
+            cid = int(getattr(ent, "id", 0) or 0) or None
+            log.debug("ensure_join(public): already url=%s cid=%s title=%r", url, cid, title)
+            return "already", title, "public", cid, invite_hash
 
     # ---- обробка винятків ----
     except InviteRequestSentError:
         if is_invite and invite_hash:
             invite_status_put(invite_hash, "requested")
+        log.info("ensure_join(invite): InviteRequestSentError invite=%s -> requested", invite_hash)
         return "requested", None, "invite", None, invite_hash
-
 
     except UserAlreadyParticipantError:
         if is_invite and invite_hash:
             invite_status_put(invite_hash, "already")
-        return "already", None, "invite" if is_invite else "public", None, invite_hash
+        kind = "invite" if is_invite else "public"
+        log.debug("ensure_join(%s): UserAlreadyParticipantError -> already", kind)
+        return "already", None, kind, None, invite_hash
 
     except (InviteHashInvalidError, InviteHashExpiredError, UsernameNotOccupiedError):
         if is_invite and invite_hash:
             invite_status_put(invite_hash, "invalid")
-        return "invalid", None, "invite" if is_invite else "public", None, invite_hash
+        kind = "invite" if is_invite else "public"
+        log.debug("ensure_join(%s): invalid/expired/not_occupied", kind)
+        return "invalid", None, kind, None, invite_hash
 
     except ChannelPrivateError:
         if is_invite and invite_hash:
             invite_status_put(invite_hash, "private")
-        return "private", None, "invite" if is_invite else "public", None, invite_hash
+        kind = "invite" if is_invite else "public"
+        log.debug("ensure_join(%s): ChannelPrivateError -> private", kind)
+        return "private", None, kind, None, invite_hash
 
     except FloodWaitError as e:
-        # FLOOD — це тимчасово, у кеш як фінальний не пишемо
-        return f"flood_wait_{e.seconds}", None, "invite" if is_invite else "public", None, invite_hash
+        kind = "invite" if is_invite else "public"
+        log.warning("ensure_join(%s): FloodWaitError %ss", kind, e.seconds)
+        return f"flood_wait_{e.seconds}", None, kind, None, invite_hash
 
     except Exception as e:
         msg = str(e) if e else "error"
+        kind = "invite" if is_invite else "public"
         if "Too many channels" in msg or "CHANNELS_TOO_MUCH" in msg:
             if is_invite and invite_hash:
                 invite_status_put(invite_hash, "too_many")
-            return "too_many", None, "public", None, invite_hash
+            log.warning("ensure_join(%s): too_many channels", kind)
+            return "too_many", None, kind, None, invite_hash
         if "USER_BANNED_IN_CHANNEL" in msg or "USER_KICKED" in msg:
             if is_invite and invite_hash:
                 invite_status_put(invite_hash, "blocked")
-            return "blocked", None, "public", None, invite_hash
+            log.warning("ensure_join(%s): blocked/banned", kind)
+            return "blocked", None, kind, None, invite_hash
         if "INVITE_REQUEST_SENT" in msg:
             if is_invite and invite_hash:
                 invite_status_put(invite_hash, "requested")
-            return "requested", None, "invite" if is_invite else "public", None, invite_hash
-        # інші помилки не кешуємо як фінальні
-        return "error", msg, "invite" if is_invite else "public", None, invite_hash
+            log.info("ensure_join(%s): INVITE_REQUEST_SENT -> requested", kind)
+            return "requested", None, kind, None, invite_hash
+        log.exception("ensure_join(%s): unexpected error: %s", kind, msg)
+        return "error", msg, kind, None, invite_hash

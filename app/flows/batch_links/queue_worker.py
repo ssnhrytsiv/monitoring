@@ -14,8 +14,49 @@ from app.services.link_queue import (
     mark_done as lq_mark_done, mark_failed as lq_mark_failed,
 )
 from app.services import channel_db  # інтеграція з channel_db
+# ➕ реєстр для reconcile requested → joined
+from app.services import requested_reconciler_db as reqdb
 
 log = logging.getLogger("flow.batch_links.worker")
+
+
+def _norm_user(u: Optional[str]) -> Optional[str]:
+    if not u:
+        return None
+    return u.lstrip("@").lower()
+
+
+def _owner_conflict(channel_id: Optional[int],
+                    new_owner_display: Optional[str],
+                    new_owner_username: Optional[str]) -> tuple[bool, Optional[str]]:
+    """
+    Конфлікт: у БД для channel_id вже є owner і він відрізняється від поточного snapshot.
+    Повертає (is_conflict, existing_owner_repr).
+    """
+    if channel_id is None:
+        return (False, None)
+    try:
+        row = channel_db.find_channel(channel_id)
+    except Exception:
+        return (False, None)
+    if not row:
+        return (False, None)
+
+    ex_disp = row.get("owner_display")
+    ex_user = _norm_user(row.get("owner_username"))
+    new_user = _norm_user(new_owner_username)
+
+    # якщо в БД owner порожній — конфлікту немає
+    if not ex_disp and not ex_user:
+        return (False, None)
+    # якщо збігається username — той самий owner
+    if ex_user and new_user and ex_user == new_user:
+        return (False, None)
+    # якщо username невідомий, але збігається display — той самий owner
+    if (not ex_user or not new_user) and ex_disp and new_owner_display and ex_disp == new_owner_display:
+        return (False, None)
+
+    return (True, f"@{ex_user}" if ex_user else (ex_disp or "owner?"))
 
 
 async def run_link_queue_worker(client):
@@ -27,8 +68,7 @@ async def run_link_queue_worker(client):
                 await _sleep(5)
                 continue
 
-            # fetch_due тепер повертає:
-            # (id, url, tries, origin_chat, origin_msg, owner_display, owner_username)
+            # fetch_due: (id, url, tries, origin_chat, origin_msg, owner_display, owner_username)
             items = lq_fetch_due(limit=10)
             if not items:
                 await _sleep(3)
@@ -49,25 +89,30 @@ async def run_link_queue_worker(client):
 
                 channel_id: Optional[int] = None
                 title_current: Optional[str] = None
+                invite_hash_probe: Optional[str] = None  # <— додаємо
 
-                # ---- Probe
+                # ---- Probe (беремо і invite_hash)
                 try:
-                    cid, title_probe, _, _ = await probe_channel_id(
+                    cid, title_probe, _kind, inv_hash = await probe_channel_id(
                         getattr(slots_now[0], "client", slots_now[0]), url
                     )
                     channel_id = cid
+                    invite_hash_probe = inv_hash
                     if title_probe:
                         title_current = title_probe
                     if channel_id is not None:
                         try:
-                            channel_db.upsert_channel(
-                                channel_id,
-                                None,
-                                title_current,
-                                owner_display,
-                                owner_username,
-                                "probe",
-                            )
+                            # при конфлікті — НЕ пишемо навіть 'probe'
+                            is_conflict, _ = _owner_conflict(channel_id, owner_display, owner_username)
+                            if not is_conflict:
+                                channel_db.upsert_channel(
+                                    channel_id,
+                                    None,
+                                    title_current,
+                                    owner_display,
+                                    owner_username,
+                                    "probe",
+                                )
                         except Exception:
                             pass
                 except Exception:
@@ -78,14 +123,17 @@ async def run_link_queue_worker(client):
                     final = any_final_for_channel(channel_id)
                     if final:
                         try:
-                            channel_db.upsert_channel(
-                                channel_id,
-                                None,
-                                title_current,
-                                owner_display,
-                                owner_username,
-                                final,
-                            )
+                            # при конфлікті — НЕ пишемо в channels
+                            is_conflict, _ = _owner_conflict(channel_id, owner_display, owner_username)
+                            if not is_conflict:
+                                channel_db.upsert_channel(
+                                    channel_id,
+                                    None,
+                                    title_current,
+                                    owner_display,
+                                    owner_username,
+                                    final,
+                                )
                             channel_db.add_link(
                                 channel_id,
                                 url,
@@ -101,13 +149,7 @@ async def run_link_queue_worker(client):
                 else:
                     # ---- Cached by URL
                     ust = url_get(url)
-                    if ust in (
-                        "joined",
-                        "already",
-                        "requested",
-                        "invalid",
-                        "private",
-                    ):
+                    if ust in ("joined", "already", "invalid", "private"):
                         try:
                             channel_db.add_link(
                                 None,
@@ -121,6 +163,7 @@ async def run_link_queue_worker(client):
                             pass
                         lq_mark_done(item_id)
                         continue
+                    # Якщо 'requested' — НЕ закриваємо пункт, а пробуємо ще раз (можливо вже accepted)
 
                 # ---- Refresh slots
                 slots_now = list(iter_pool_clients())
@@ -141,6 +184,29 @@ async def run_link_queue_worker(client):
                     cli = getattr(slot, "client", slot)
                     who = _session_name(cli)
 
+                    # Якщо це інвайт і ця ж сесія вже має pending по invite_hash — НЕ дублюємо join
+                    if invite_hash_probe:
+                        try:
+                            is_pending = getattr(reqdb, "is_requested_invite", None)
+                            if callable(is_pending) and is_pending(who, invite_hash_probe):
+                                # просто фіксуємо лінк та закриваємо item
+                                try:
+                                    channel_db.add_link(
+                                        cid_eff,
+                                        url,
+                                        last_kind,
+                                        origin_msg,
+                                        owner_display,
+                                        owner_username,
+                                    )
+                                except Exception:
+                                    pass
+                                lq_mark_done(item_id)
+                                processed = True
+                                break
+                        except Exception:
+                            pass
+
                     # Перевірка фінального для акаунта
                     if cid_eff is not None:
                         acc_status = get_membership(who, cid_eff)
@@ -153,9 +219,25 @@ async def run_link_queue_worker(client):
                             "blocked",
                             "too_many",
                         ):
+                            # якщо для цього акаунта вже requested — вважаємо, що заявка подана раніше
+                            if acc_status == "requested":
+                                try:
+                                    channel_db.add_link(
+                                        cid_eff,
+                                        url,
+                                        last_kind,
+                                        origin_msg,
+                                        owner_display,
+                                        owner_username,
+                                    )
+                                except Exception:
+                                    pass
+                                lq_mark_done(item_id)
+                                processed = True
                             continue
 
-                    status, title, kind, cid_after, _ = await ensure_join(cli, url)
+                    # ensure_join повертає (status, title, kind, channel_id|None, invite_hash|None)
+                    status, title, kind, cid_after, invite_hash = await ensure_join(cli, url)
                     last_kind = kind
                     if cid_eff is None:
                         cid_eff = cid_after
@@ -182,19 +264,46 @@ async def run_link_queue_worker(client):
                     ):
                         url_put(url, status)
 
-                    # Оновлення каналу проміжним/фінальним статусом
+                    # Оновлення каналу проміжним/фінальним статусом (з урахуванням конфлікту owner)
                     if cid_eff is not None:
                         try:
-                            channel_db.upsert_channel(
-                                cid_eff,
-                                None,
-                                title_current,
-                                owner_display,
-                                owner_username,
-                                status,
-                            )
+                            is_conflict, _ = _owner_conflict(cid_eff, owner_display, owner_username)
+                            if not is_conflict:
+                                channel_db.upsert_channel(
+                                    cid_eff,
+                                    None,
+                                    title_current,
+                                    owner_display,
+                                    owner_username,
+                                    status,
+                                )
                         except Exception:
                             pass
+
+                    # ➕ Реєстрація 'requested' саме для цього акаунта (включно з кейсом без channel_id)
+                    if status == "requested":
+                        try:
+                            if invite_hash:
+                                # головний трекінг — по invite_hash
+                                reqdb.note_requested_invite(who, str(invite_hash))
+                            if cid_eff is not None:
+                                # можна паралельно тримати і по channel_id (необов’язково)
+                                reqdb.note_requested(who, cid_eff)
+                        except Exception:
+                            pass
+
+                    # очищення для фінальних
+                    if status in ("joined", "already", "invalid", "private", "blocked", "too_many"):
+                        try:
+                            if invite_hash:
+                                reqdb.clear(who, str(invite_hash))
+                        except Exception:
+                            pass
+                        if cid_eff is not None:
+                            try:
+                                reqdb.clear(who, cid_eff)
+                            except Exception:
+                                pass
 
                     # Фінальні стани
                     if status in (
