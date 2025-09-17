@@ -11,6 +11,7 @@ from app.services.requested_reconciler import run_requested_reconciler
 from app.services import requested_reconciler_db as reqdb
 # ✅ ORM-метадані (idempotent create_all)
 from app.services.models import init_db as orm_init_db
+from app.services.owner_conflict_guard import init as owner_guard_init
 
 
 def setup_logging():
@@ -31,6 +32,7 @@ async def _main():
         channel_db.init()
         reqdb.init()       # legacy-схеми/міграції для reconciler
         orm_init_db()      # ORM create_all (idempotent, нічого не ламає)
+        owner_guard_init()
         log.debug("DB init complete")
     except Exception:
         log.exception("DB init error: one of init() failed")

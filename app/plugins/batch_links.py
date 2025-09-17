@@ -218,9 +218,9 @@ def setup(client, control_peer=None, monitor_buffer=None, **kwargs):
 
         await evt.reply(
             f"📦 Отримав {len(links)} посилань.\n"
-            "Задай owner: /owner_set @username або /owner_set Назва\n"
-            "Або /owner_skip — обробити без owner.\n"
-            "/batch_cancel — скасувати."
+    "Введи ім’я або @username (без команди) — і запущу обробку.\n"
+    "Або скористайся командами: /owner_set @username чи /owner_set Ім’я,\n"
+    "/owner_skip — обробити без owner, /batch_cancel — скасувати."
         )
 
         # ВАЖЛИВО: НЕ викликаємо process_links тут — чекаємо /owner_set або /owner_skip.

@@ -10,7 +10,7 @@ from telethon.errors import (
     UsernameNotOccupiedError, ChannelPrivateError,
 )
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest,CheckChatInviteRequest
 
 from app.services.membership_db import (
     map_invite_set, map_invite_get,
@@ -213,11 +213,68 @@ async def ensure_join(client, url: str):
         log.info("ensure_join(invite): InviteRequestSentError invite=%s -> requested", invite_hash)
         return "requested", None, "invite", None, invite_hash
 
+
+
+
     except UserAlreadyParticipantError:
-        if is_invite and invite_hash:
-            invite_status_put(invite_hash, "already")
+
         kind = "invite" if is_invite else "public"
+
         log.debug("ensure_join(%s): UserAlreadyParticipantError -> already", kind)
+
+        if is_invite and invite_hash:
+
+            # 1) Позначаємо статус
+
+            try:
+
+                invite_status_put(invite_hash, "already")
+
+
+            except Exception:
+
+                pass
+
+            # 2) Прагнемо отримати channel_id без join – одним легким викликом
+
+            try:
+
+                from telethon.tl.functions.messages import CheckChatInviteRequest
+
+                await throttle_invite()  # поважаємо троттл
+
+                inv = await client(CheckChatInviteRequest(invite_hash))
+
+                chat = getattr(inv, "chat", None)
+
+                cid = int(getattr(chat, "id", 0) or 0) if chat else None
+
+                title = getattr(chat, "title", None)
+
+                if cid:
+
+                    try:
+
+                        # збережемо мапу invite -> (channel_id, title)
+
+                        map_invite_set(invite_hash, cid, title or None)
+
+
+                    except Exception:
+
+                        pass
+
+                return "already", title, "invite", cid, invite_hash
+
+
+            except Exception:
+
+                # якщо з якоїсь причини не вийшло — повертаємось без cid
+
+                return "already", None, "invite", None, invite_hash
+
+        # публічні чати/канали: як і було
+
         return "already", None, kind, None, invite_hash
 
     except (InviteHashInvalidError, InviteHashExpiredError, UsernameNotOccupiedError):
