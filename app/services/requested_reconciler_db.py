@@ -1,4 +1,3 @@
-# app/services/requested_reconciler_db.py
 from __future__ import annotations
 
 import os
@@ -46,6 +45,7 @@ class InviteCheck(Base):
     __table_args__ = (
         PrimaryKeyConstraint("invite_hash", "session", name="pk_invite_check"),
         Index("idx_invite_check_next", "next_check_at"),
+        Index("idx_invite_check_sess_next", "session", "next_check_at"),
     )
 
 class RequestedCheck(Base):
@@ -60,6 +60,7 @@ class RequestedCheck(Base):
     __table_args__ = (
         PrimaryKeyConstraint("session", "channel_id", name="pk_requested_check"),
         Index("idx_requested_check_next", "next_check_at"),
+        Index("idx_requested_check_sess_next", "session", "next_check_at"),
     )
 
 # Engine + Session
@@ -117,6 +118,8 @@ def _calc_next(base: int, tries: int, max_cap: int) -> int:
 def note_requested_invite(session: str, invite_hash: str, start_after_sec: int = 60) -> None:
     """
     Додати/оновити запис для інвайта, перша спроба перевірки не раніше ніж через start_after_sec.
+    ВАЖЛИВО: при повторних викликах ми скидаємо tries=0 і ставимо next_check_at=now+start_after_sec,
+    щоб не «залипав» далекий backoff після прийняття заявки.
     """
     with SessionLocal() as s:
         row = s.get(InviteCheck, {"invite_hash": invite_hash, "session": session})
@@ -130,14 +133,27 @@ def note_requested_invite(session: str, invite_hash: str, start_after_sec: int =
                 tries=0,
             )
             s.add(row)
-            log.debug("[note_requested_invite] set")
+            log.debug("[note_requested_invite] set sess=%s invite=%s next=%d", session, invite_hash, row.next_check_at)
         else:
-            row.noted_at = row.noted_at or now
-            # якщо next уже раніше, не рухаємо в минуле
-            row.next_check_at = max(row.next_check_at or 0, now + int(start_after_sec))
+            row.noted_at = now  # оновлюємо час останньої ноти
+            row.tries = 0
+            row.next_check_at = now + int(start_after_sec)
             s.add(row)
-            log.debug("[note_requested_invite] update")
+            log.debug("[note_requested_invite] update+reset sess=%s invite=%s tries=%d next=%d",
+                      session, invite_hash, row.tries, row.next_check_at)
         s.commit()
+
+def get_invite_sessions(invite_hash: str) -> List[str]:
+    """
+    Повертає список сесій, для яких уже існує pending-запис цього інвайта.
+    Використовується, щоб НЕ створювати нові записи на «випадкову» сесію.
+    """
+    with SessionLocal() as s:
+        q = select(InviteCheck.session).where(InviteCheck.invite_hash == invite_hash)
+        rows = s.execute(q).scalars().all()
+        out = [r for r in rows if r]
+        log.debug("[get_invite_sessions] invite=%s sessions=%s", invite_hash, out)
+        return out
 
 def due_invites(sessions: Sequence[str], limit: int) -> List[InviteCheck]:
     """
@@ -190,6 +206,7 @@ def clear_invite(session: str, invite_hash: str) -> None:
 def note_requested(session: str, channel_id: int, start_after_sec: int = 60) -> None:
     """
     Додати/оновити запис для requested за channel_id.
+    Як і для інвайтів — при повторних викликах скидаємо tries=0 і прискорюємо наступну перевірку.
     """
     with SessionLocal() as s:
         pk = {"session": session, "channel_id": int(channel_id)}
@@ -204,12 +221,14 @@ def note_requested(session: str, channel_id: int, start_after_sec: int = 60) -> 
                 tries=0,
             )
             s.add(row)
-            log.debug("[note_requested] set")
+            log.debug("[note_requested] set sess=%s cid=%s next=%d", session, channel_id, row.next_check_at)
         else:
-            row.noted_at = row.noted_at or now
-            row.next_check_at = max(row.next_check_at or 0, now + int(start_after_sec))
+            row.noted_at = now
+            row.tries = 0
+            row.next_check_at = now + int(start_after_sec)
             s.add(row)
-            log.debug("[note_requested] update")
+            log.debug("[note_requested] update+reset sess=%s cid=%s tries=%d next=%d",
+                      session, channel_id, row.tries, row.next_check_at)
         s.commit()
 
 def due_requested(sessions: Sequence[str], per_account: int, limit: int) -> List[RequestedCheck]:

@@ -1,5 +1,6 @@
 # app/services/gsheets.py
 import json
+from typing import Optional, List
 from app.config import GSHEET_SPREADSHEET_ID, GSHEET_CREDS_FILE, GSHEET_SUMMARY_SHEET
 
 try:
@@ -8,6 +9,7 @@ try:
 except Exception:
     gspread = None
     Credentials = None
+
 
 def _client():
     if not gspread or not Credentials:
@@ -25,8 +27,9 @@ def _client():
     creds = Credentials.from_service_account_info(data, scopes=scopes)
     return gspread.authorize(creds)
 
+
 def append_summary_row(row: list) -> bool:
-    """Append a row to Summary sheet. Row is a list of values."""
+    """(legacy) Append a row to fixed Summary sheet."""
     try:
         gc = _client()
         if not gc:
@@ -37,3 +40,24 @@ def append_summary_row(row: list) -> bool:
         return True
     except Exception:
         return False
+
+
+def ensure_daily_sheet(title: str, headers: Optional[List[str]] = None):
+    """
+    Повертає worksheet з назвою `title`. Якщо аркуша нема — створює.
+    Якщо передано headers — і на аркуші порожньо, записує headers в перший рядок.
+    """
+    try:
+        gc = _client()
+        if not gc:
+            return None
+        sh = gc.open_by_key(GSHEET_SPREADSHEET_ID)
+        try:
+            ws = sh.worksheet(title)
+        except Exception:
+            ws = sh.add_worksheet(title=title, rows=1000, cols=max(8, len(headers or [])) or 8)
+            if headers:
+                ws.append_row(headers, value_input_option="USER_ENTERED")
+        return ws
+    except Exception:
+        return None

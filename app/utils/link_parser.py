@@ -2,6 +2,7 @@
 from __future__ import annotations
 import re
 from typing import Iterable, List, Optional, Union
+from typing import List
 
 try:
     # Імпортимо типи тільки якщо є telethon (щоб утиліта жила і без нього)
@@ -184,3 +185,37 @@ def extract_links_any(msg_or_text: Union[str, "TgMessage"]) -> List[str]:
 
     # випадок звичайного тексту
     return extract_links(str(msg_or_text or ""))
+
+async def collect_links(evt) -> List[str]:
+    links: List[str] = []
+
+    # 1) текст повідомлення
+    text = getattr(evt, "raw_text", "") or ""
+    if text:
+        try:
+            # якщо у файлі вже є extract_links(text) — використовуємо її
+            links.extend(extract_links(text))  # type: ignore[name-defined]
+        except NameError:
+            # fallback: простий підхват t.me та @username
+            import re
+            links.extend(re.findall(r'(https?://t\.me/[^\s]+|t\.me/[^\s]+|@[\w\d_]+)', text))
+
+    # 2) посилання в entities (наприклад, приховані URL)
+    msg = getattr(evt, "message", None)
+    entities = getattr(msg, "entities", None)
+    if entities:
+        for e in entities:
+            u = getattr(e, "url", None)
+            if u:
+                links.append(u)
+
+    # 3) посилання в кнопках reply_markup
+    rm = getattr(msg, "reply_markup", None)
+    if rm:
+        for row in getattr(rm, "rows", []) or []:
+            for btn in getattr(row, "buttons", []) or []:
+                u = getattr(btn, "url", None)
+                if u:
+                    links.append(u)
+
+    return links

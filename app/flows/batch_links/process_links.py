@@ -1,8 +1,7 @@
-# app/flows/batch_links/process_links.py
 import logging
 import os
 import asyncio
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 from html import escape as _escape
 
 from telethon.tl import types as ttypes  # для читання MessageEntityTextUrl
@@ -13,7 +12,7 @@ from app.utils.throttle import throttle_between_links
 from app.utils.formatting import fmt_result_line
 from app.services.joiner import probe_channel_id, ensure_join
 from app.services.account_pool import (
-    iter_pool_clients, bump_cooldown, mark_flood, mark_limit, session_name as _session_name
+    iter_ready_pool_clients, bump_cooldown, mark_flood, mark_limit, session_name as _session_name
 )
 from app.services.membership_db import (
     upsert_membership, get_membership, any_final_for_channel, url_get, url_put,
@@ -30,6 +29,64 @@ from app.services.owner_conflict_guard import begin as _guard_begin, end as _gua
 from app.utils.tg_links import sanitize_link
 
 log = logging.getLogger("flow.batch_links.process")
+
+
+# --------- Round-robin order helper (in-process) ---------
+class _RoundRobinOrder:
+    """
+    In-process round-robin reordering for available pool slots.
+    - Keeps a rotating ring of session names.
+    - On each pick, returns slots ordered starting from the current head,
+      then advances the head by one for the next call.
+    - Respects availability: builds the ring only from currently available sessions
+      (we pass only ready slots here).
+    """
+    def __init__(self) -> None:
+        self._ring: List[str] = []
+        self._pos: int = 0
+
+    def _sid(self, slot: Any) -> str:
+        client = getattr(slot, "client", slot)
+        sid = _session_name(client)
+        return str(sid)
+
+    def pick_order(self, slots: List[Any]) -> List[Any]:
+        if not slots:
+            return []
+        # map session -> slot and collect available ids
+        id_to_slot: Dict[str, Any] = {}
+        avail_ids: List[str] = []
+        for s in slots:
+            sid = self._sid(s)
+            if sid not in id_to_slot:
+                id_to_slot[sid] = s
+                avail_ids.append(sid)
+
+        # rebuild ring to contain only currently available (stable order: keep old order, append new)
+        new_ring = [sid for sid in self._ring if sid in avail_ids]
+        for sid in avail_ids:
+            if sid not in new_ring:
+                new_ring.append(sid)
+        self._ring = new_ring
+
+        if not self._ring:
+            return []
+
+        # normalize head position
+        if self._pos >= len(self._ring):
+            self._pos = self._pos % max(1, len(self._ring))
+
+        head_idx = self._pos
+        ordered_ids = self._ring[head_idx:] + self._ring[:head_idx]
+        ordered_slots = [id_to_slot[sid] for sid in ordered_ids if sid in id_to_slot]
+
+        # advance head for next call (one step per URL)
+        self._pos = (head_idx + 1) % len(self._ring)
+
+        return ordered_slots
+
+
+_RR = _RoundRobinOrder()
 
 
 def _build_full_footer(items: List[dict]) -> str:
@@ -199,6 +256,37 @@ def _owner_conflict(channel_id: Optional[int],
     return (True, ex_repr)
 
 
+def _invite_owner_conflict(invite_hash: Optional[str],
+                           new_owner_display: Optional[str],
+                           new_owner_username: Optional[str]) -> tuple[bool, Optional[str]]:
+    """
+    Перевірка конфлікту owner для випадку, коли ми маємо лише інвайт (channel_id ще невідомий)
+    і статус може бути 'requested'. Джерело правди — channel_db.get_invite_owner(invite_hash).
+    """
+    if not invite_hash:
+        return (False, None)
+    try:
+        row = channel_db.get_invite_owner(str(invite_hash))
+    except Exception:
+        row = None
+    if not row:
+        return (False, None)
+
+    ex_disp = row.get("owner_display")
+    ex_user = _norm_user(row.get("owner_username"))
+    new_user = _norm_user(new_owner_username)
+
+    if not ex_disp and not ex_user:
+        return (False, None)
+    if ex_user and new_user and ex_user == new_user:
+        return (False, None)
+    if (not ex_user or not new_user) and ex_disp and new_owner_display and ex_disp == new_owner_display:
+        return (False, None)
+
+    ex_repr = f"@{ex_user}" if ex_user else (ex_disp or "owner?")
+    return (True, ex_repr)
+
+
 async def process_links(message, text: str, owner_display: Optional[str] = None, owner_username: Optional[str] = None):
     # snapshot owner (із буфера, якщо не передали явно)
     od = owner_display
@@ -260,7 +348,7 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
         log.info("batch start: raw=%d uniq=%d", len(links), len(set(links)))
 
         probe_client = None
-        slots_probe = list(iter_pool_clients())
+        slots_probe = list(iter_ready_pool_clients())
         log.debug("[PL] probe slots available=%d", len(slots_probe))
         if slots_probe:
             probe_client = getattr(slots_probe[0], "client", slots_probe[0])
@@ -277,8 +365,12 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
             title_current: Optional[str] = None
             channel_id: Optional[int] = None
             kind_for_link: Optional[str] = None
+            # позначка можливого конфлікту власника для інвайт-лінка (коли cid ще нема)
+            invite_owner_conflict_repr: Optional[str] = None
             probe_kind: Optional[str] = None
             probe_invite: Optional[str] = None
+            # інвайт із ensure_join (або None)
+            invite_hash_var: Optional[str] = None
 
             log.debug("[PL] #%d start url=%s", idx, url)
 
@@ -304,6 +396,26 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     log.debug("[PL] #%d probe_channel_id(url=%s)", idx, url)
                     cid, title_probe, probe_kind, probe_invite = await probe_channel_id(probe_client, url)
                     log.debug("[PL] #%d probe result: cid=%s title=%s kind=%s invite=%s", idx, cid, title_probe, probe_kind, probe_invite)
+
+                    # Seed власника інвайту, якщо cid ще невідомий і це інвайт
+                    if cid is None and probe_kind == "invite" and probe_invite:
+                        try:
+                            row_inv = channel_db.get_invite_owner(str(probe_invite))
+                        except Exception:
+                            row_inv = None
+                        if row_inv is None:
+                            try:
+                                channel_db.set_invite_owner(str(probe_invite), od, ou)
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                _ic_probe, _ex_probe = _invite_owner_conflict(str(probe_invite), od, ou)
+                                if _ic_probe:
+                                    invite_owner_conflict_repr = _ex_probe
+                            except Exception:
+                                pass
+
                     if cid is not None:
                         channel_id = cid
                         if title_probe:
@@ -331,7 +443,15 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                         line = f"{line} | owner_conflict(existing={ex_owner})"
                         log.debug("[PL] #%d owner conflict on cached, not updating channel row", idx)
                     results.append(line)
-                    progress.add_status("already" if final in ("joined", "already") else "invalid")
+                    # OK: розвʼязування лічильника в прогресі для final
+                    if final == "joined":
+                        progress.add_status("joined")
+                    elif final == "already":
+                        progress.add_status("already")
+                    elif final == "requested":
+                        progress.add_status("requested")
+                    else:
+                        progress.add_status("invalid")
                     status_part = line.split(" — ", 1)[1] if " — " in line else line
                     if is_conflict:
                         status_part += f" | owner_conflict(existing={ex_owner})"
@@ -354,19 +474,43 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 if ust in ("joined", "already", "requested", "invalid", "private"):
                     if ust == "requested" and probe_kind == "invite" and probe_invite:
                         try:
-                            slots_for_inv = list(iter_pool_clients())
-                            if slots_for_inv:
-                                cli0 = getattr(slots_for_inv[0], "client", slots_for_inv[0])
-                                sess0 = _session_name(cli0)
-                                reqdb.note_requested_invite(sess0, str(probe_invite), start_after_sec=REQ_START)
+                            # Підштовхуємо лише ті сесії, що вже мають pending для цього інвайта
+                            sess_list = reqdb.get_invite_sessions(str(probe_invite))
+                            if sess_list:
+                                for sess0 in sess_list:
+                                    reqdb.note_requested_invite(sess0, str(probe_invite), start_after_sec=REQ_START)
+                            else:
+                                # Немає зафіксованих сесій — не створюємо запис «наосліп»
+                                log.debug(
+                                    "[PL] requested+invite cached but no invite sessions recorded; skip creating new check")
                         except Exception:
                             pass
 
                     line = fmt_result_line(idx, url, "cached", extra=ust)
+                    # Для requested+invite: визначити конфлікт і додати маркер
+                    _ic_req_inv, _ex_req_inv = (False, None)
+                    if ust == "requested" and probe_kind == "invite" and probe_invite:
+                        try:
+                            _ic_req_inv, _ex_req_inv = _invite_owner_conflict(str(probe_invite), od, ou)
+                            if _ic_req_inv:
+                                line = f"{line} | owner_conflict(existing={_ex_req_inv})"
+                        except Exception:
+                            _ic_req_inv, _ex_req_inv = (False, None)
+
                     results.append(line)
                     status_part = line.split(" — ", 1)[1] if " — " in line else line
+                    if _ic_req_inv and _ex_req_inv:
+                        status_part += f" | owner_conflict(existing={_ex_req_inv})"
                     result_items.append({"idx": idx, "url": url, "title": title_current, "status": status_part})
-                    progress.add_status("already" if ust in ("joined", "already") else "invalid")
+                    # OK: розвʼязування лічильника в прогресі для ust
+                    if ust == "joined":
+                        progress.add_status("joined")
+                    elif ust == "already":
+                        progress.add_status("already")
+                    elif ust == "requested":
+                        progress.add_status("requested")
+                    else:
+                        progress.add_status("invalid")
                     try:
                         channel_db.add_link(None, url, None, message.id, od, ou)
                     except Exception:
@@ -375,7 +519,8 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     continue
 
             # немає вільних клієнтів — у чергу
-            slots = list(iter_pool_clients())
+            slots_raw = list(iter_ready_pool_clients())
+            slots = _RR.pick_order(slots_raw)
             if not slots:
                 log.debug("[PL] no available pool slots -> enqueue rest of URLs")
                 rest = [url] + [u for u in links[idx:] if u not in used]
@@ -394,7 +539,7 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 except Exception:
                     pass
                 break
-            log.debug("[PL] slots available for ensure_join=%d for url=%s", len(slots), url)
+            log.debug("[PL] slots available for ensure_join=%d for url=%s (RR applied)", len(slots), url)
 
             # основна спроба
             line = None
@@ -414,7 +559,7 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                         if reqdb.is_requested(who_sess, cid_eff):
                             log.debug("[PL] #%d session=%s has pending requested for cid=%s -> skip ensure_join", idx, who_sess, cid_eff)
                             line = fmt_result_line(idx, url, "requested", who_display)
-                            progress.add_status("already")
+                            progress.add_status("requested")
                             break
                     except Exception:
                         pass
@@ -424,13 +569,16 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     if acc_status in ("joined","already","requested","invalid","private","blocked","too_many"):
                         if acc_status == "requested":
                             line = fmt_result_line(idx, url, "requested", who_display)
-                            progress.add_status("already")
+                            progress.add_status("requested")
                             break
                         continue
 
                 log.debug("[PL] #%d ensure_join start (session=%s, url=%s)", idx, who_sess, url)
                 status, title, kind, cid_after, invite_hash = await ensure_join(client, url)
                 log.debug("[PL] #%d ensure_join done: status=%s kind=%s cid_after=%s invite_hash=%s", idx, status, kind, cid_after, invite_hash)
+
+                # зафіксувати інвайт, який повернув ensure_join
+                invite_hash_var = invite_hash or invite_hash_var
 
                 last_kind = kind
                 if cid_eff is None:
@@ -479,7 +627,7 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     break
                 elif status == "requested":
                     line = fmt_result_line(idx, url, "requested", who_display)
-                    progress.add_status("already")
+                    progress.add_status("requested")
                     bump_cooldown(client, 6)
                     break
                 elif status == "invalid":
@@ -519,14 +667,32 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
             if not line:
                 line = fmt_result_line(idx, url, "waiting")
 
+            # Спершу перевірка конфлікту за channel_id (якщо він відомий),
+            # інакше — спроба підсвітити конфлікт за інвайтом (requested-case).
             is_conflict, ex_owner = _owner_conflict(cid_eff, od, ou)
+            invite_ex_owner = None
+            if not is_conflict:
+                # Обрати ефективний інвайт: з ensure_join або з probe
+                _invite_eff = invite_hash_var or probe_invite
+                if _invite_eff:
+                    try:
+                        _ic_inv, _ex_inv = _invite_owner_conflict(str(_invite_eff), od, ou)
+                        if _ic_inv:
+                            invite_ex_owner = _ex_inv
+                    except Exception:
+                        pass
+
             if is_conflict:
                 line = f"{line} | owner_conflict(existing={ex_owner})"
+            elif invite_ex_owner:
+                line = f"{line} | owner_conflict(existing={invite_ex_owner})"
 
             results.append(line)
             status_part = line.split(" — ", 1)[1] if " — " in line else line
             if is_conflict:
                 status_part += f" | owner_conflict(existing={ex_owner})"
+            elif invite_ex_owner:
+                status_part += f" | owner_conflict(existing={invite_ex_owner})"
             result_items.append({"idx": idx, "url": url, "title": title_current, "status": status_part})
 
             try:

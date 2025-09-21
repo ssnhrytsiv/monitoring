@@ -22,13 +22,14 @@ class DebouncedProgress:
 
     # counters
     done: int = 0
-    ok: int = 0          # joined
+    ok: int = 0            # joined
+    requested: int = 0     # requested (окремо від already)
     already: int = 0
-    bad: int = 0         # invalid/private/error
+    bad: int = 0           # invalid/private/error/temp/other
     flood: int = 0
-    current: str = ""    # current url
-    actor: str = ""      # session/slot label
-    footer: str = ""     # optional summary
+    current: str = ""      # current url
+    actor: str = ""        # session/slot label
+    footer: str = ""       # optional summary
 
     # internals
     _changed: bool = False
@@ -52,16 +53,19 @@ class DebouncedProgress:
 
     def add_status(self, status: str) -> None:
         """
-        status: 'joined' | 'already' | 'invalid' | 'private' | 'error' | 'flood_wait'
+        status: 'joined' | 'requested' | 'already' | 'invalid' | 'private' | 'error' | 'flood_wait'
         """
         self.done += 1
         if status == "joined":
             self.ok += 1
+        elif status == "requested":
+            self.requested += 1
         elif status == "already":
             self.already += 1
         elif status == "flood_wait":
             self.flood += 1
         else:
+            # все інше (invalid/private/error/temp/blocked/too_many/...) — у bad
             self.bad += 1
         self._mark_changed()
 
@@ -120,7 +124,7 @@ class DebouncedProgress:
         return (
             f"📦 <b>{self.title}</b> {header_suffix}\n"
             f"{bar}  {self.done}/{self.total}\n"
-            f"✔ <b>joined:</b> {self.ok}   🔁 <b>already:</b> {self.already}\n"
+            f"✔ <b>joined:</b> {self.ok}   📨 <b>requested:</b> {self.requested}   🔁 <b>already:</b> {self.already}\n"
             f"❌ <b>invalid/private/error:</b> {self.bad}   ⏳ <b>flood:</b> {self.flood}"
             f"{line_now}{footer}"
         )

@@ -1,2 +1,4 @@
 # app/services/__init__.py
-# marker
+from .post_watch_db import list_templates_full  # реекспорт API для шаблонів
+
+__all__ = ["list_templates_full"]

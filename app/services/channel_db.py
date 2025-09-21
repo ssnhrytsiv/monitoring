@@ -1,46 +1,3 @@
-"""
-channel_db.py
----------------
-Сервіс для збереження метаданих про канали та сирих посилань, які ми опрацьовуємо
-(етап 1 — створення БД без інтеграції у process_links / queue_worker).
-
-Поля / ідеї:
-- Таблиця channels: по одному запису на channel_id (Telegram internal id).
-- Таблиця links: кожне сире посилання, що потрапило в обробку (навіть якщо channel_id ще не відомий).
-- Зв’язок links.channel_id -> channels.channel_id (необов’язковий / без FK — для простоти й швидких вставок).
-- owner_* фіксуємо «snapshot» (стан на момент обробки пакету), щоб історія не губилася при зміні owner надалі.
-
-Дизайн / компроміси:
-- SQLite, один глобальний конект + threading.Lock для серіалізації записів.
-- Без складних індексів (лише найпотрібніші).
-- Логіка оновлення каналів: якщо існує — оновлюємо вибірково (COALESCE).
-- last_status: останній фінальний або проміжний статус (joined / requested / invalid / private / probe / etc).
-- updated_at оновлюється при кожному upsert_channel.
-- created_at лише при створенні.
-
-Подальші кроки (етапи 2–4):
-- Виклик init() при старті (наприклад у main або у plugin.setup()).
-- Виклики upsert_channel / add_link у process_links та queue_worker після ensure_join().
-- Додати новий плагін для /channels_owner, /recent_links тощо.
-
-ENV:
-- CHANNEL_DB_PATH (якщо хочемо окремий файл)
-- Якщо немає — беремо DB_PATH (можливо вже використовується membership_db)
-- Якщо немає й його — fallback "channel_meta.sqlite3"
-
-Функції публічного API:
-- init()
-- upsert_channel(channel_id, username, title, owner_display, owner_username, last_status)
-- add_link(channel_id, raw_url, kind, batch_msg_id, owner_display, owner_username)
-- get_channels_by_owner(owner, limit=50)
-- find_channel(channel_id)
-- recent_links(limit=30)
-- recent_channels(limit=30)
-- search_channels_by_username(substring, limit=30)
-- prune_orphan_links(max_without_channel=10000)  (опціональна утиліта)
-- raw_connection() (для складніших запитів поза модулем — обережно)
-"""
-
 from __future__ import annotations
 
 import os
@@ -60,6 +17,8 @@ __all__ = [
     "search_channels_by_username",
     "prune_orphan_links",
     "raw_connection",
+    "set_invite_owner",
+    "get_invite_owner",
 ]
 
 _DB_PATH = (
@@ -72,9 +31,6 @@ _conn: Optional[sqlite3.Connection] = None
 _lock = threading.Lock()
 
 
-# -------------------------
-# Helpers
-# -------------------------
 def _now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
@@ -86,23 +42,15 @@ def _ensure_conn() -> sqlite3.Connection:
     return _conn
 
 
-# -------------------------
-# Schema init
-# -------------------------
 def init() -> None:
-    """
-    Ініціалізує SQLite БД (idempotent). Безпечний повторний виклик.
-    """
     global _conn
     if _conn is not None:
         return
-    # isolation_level=None -> autocommit режим небажаний тут; залишимо дефолт
     _conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
     _conn.execute("PRAGMA journal_mode=WAL;")
     _conn.execute("PRAGMA synchronous=NORMAL;")
-    _conn.execute("PRAGMA foreign_keys=OFF;")  # FK не використовуємо (швидкість > строгість)
+    _conn.execute("PRAGMA foreign_keys=OFF;")
 
-    # Таблиця каналів
     _conn.execute(
         """
         CREATE TABLE IF NOT EXISTS channels (
@@ -119,7 +67,6 @@ def init() -> None:
         """
     )
 
-    # Таблиця сирих посилань
     _conn.execute(
         """
         CREATE TABLE IF NOT EXISTS links (
@@ -135,7 +82,18 @@ def init() -> None:
         """
     )
 
-    # Індекси
+    # нова таблиця для мапи invite → owner
+    _conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS invite_owners (
+            invite_hash TEXT PRIMARY KEY,
+            owner_display TEXT,
+            owner_username TEXT,
+            created_at TEXT
+        )
+        """
+    )
+
     _conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_channels_channel_id ON channels(channel_id)"
     )
@@ -152,9 +110,6 @@ def init() -> None:
     _conn.commit()
 
 
-# -------------------------
-# Upsert channel
-# -------------------------
 def upsert_channel(
     channel_id: Optional[int],
     username: Optional[str],
@@ -163,23 +118,13 @@ def upsert_channel(
     owner_username: Optional[str],
     last_status: Optional[str],
 ) -> None:
-    """
-    Додає або частково оновлює канал.
-    COALESCE дозволяє не затирати існуючі значення None-ами.
-    Якщо channel_id=None → нічого не робимо (немає ключа).
-    """
     if channel_id is None:
         return
-
     conn = _ensure_conn()
     now = _now()
-
     with _lock:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT id FROM channels WHERE channel_id=?",
-            (channel_id,),
-        )
+        cur.execute("SELECT id FROM channels WHERE channel_id=?", (channel_id,))
         row = cur.fetchone()
         if row:
             cur.execute(
@@ -219,9 +164,6 @@ def upsert_channel(
         conn.commit()
 
 
-# -------------------------
-# Add link (raw URL event)
-# -------------------------
 def add_link(
     channel_id: Optional[int],
     raw_url: str,
@@ -230,10 +172,6 @@ def add_link(
     owner_display: Optional[str],
     owner_username: Optional[str],
 ) -> None:
-    """
-    Додаємо сире посилання (навіть якщо channel_id ще невідомий).
-    kind: public / invite / username / message / unknown (класифікація можлива пізніше).
-    """
     if not raw_url:
         return
     conn = _ensure_conn()
@@ -251,14 +189,7 @@ def add_link(
         conn.commit()
 
 
-# -------------------------
-# Queries
-# -------------------------
 def get_channels_by_owner(owner: str, limit: int = 50) -> List[Tuple]:
-    """
-    Повертає канали по owner. Owner може бути або @username (без @ теж ок),
-    або текстове display ім’я. Порівнюємо по обох полях (owner_username / owner_display).
-    """
     clean = owner.lstrip("@").lower()
     conn = _ensure_conn()
     with _lock:
@@ -278,9 +209,6 @@ def get_channels_by_owner(owner: str, limit: int = 50) -> List[Tuple]:
 
 
 def find_channel(channel_id: int) -> Optional[Dict[str, Any]]:
-    """
-    Пошук одного каналу за його channel_id (Telegram internal id).
-    """
     conn = _ensure_conn()
     with _lock:
         cur = conn.cursor()
@@ -308,9 +236,6 @@ def find_channel(channel_id: int) -> Optional[Dict[str, Any]]:
 
 
 def recent_links(limit: int = 30) -> List[Tuple]:
-    """
-    Останні N посилань (raw_url, channel_id, kind, owner_display, owner_username, added_at).
-    """
     conn = _ensure_conn()
     with _lock:
         cur = conn.cursor()
@@ -327,9 +252,6 @@ def recent_links(limit: int = 30) -> List[Tuple]:
 
 
 def recent_channels(limit: int = 30) -> List[Tuple]:
-    """
-    Останні (за updated_at) канали.
-    """
     conn = _ensure_conn()
     with _lock:
         cur = conn.cursor()
@@ -347,9 +269,6 @@ def recent_channels(limit: int = 30) -> List[Tuple]:
 
 
 def search_channels_by_username(substring: str, limit: int = 30) -> List[Tuple]:
-    """
-    Пошук по username (LIKE). Substring приводимо до нижнього регістру.
-    """
     if not substring:
         return []
     pattern = f"%{substring.lower()}%"
@@ -371,20 +290,13 @@ def search_channels_by_username(substring: str, limit: int = 30) -> List[Tuple]:
 
 
 def prune_orphan_links(max_without_channel: int = 10000) -> int:
-    """
-    Опціональна утиліта: якщо дуже багато links з NULL channel_id — можна обрізати старі.
-    Повертає кількість видалених рядків.
-    """
     conn = _ensure_conn()
     with _lock:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT COUNT(*) FROM links WHERE channel_id IS NULL"
-        )
+        cur.execute("SELECT COUNT(*) FROM links WHERE channel_id IS NULL")
         cnt = cur.fetchone()[0] or 0
         if cnt <= max_without_channel:
             return 0
-        # Видалимо найстаріші поки не стане <= max_without_channel
         excess = cnt - max_without_channel
         cur.execute(
             """
@@ -404,8 +316,44 @@ def prune_orphan_links(max_without_channel: int = 10000) -> int:
 
 
 def raw_connection() -> sqlite3.Connection:
-    """
-    Повертає сирий конект (якщо потрібні кастомні складні запити).
-    Використовуй обережно (самостійно забезпечуй синхронізацію, якщо робиш записи).
-    """
     return _ensure_conn()
+
+
+def set_invite_owner(invite_hash: str, owner_display: Optional[str], owner_username: Optional[str]) -> None:
+    if not invite_hash:
+        return
+    conn = _ensure_conn()
+    now = _now()
+    with _lock:
+        conn.execute(
+            """
+            INSERT INTO invite_owners (invite_hash, owner_display, owner_username, created_at)
+            VALUES (?,?,?,?)
+            ON CONFLICT(invite_hash) DO UPDATE SET
+                owner_display=excluded.owner_display,
+                owner_username=excluded.owner_username
+            """,
+            (invite_hash, owner_display, owner_username, now),
+        )
+        conn.commit()
+
+
+def get_invite_owner(invite_hash: str) -> Optional[Dict[str, Any]]:
+    if not invite_hash:
+        return None
+    conn = _ensure_conn()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT invite_hash, owner_display, owner_username, created_at FROM invite_owners WHERE invite_hash=?",
+            (invite_hash,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "invite_hash": row[0],
+        "owner_display": row[1],
+        "owner_username": row[2],
+        "created_at": row[3],
+    }

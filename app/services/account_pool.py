@@ -1,4 +1,3 @@
-# app/services/account_pool.py
 from __future__ import annotations
 
 import os
@@ -76,6 +75,29 @@ def _find_slot(obj: Union[TelegramClient, ClientSlot]) -> Optional[ClientSlot]:
         if s.client is obj:
             return s
     return None
+
+def find_slot_by_session_name(name: str) -> Optional[ClientSlot]:
+    """
+    Знаходить слот у пулі за exact-іменем сесії (як у ACCOUNTS).
+    """
+    for s in _POOL:
+        if s.name == name:
+            return s
+    return None
+
+def get_client_by_session_name(name: str) -> Optional[TelegramClient]:
+    """
+    Повертає TelegramClient із пулу за ім’ям сесії, або None якщо не знайдено/не в пулі.
+    (PRIMARY тут недоступний, він не є частиною пулу.)
+    """
+    slot = find_slot_by_session_name(name)
+    return slot.client if slot else None
+
+def list_session_names() -> List[str]:
+    """
+    Знімок імен усіх сесій у пулі (для діагностики/логів).
+    """
+    return [s.name for s in _POOL]
 
 def _set_ready_after(slot: ClientSlot, seconds: int) -> None:
     now = time.time()
@@ -166,9 +188,19 @@ async def stop_pool() -> None:
 
 def iter_pool_clients() -> List[ClientSlot]:
     """
-    Повертає знімок слотів пулу (read-only).
+    Повертає знімок слотів пулу (read-only), без фільтрації стану.
+    Використовуйте iter_ready_pool_clients() там, де потрібно уникати FLOOD/cooldown/busy.
     """
     return list(_POOL)
+
+def iter_ready_pool_clients() -> List[ClientSlot]:
+    """
+    Повертає лише ті слоти, що готові до використання прямо зараз:
+      - не busy
+      - next_ready <= now
+    """
+    now = time.time()
+    return [s for s in _POOL if (not s.busy) and (s.next_ready <= now)]
 
 @asynccontextmanager
 async def _lease_ctx(slot: ClientSlot):

@@ -343,24 +343,31 @@ def setup(client, control_peer=None, **kwargs):
 
         nice = "exact" if mode == "exact" else f"fuzzy (поріг {threshold:.2f})"
 
-        # Формування нового формату відповіді з переліком посилань
+        # Формування нового формату відповіді з переліком посилань + швидка команда
         lines = ["✅ Зразок поста додано"]
         lines.append(f"ID: {tid}")
         lines.append(f"Назва: {_escape(title) if title else '—'}")
         lines.append(f"Режим: {nice}")
 
+        # 🔹 Готова команда без 'id=' і з переносом рядка в кінці (та zero-width space для гарантованого копіювання переносу)
+        quick_cmd = f"/watch_from_links {tid} --window 3h\n\u200b"
+        lines.append("")  # порожній рядок розділювач
+        lines.append(f"<code>{_escape(quick_cmd)}</code>")
+
         if links_list:
+            lines.append("")
             lines.append(f"Посилання ({len(links_list)}):")
-            # робимо кожне посилання клікабельним
             for u in links_list:
                 safe = _escape(u, quote=True)
                 lines.append(f'<a href="{safe}">{safe}</a>')
         else:
+            lines.append("")
             lines.append("Посилання (0): —")
 
         reply_text = "\n".join(lines)
         await evt.reply(reply_text, parse_mode="html")
 
+        # Спроба продублювати оригінальний пост (для наочності)
         try:
             if getattr(src, "media", None) and (getattr(src, "photo", None) or getattr(src, "document", None)):
                 await client.send_file(

@@ -7,12 +7,20 @@ from app.services.account_pool import start_pool, stop_pool
 from app.logging_json import configure_logging, get_logger
 from app.services.post_watch_db import init as postwatch_init
 from app.services import channel_db
+from app.services import channel_maps
 from app.services.requested_reconciler import run_requested_reconciler
 from app.services import requested_reconciler_db as reqdb
 # ✅ ORM-метадані (idempotent create_all)
 from app.services.models import init_db as orm_init_db
 from app.services.owner_conflict_guard import init as owner_guard_init
 
+from app.services.posts_watch_result_db import init as posts_result_init
+
+from app.settings import MONITOR_LINKS_V2
+
+# Якщо ввімкнено V2 — реєструємо новий плагін. Інакше працює стара логіка.
+if MONITOR_LINKS_V2:
+    import app.plugins.monitor_links  # реєструє хендлери V2
 
 def setup_logging():
     configure_logging()
@@ -29,7 +37,9 @@ async def _main():
     t0 = time.perf_counter()
     try:
         postwatch_init()
+        posts_result_init()
         channel_db.init()
+        await channel_maps.init()
         reqdb.init()       # legacy-схеми/міграції для reconciler
         orm_init_db()      # ORM create_all (idempotent, нічого не ламає)
         owner_guard_init()
@@ -93,6 +103,9 @@ async def _main():
     log.info("Завантажую плагіни…")
     t0 = time.perf_counter()
     try:
+        from app.settings import MONITOR_LINKS_V2
+        if MONITOR_LINKS_V2:
+            import app.plugins.monitor_links
         await load_plugins()
         log.debug("Plugins loaded")
     except Exception:
