@@ -91,19 +91,24 @@ _RR = _RoundRobinOrder()
 
 def _build_full_footer(items: List[dict]) -> str:
     """
-    Рендер підсумку з новою логікою:
-    1) Спочатку – всі “нормальні” (без owner_conflict)
-    2) Далі – групи з конфліктами за іменем адміна: "⚠️ Адмін вже є для цих каналів: <ім'я>"
-    3) Окремий блок для 'private'
-    4) Окремий блок для 'invalid' та інших помилок (щоб не зливати з private)
-    ВАЖЛИВО: у рядках статусів НЕ показувати 'owner_conflict(existing=...)'.
+    Порядок секцій:
+    1) Чисті (без конфліктів і без дублікатів)
+    2) Конфлікти (згруповані за адміном)
+    3) Інші без конфліктів, але з дублікатами (по одному "оригіналу" на channel_id)
+    4) Приватні
+    5) Недійсні/помилки
+    6) Дублікати (усі «повтори» channel_id) — внизу
+
+    У рядках статусів НЕ показувати 'owner_conflict(existing=...)' (прибираємо для читабельності).
     """
     import re
+    from html import escape as _escape
+    from typing import Optional, Any, Dict, List
 
     def _esc(s: str) -> str:
         return _escape(s or "")
 
-    # Витягує імʼя з owner_conflict(existing=...)
+    # Витягнути імʼя з owner_conflict(existing=...)
     RE_CONFLICT = re.compile(r"owner_conflict\(existing=([^)]+)\)", re.IGNORECASE)
 
     def _conflict_name(status: str) -> Optional[str]:
@@ -112,13 +117,12 @@ def _build_full_footer(items: List[dict]) -> str:
         m = RE_CONFLICT.search(status)
         return m.group(1).strip() if m else None
 
-    # Прибрати маркер owner_conflict(...) з тексту статусу + прибрати подвійні роздільники
+    # Прибрати маркер owner_conflict(...) з тексту статусу + почистити роздільники
     def _strip_conflict(status: str) -> str:
         if not status:
-            return status
+            return status or ""
         s = RE_CONFLICT.sub("", status)
-        # почистити зайві " | " після вилучення маркера
-        s = re.sub(r"\s*\|\s*\|\s*", " | ", s)  # подвійні |
+        s = re.sub(r"\s*\|\s*\|\s*", " | ", s)   # подвійні |
         s = re.sub(r"^\s*\|\s*|\s*\|\s*$", "", s)  # крайові |
         s = re.sub(r"\s{2,}", " ", s).strip()      # зайві пробіли
         return s
@@ -129,66 +133,129 @@ def _build_full_footer(items: List[dict]) -> str:
 
     def _is_invalid_or_error(status: str) -> bool:
         s = (status or "").lower()
-        # усе проблемне, окрім private: invalid, error/temp, blocked, too_many, waiting
         if _is_private(status):
             return False
         tokens = ("invalid", "error", "temp", "blocked", "too_many", "waiting")
         return any(tok in s for tok in tokens)
 
-    def _link_line(idx: int, url: str, title: Optional[str], status: str) -> str:
+    def _link_line(idx: int, url: str, title: Optional[str], status: str, tag: str = "") -> str:
         clean_status = _strip_conflict(status)
+        suffix = f" {tag}" if tag else ""
         if title:
-            return f"{idx}. {_esc(title)}\n   <a href=\"{_esc(url)}\">Посилання</a> — {clean_status}"
+            return f"{idx}. {_esc(title)}{suffix}\n   <a href=\"{_esc(url)}\">Посилання</a> — {clean_status}"
         else:
-            return f"{idx}. <a href=\"{_esc(url)}\">Посилання</a> — {clean_status}"
+            return f"{idx}. <a href=\"{_esc(url)}\">Посилання</a>{suffix} — {clean_status}"
 
-    normal: List[str] = []
-    conflicts: dict[str, List[str]] = {}  # admin_name -> [lines]
+    # 0) Групування за channel_id і визначення дублікатів
+    cid_to_items: Dict[Any, List[dict]] = {}
+    for it in (items or []):
+        cid = it.get("channel_id")
+        if cid is None:
+            continue
+        cid_to_items.setdefault(cid, []).append(it)
+    dup_cids = {cid for cid, lst in cid_to_items.items() if len(lst) > 1}
+
+    # 0.1) Для кожного дублікатного channel_id обрати ПРЕДСТАВНИКА (оригінал, що лишається в секції):
+    # - якщо у цього cid є рядки з конфліктом — обираємо той із мінімальним idx серед конфліктних (піде в "Конфлікти")
+    # - інакше — рядок із мінімальним idx (піде в "Інші (мають дублікати)")
+    rep_idx_by_cid: Dict[Any, int] = {}
+    for cid in dup_cids:
+        lst = cid_to_items[cid]
+        conflict_items = [it for it in lst if _conflict_name(it.get("status") or "") is not None]
+        rep = min(conflict_items or lst, key=lambda x: (x.get("idx") or 10**9))
+        rep_idx_by_cid[cid] = rep.get("idx")
+
+    # 1) Розподіл по секціях
+    clean_unique: List[str] = []          # чисті (без конфліктів, без дублікатів)
+    conflicts_by_admin: Dict[str, List[str]] = {}
+    other_clean_dup_reps: List[str] = []  # представники без конфліктів, але з дублями
     privates: List[str] = []
     invalids: List[str] = []
+    dup_lines_by_cid: Dict[Any, List[str]] = {}  # непредставники для блоку "Дублікати"
+    title_by_cid: Dict[Any, Optional[str]] = {}
 
     for it in (items or []):
         idx: int = it.get("idx") or 0
         url: str = it.get("url") or ""
         title: Optional[str] = it.get("title")
         status: str = it.get("status") or ""
-
+        cid = it.get("channel_id")
         admin = _conflict_name(status)
-        line = _link_line(idx, url, title, status)
 
+        # Якщо це дублікатний channel_id і не представник — піде в блок "Дублікати" (внизу)
+        if cid is not None and cid in dup_cids and rep_idx_by_cid.get(cid) != idx:
+            line = _link_line(idx, url, title, status, tag="[дублікат]")
+            dup_lines_by_cid.setdefault(cid, []).append(line)
+            if cid not in title_by_cid:
+                title_by_cid[cid] = title
+            continue
+
+        # Представник або унікальний запис:
         if admin:
-            conflicts.setdefault(admin, []).append(line)
+            line = _link_line(idx, url, title, status)
+            conflicts_by_admin.setdefault(admin, []).append(line)
         elif _is_private(status):
-            privates.append(line)
+            privates.append(_link_line(idx, url, title, status))
         elif _is_invalid_or_error(status):
-            invalids.append(line)
+            invalids.append(_link_line(idx, url, title, status))
         else:
-            normal.append(line)
+            # чистий запис (без конфлікту)
+            if cid is not None and cid in dup_cids:
+                # представник дублікатного cid без конфлікту -> у секцію "інші (мають дублікати)"
+                other_clean_dup_reps.append(_link_line(idx, url, title, status))
+            else:
+                # унікальний канал без конфлікту
+                clean_unique.append(_link_line(idx, url, title, status))
 
+    # 2) Рендер у потрібному порядку
     out: List[str] = []
     out.append("📊 Підсумок (всі):")
 
-    if normal:
-        out.extend(normal)
+    # 2.1) Чисті унікальні першими
+    if clean_unique:
+        out.extend(clean_unique)
 
-    # конфлікти по кожному адміну
-    for admin, lines in conflicts.items():
+    # 2.2) Конфлікти (групами)
+    for admin, lines in conflicts_by_admin.items():
         out.append("")
         out.append(f"⚠️ Адмін вже є для цих каналів: {admin}")
         out.extend(lines)
 
+    # 2.3) Інші (мають дублікати) — представники без конфлікту
+    if other_clean_dup_reps:
+        out.append("")
+        out.append("ℹ️ Канали (оригінали), які мають дублікати:")
+        out.extend(other_clean_dup_reps)
+
+    # 2.4) Приватні/недоступні
     if privates:
         out.append("")
         out.append("🔒 Приватні/недоступні:")
         out.extend(privates)
 
+    # 2.5) Недійсні/помилки
     if invalids:
         out.append("")
         out.append("❌ Недійсні/помилки:")
         out.extend(invalids)
 
-    return "\n".join(out)
+    # 2.6) Дублікати — внизу
+    if dup_lines_by_cid:
+        out.append("")
+        out.append("🔁 Дублікати каналів (однаковий channel_id у кількох рядках):")
+        for cid in sorted(dup_lines_by_cid.keys()):
+            title = title_by_cid.get(cid)
+            if not title:
+                for it in cid_to_items.get(cid, []):
+                    if it.get("title"):
+                        title = it.get("title")
+                        break
+            header = f"• {title or 'Без назви'} (ID: {cid})"
+            out.append(header)
+            for line in dup_lines_by_cid[cid]:
+                out.append("  " + line)
 
+    return "\n".join(out)
 
 async def _short_pause():
     try:
@@ -227,6 +294,44 @@ def _norm_user(u: Optional[str]) -> Optional[str]:
     if not u:
         return None
     return u.lstrip("@").lower()
+
+
+# --- Додано: локальний хелпер для запису конфліктів у owner_conflicts
+def _persist_owner_conflict(channel_id: Optional[int],
+                            new_owner_display: Optional[str],
+                            new_owner_username: Optional[str],
+                            source_ref: Optional[str],
+                            reason: str) -> bool:
+    """
+    Пише запис у owner_conflicts. Повертає True, якщо запис створено.
+    channel_id: Telegram channel_id (не внутрішній id). Якщо None — пропускаємо (не буде прив'язки у звіті).
+    source_ref: invite_hash або URL (для дебагу).
+    reason: 'probe_mismatch' | 'cached_mismatch' | 'upsert_mismatch' | ін.
+    """
+    try:
+        owner_key = ((new_owner_display or "").lstrip("@").strip()
+                     or ((new_owner_username or "").lstrip("@").strip()))
+        if not owner_key:
+            return False
+        if channel_id is None:
+            return False
+        import sqlite3
+        db_path = os.getenv("DB_PATH", "post_watchdog.sqlite3")
+        with sqlite3.connect(db_path) as con:
+            cur = con.cursor()
+            cur.execute(
+                """
+                INSERT INTO owner_conflicts(owner, channel_id, source_ref, reason, created_at)
+                VALUES(?, ?, ?, ?, strftime('%s','now'))
+                """,
+                (owner_key, int(channel_id), source_ref or "", reason or "unknown")
+            )
+            con.commit()
+        return True
+    except Exception:
+        log.exception("failed to insert owner_conflict channel_id=%s owner=%s", channel_id,
+                      (new_owner_username or new_owner_display))
+        return False
 
 
 def _owner_conflict(channel_id: Optional[int],
@@ -372,6 +477,9 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
             # інвайт із ensure_join (або None)
             invite_hash_var: Optional[str] = None
 
+            # прапорець, щоб не дублювати запис конфлікту в межах одного URL
+            conflict_logged: bool = False
+
             log.debug("[PL] #%d start url=%s", idx, url)
 
             # дублі в межах одного пакету
@@ -425,6 +533,10 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                             if not is_conflict:
                                 channel_db.upsert_channel(channel_id, None, title_current, od, ou, "probe")
                             else:
+                                # записати конфлікт (probe)
+                                if not conflict_logged:
+                                    if _persist_owner_conflict(channel_id, od, ou, probe_invite or url, "probe_mismatch"):
+                                        conflict_logged = True
                                 log.debug("[PL] #%d owner conflict on probe, skip upsert", idx)
                         except Exception:
                             pass
@@ -441,6 +553,10 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     is_conflict, ex_owner = _owner_conflict(channel_id, od, ou)
                     if is_conflict:
                         line = f"{line} | owner_conflict(existing={ex_owner})"
+                        # записати конфлікт (cached)
+                        if not conflict_logged:
+                            if _persist_owner_conflict(channel_id, od, ou, probe_invite or url, "cached_mismatch"):
+                                conflict_logged = True
                         log.debug("[PL] #%d owner conflict on cached, not updating channel row", idx)
                     results.append(line)
                     # OK: розвʼязування лічильника в прогресі для final
@@ -455,7 +571,7 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     status_part = line.split(" — ", 1)[1] if " — " in line else line
                     if is_conflict:
                         status_part += f" | owner_conflict(existing={ex_owner})"
-                    result_items.append({"idx": idx, "url": url, "title": title_current, "status": status_part})
+                    result_items.append({"idx": idx, "url": url, "title": title_current, "status": status_part, "channel_id": channel_id})
                     if not is_conflict:
                         try:
                             channel_db.upsert_channel(channel_id, None, title_current, od, ou, final)
@@ -501,7 +617,7 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     status_part = line.split(" — ", 1)[1] if " — " in line else line
                     if _ic_req_inv and _ex_req_inv:
                         status_part += f" | owner_conflict(existing={_ex_req_inv})"
-                    result_items.append({"idx": idx, "url": url, "title": title_current, "status": status_part})
+                    result_items.append({"idx": idx, "url": url, "title": title_current, "status": status_part, "channel_id": channel_id})
                     # OK: розвʼязування лічильника в прогресі для ust
                     if ust == "joined":
                         progress.add_status("joined")
@@ -532,7 +648,7 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 line = f"{idx}. {url} — 💤 Немає вільних акаунтів; додано у чергу: {added} URL"
                 results.append(line)
                 status_part = line.split(" — ", 1)[1] if " — " in line else line
-                result_items.append({"idx": idx, "url": url, "title": title_current, "status": status_part})
+                result_items.append({"idx": idx, "url": url, "title": title_current, "status": status_part, "channel_id": channel_id})
                 progress.add_status("flood_wait")
                 try:
                     channel_db.add_link(None, url, None, message.id, od, ou)
@@ -597,6 +713,10 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                         if not is_conflict:
                             channel_db.upsert_channel(cid_eff, None, title_current, od, ou, status)
                         else:
+                            # записати конфлікт (upsert)
+                            if not conflict_logged:
+                                if _persist_owner_conflict(cid_eff, od, ou, (invite_hash or invite_hash_var or url), "upsert_mismatch"):
+                                    conflict_logged = True
                             log.debug("[PL] #%d owner conflict on upsert_channel -> skip", idx)
                     except Exception:
                         pass
@@ -693,7 +813,7 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 status_part += f" | owner_conflict(existing={ex_owner})"
             elif invite_ex_owner:
                 status_part += f" | owner_conflict(existing={invite_ex_owner})"
-            result_items.append({"idx": idx, "url": url, "title": title_current, "status": status_part})
+            result_items.append({"idx": idx, "url": url, "title": title_current, "status": status_part, "channel_id": channel_id})
 
             try:
                 channel_db.add_link(cid_eff, url, last_kind, message.id, od, ou)

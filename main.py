@@ -1,4 +1,3 @@
-# main.py
 import asyncio
 import time
 
@@ -22,6 +21,12 @@ from app.settings import MONITOR_LINKS_V2
 if MONITOR_LINKS_V2:
     import app.plugins.monitor_links  # реєструє хендлери V2
 
+# ДОДАНО: експортер каналів у Google Sheets (миттєвий запуск + далі щодоби)
+from app.services.googlesheets.channels_export_service import (
+    start_channels_exporter,
+    stop_channels_exporter,
+)
+
 def setup_logging():
     configure_logging()
 
@@ -31,6 +36,7 @@ async def _main():
     log = get_logger("main")
 
     reconciler_task = None
+    exporter_task = None  # ДОДАНО
 
     # ---- DB init (одноразово, без дублювань)
     log.info("Ініціалізую БД…")
@@ -99,6 +105,17 @@ async def _main():
             log.exception("client.disconnect() failed after reconciler create failure")
         raise SystemExit(1)
 
+    # ---- ДОДАНО: Старт експортера каналів (миттєво + далі щодоби)
+    try:
+        exporter_task = start_channels_exporter()
+        if exporter_task:
+            log.debug("Channels exporter task created: %s", exporter_task.get_name())
+        else:
+            log.info("Channels exporter is disabled or not configured; skipping")
+    except Exception:
+        log.exception("Failed to start channels exporter")
+        # не критично для основного бота — продовжуємо
+
     # ---- Плагіни
     log.info("Завантажую плагіни…")
     t0 = time.perf_counter()
@@ -143,6 +160,14 @@ async def _main():
         log.exception("Main run loop error")
         raise
     finally:
+        # ДОДАНО: Акуратно зупиняємо експортер
+        if exporter_task:
+            log.info("Зупиняю експортер каналів…")
+            try:
+                await stop_channels_exporter()
+            except Exception:
+                log.exception("Channels exporter stop failed")
+
         # Акуратно зупиняємо reconciler
         if reconciler_task:
             log.info("Зупиняю reconciler…")
