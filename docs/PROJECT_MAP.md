@@ -1,6 +1,6 @@
 # Project Map (auto-generated)
 
-- Generated: 2025-11-29 23:06:35 UTC
+- Generated: 2025-11-29 23:38:10 UTC
 - Branch: watcherchannels
 
 ## Structure (depth=4)
@@ -108,6 +108,8 @@
 │       └── throttle.py
 ├── apply_anchored_patch.py
 ├── bot_create_watch.py
+├── db_dump
+│   └── post_watchdog.sqlite3
 ├── docs
 │   ├── ARCHITECTURE.md
 │   └── PROJECT_MAP.md
@@ -115,14 +117,23 @@
 ├── main.py
 ├── patch_gsheets_buffer.diff
 ├── post_watchdog.sqlite3
+├── posts_watch_result.sqlite3
 ├── requirements.txt
 ├── safe_apply_patch.py
 ├── schema_dump.txt
 ├── scripts
 │   └── generate-project-map.sh
+├── seed_channels.sqlite3
+├── tg_session.session
+├── tg_session.session-journal
+├── tg_session_2.session
+├── tg_session_2.session-journal
+├── tg_session_3.session
+├── tg_session_4.session
+├── tg_session_4.session-journal
 └── tree.txt
 
-16 directories, 99 files
+17 directories, 109 files
 ```
 
 ## Symbols index (functions/classes)
@@ -431,7 +442,7 @@ StructuredAdapter class        52 app/logging_json.py class StructuredAdapter(lo
 StructuredAdapter.__init__ member       53 app/logging_json.py def __init__(self, logger: logging.Logger, context: Optional[Dict[str, Any]] = None):
 StructuredAdapter.add_context member       56 app/logging_json.py def add_context(self, **ctx):
 StructuredAdapter.log member       59 app/logging_json.py def log(self, level: int, msg: Any, *args, **kwargs):
-Symbols index (functions/classes) section     128 docs/PROJECT_MAP.md ## Symbols index (functions/classes)
+Symbols index (functions/classes) section     139 docs/PROJECT_MAP.md ## Symbols index (functions/classes)
 TARGET_FLUSH_SEC variable     14 app/services/gsheets_buffer.py TARGET_FLUSH_SEC = 15.0
 TERMINAL         variable     64 app/services/requested_reconciler.py TERMINAL = "terminal"
 TICK_SEC         variable     24 app/services/requested_reconciler.py TICK_SEC = int(os.getenv("REQUESTED_RECONCILER_TICK", "60") or "60")
