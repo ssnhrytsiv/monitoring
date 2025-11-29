@@ -1,6 +1,6 @@
 # Project Map (auto-generated)
 
-- Generated: 2025-11-29 23:38:10 UTC
+- Generated: 2025-11-29 23:45:49 UTC
 - Branch: watcherchannels
 
 ## Structure (depth=4)
@@ -124,6 +124,7 @@
 ├── scripts
 │   └── generate-project-map.sh
 ├── seed_channels.sqlite3
+├── service_account.json
 ├── tg_session.session
 ├── tg_session.session-journal
 ├── tg_session_2.session
@@ -133,7 +134,7 @@
 ├── tg_session_4.session-journal
 └── tree.txt
 
-17 directories, 109 files
+17 directories, 110 files
 ```
 
 ## Symbols index (functions/classes)
@@ -442,7 +443,7 @@ StructuredAdapter class        52 app/logging_json.py class StructuredAdapter(lo
 StructuredAdapter.__init__ member       53 app/logging_json.py def __init__(self, logger: logging.Logger, context: Optional[Dict[str, Any]] = None):
 StructuredAdapter.add_context member       56 app/logging_json.py def add_context(self, **ctx):
 StructuredAdapter.log member       59 app/logging_json.py def log(self, level: int, msg: Any, *args, **kwargs):
-Symbols index (functions/classes) section     139 docs/PROJECT_MAP.md ## Symbols index (functions/classes)
+Symbols index (functions/classes) section     140 docs/PROJECT_MAP.md ## Symbols index (functions/classes)
 TARGET_FLUSH_SEC variable     14 app/services/gsheets_buffer.py TARGET_FLUSH_SEC = 15.0
 TERMINAL         variable     64 app/services/requested_reconciler.py TERMINAL = "terminal"
 TICK_SEC         variable     24 app/services/requested_reconciler.py TICK_SEC = int(os.getenv("REQUESTED_RECONCILER_TICK", "60") or "60")
@@ -928,6 +929,8 @@ apply_insert_before function     29 apply_anchored_patch.py def apply_insert_bef
 apply_regex_replace function     35 apply_anchored_patch.py def apply_regex_replace(content, pattern, repl, count=1, flags=""):
 apply_replace    function     12 apply_anchored_patch.py def apply_replace(content, before, after, allow_multiple=False):
 apply_replace_between function     52 apply_anchored_patch.py def apply_replace_between(content, begin_marker, end_marker, payload, include_markers=False):
+auth_provider_x509_cert_url string       10 service_account.json "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+auth_uri         string        8 service_account.json "auth_uri": "https://accounts.google.com/o/oauth2/auth",
 await_action     variable      5 app/bot/states.py await_action = State()
 back_to_menu_kb  function     13 app/bot/keyboards.py def back_to_menu_kb():
 backoff_invite_miss function    266 app/services/requested_reconciler_db.py def backoff_invite_miss(session: str, invite_hash: str) -> None:
@@ -955,6 +958,9 @@ clear            function    422 app/services/requested_reconciler_db.py def cle
 clear_invite     function    325 app/services/requested_reconciler_db.py def clear_invite(session: str, invite_hash: str) -> None:
 client           variable     15 app/telethon_client.py client = TelegramClient(SESSION, API_ID, API_HASH, connection=ConnectionTcpAbridged)
 client           variable     68 app/services/feature/seed_creator.py client: Optional[TelegramClient] = None
+client_email     string        6 service_account.json "client_email": "watchdog-service@watchdog-bot-469918.iam.gserviceaccount.com",
+client_id        string        7 service_account.json "client_id": "112428346538027783929",
+client_x509_cert_url string       11 service_account.json "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/watchdog-service%40watchdog-bot-469918.iam.gserviceaccount.com",
 cmd_help         function     61 app/services/feature/channel_seed.py async def cmd_help(event):
 cmd_off          function    413 app/plugins/monitor_links.py async def cmd_off(ev):
 cmd_on           function    391 app/plugins/monitor_links.py async def cmd_on(ev):
@@ -1233,8 +1239,11 @@ post_to_channels function    100 app/services/feature/seed_posts.py async def po
 post_to_channels._post_one function    126 app/services/feature/seed_posts.py async def _post_one(ent, link_repr: str):
 posts_result_init unknown      17 main.py          from app.services.posts_watch_result_db import init as posts_result_init
 postwatch_init   unknown      10 main.py          from app.services.post_watch_db import init as postwatch_init
+private_key      string        5 service_account.json "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC969ROdwxA2y9C\nVxIorZRLAPP/iGJQFkqvn09KECDlZge3gZzBkXgA0FNhGGwMibzL8HjLZ8l1bb9d\n8XEledbtp8bay67Hf8UlEChGaZLylhZhQXQPMiteVLZfP5pVp3Sxt3gs6oFMf7U5\nyPmhkr77oszSl/IUYh6BAQjg3w6QbcU498H5lymLpU1ctZUSquAiDHFawtgZqUg0\nGNKcb55/zoM1nTq0zIguRiG6iAJpdaCfQ9cwxZXUq8vH1xnKqJ+e7UrhOSzRpObW\nwp7DC5HV8uS6R+JexjLvX3vU9HFguAO9/r4mKXbhhHg9OTNATsRDsGcuFTVZwa7R\nRAbRhScTAgMBAAECggEAOOV5JYaZp6ZiWpP+LyyNNAkVj/SaS1baShHGbbA2QrMV\n1b5hKUY8trWyfPCVkg4Dfu9MKNevbVwTDABEfs8o+eqc8rg5ZK/c7lUQU8PWD5Gy\nI7G5pMHJZ0mmlxNVV5rCpWkK+h3I3ZOWxbh1PJfbWkRz6xU1IzEf5VLbh46bbN3J\nqEmRxw64hSQxBnQL2A6m/pyuoRssT0Quj6KkeuQpkCbl+/Abk7z7OADaM+Q54DAt\nZOt0d9OrzVWd4kG/+TMd568BoINi9sow7/vObYD8De2s/zvsgg8XlZqLAzoVH4iR\n2te7NLZTDUKDZvPipuxuf5VCjFTcbGMoCVn8HQIgxQKBgQDgfwUa5Mg5tiT5uaCI\nxix87GsVO8kOLFDMErzb3ob2rNGT7vzU1UitdVpKi5ZHc+JpyDBKcE/ZJCbcGOue\nmwl8eNhwdVygRDfIR7/wzGPJENZRLWkd/g8CrDm9PJpU1Y9QRLnxcmxxSnczLkO5\n/bCkbLWoB0jYtHvP5eM5eIyZBQKBgQDYkrXy9AWfA5CpjiQITQ+Z/Ti4HrewYMyN\noYXX6SuPF3tpHSYDpx1HEdHe7o1paInnQXaJT/bzhlOKux9fh/WSMOKn4CmC/HAQ\nLlEpfYgFSOmpCHlNK2Xm478TC3i3QW8vO+MGyOgcsaaB/WXwjlPB/5KmCzwzN7f+\nvanQaxXbNwKBgQCAfzPk2N7iaadwaRfCMex09L22QaorOqJkrLT9BLorp2+uRTTi\nfdJDttAfqxYxf9swwS0i7nZFy7OSd5EmD4e2f1UjyYljEqj7MlZi9hqHk+OYQ23P\nhQQCe6Hw9yc/N534S95CnUQE9KKV4P1TECpzcuXnb4P6xhO4Q9Vzp9SSIQKBgQDE\n53aX4rctoO8oyXwHNBEIP4sPE5aMvSWda4qmCHA7E+13XzINxiW/VPtMRfW6LXqc\nEA+2vkZXmPxhuMnIcHOcK+gXG56CYgN9Iq9WGrTNoUIYFgU7XUazysMRjK9/ZfWx\nqzA5HfazB+3MZ9gEA1MxoazyXGqqYnFeIZDAVmwztwKBgEL5hbwu24SFWV8C2jfk\ny3JeiuKJQVQRIQ6QifWo2Sw+kEW6T2qmEDoGfLE+s85o1TbMDIeEmyoWApALoKPH\n5EXObfRJrSaZy134HxcYAT4+yRAAQzyD721pZnkqHimQ92bfjmWQMJotNHoxlWkZ\nwhg4R4MDf/NVbvwioBqG8FpJ\n-----END PRIVATE KEY-----\n",
+private_key_id   string        4 service_account.json "private_key_id": "bb9a0d676e158c92c1e73ffc5b0da4e1c210da96",
 probe_channel_id function     64 app/services/joiner.py async def probe_channel_id(client, url: str):
 process_links    function    409 app/flows/batch_links/process_links.py async def process_links(message, text: str, owner_display: Optional[str] = None, owner_username: Optional[str] = None):
+project_id       string        3 service_account.json "project_id": "watchdog-bot-469918",
 prune_orphan_links function    292 app/services/channel_db.py def prune_orphan_links(max_without_channel: int = 10000) -> int:
 pt_init          unknown      10 app/plugins/post_templates.py from app.services.post_watch_db import init as pt_init, add_template, list_templates
 raw_connection   function    318 app/services/channel_db.py def raw_connection() -> sqlite3.Connection:
@@ -1372,6 +1381,7 @@ throttle_probe   function     38 app/utils/throttle.py async def throttle_probe(
 throttle_public  function     59 app/utils/throttle.py async def throttle_public() -> None:
 time_window      variable     11 app/bot/states.py time_window = State()
 title            variable    115 app/services/models.py title = Column(Text, nullable=True)
+token_uri        string        9 service_account.json "token_uri": "https://oauth2.googleapis.com/token",
 tries            variable     56 app/services/requested_reconciler_db.py tries: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 tries            variable     71 app/services/requested_reconciler_db.py tries: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 tries            variable    177 app/services/models.py tries = Column(Integer, nullable=False, default=0)
@@ -1382,6 +1392,8 @@ ts               variable    152 app/services/models.py ts = Column(Integer, nul
 ttypes           unknown       6 app/plugins/batch_links.py from telethon.tl import types as ttypes # для перевірки entities/markup
 ttypes           unknown       7 app/flows/batch_links/process_links.py from telethon.tl import types as ttypes # для читання MessageEntityTextUrl
 ttypes           unknown       7 app/plugins/post_templates.py from telethon.tl import types as ttypes
+type             string        2 service_account.json "type": "service_account",
+universe_domain  string       12 service_account.json "universe_domain": "googleapis.com"
 update_cap       member       58 app/services/join_scheduler.py def update_cap(self, new_cap: int, window_sec: int):
 update_progress  function    106 app/services/monitor_links_bridge.py async def update_progress(control_msg_id: int, text: str) -> None:
 updated_at       variable    116 app/services/models.py updated_at = Column(Integer, nullable=True)
