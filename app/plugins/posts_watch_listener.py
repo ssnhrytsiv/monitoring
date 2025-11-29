@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import json
 from datetime import datetime, timedelta
-from typing import Callable, Optional, Dict, Tuple, Any
+from typing import Callable, Optional, Dict, Any
 from zoneinfo import ZoneInfo
+import re
 
 from telethon import events
-from telethon.tl.types import Message, Channel, Chat
+from telethon.tl.types import Message
 
 from app.telethon_client import client as MAIN_CLIENT
 from app.logging_json import get_logger
@@ -23,7 +23,8 @@ from app.services.posts_watch_result_db import (
     find_matched_by_message,
     list_due_pending_expire,
     mark_expired,
-    raw_connection,  # ⬅️ потрібен для читання owner із БД (залишаю як було)
+    raw_connection,
+    insert_watch_event,
 )
 from app.services.html_match import exact_html_equal
 from app.services.account_pool import iter_pool_clients, session_name
@@ -34,10 +35,10 @@ try:
 except Exception:
     list_templates_full = None  # type: ignore
 
-# ⬇️ нова інтеграція з Google Sheets через буфер
 SHEETS_OK = False
 try:
     from app.services import gsheets_buffer
+
     SHEETS_OK = True
 except Exception:
     gsheets_buffer = None  # type: ignore
@@ -48,14 +49,12 @@ _pylog = logging.getLogger("plugin.posts_watch_listener")
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 COVERAGE_POLL_TICK_SEC = 30
 
-# --- Глобальна дідуплікація видалень між усіма лістенерами (процес-wide) ---
-_GLOBAL_DELETED_SEEN: Dict[int, float] = {}   # wid -> monotonic_ts, спільний для всіх сесій
-GLOBAL_DELETED_TTL = 180.0  # секунди; протягом цього часу повторні delete того ж wid ігноруються
+_GLOBAL_DELETED_SEEN: Dict[int, float] = {}
+GLOBAL_DELETED_TTL = 180.0
+
 
 def _now_monotonic() -> float:
-    # один спільний монотонний таймер для всього модуля
     return asyncio.get_event_loop().time()
-
 
 
 def _human(dt: datetime) -> str:
@@ -129,27 +128,6 @@ def _init_html_renderer():
 
 
 _init_html_renderer()
-log.info("posts_watch_listener: HTML renderer = %s", _HTML_RENDER_SRC)
-
-
-_TEMPLATE_TITLE_CACHE: Dict[int, Optional[str]] = {}
-def _get_template_title(tid: Optional[int]) -> Optional[str]:
-    if not tid or tid <= 0:
-        return None
-    if tid in _TEMPLATE_TITLE_CACHE:
-        return _TEMPLATE_TITLE_CACHE[tid]
-    title: Optional[str] = None
-    try:
-        if list_templates_full:
-            rows = list_templates_full(limit=500)
-            for r in rows:
-                if r[0] == tid:
-                    title = (r[5] if len(r) > 5 else None) or None
-                    break
-    except Exception:
-        _pylog.exception("template title lookup failed (tid=%s)", tid)
-    _TEMPLATE_TITLE_CACHE[tid] = title
-    return title
 
 
 def _db_get_watch_core(wid: int) -> Optional[Dict[str, Any]]:
@@ -181,62 +159,74 @@ def _db_get_watch_core(wid: int) -> Optional[Dict[str, Any]]:
     return None
 
 
-# (залишаю як було; може згодитися для інших місць)
-def _db_get_owner_for_channel(channel_id: int) -> Tuple[Optional[str], Optional[str]]:
+# --- HTML normalization ------------------------------------------------------
+
+_A_TAG_RE = re.compile(r'<a\s+href=(?P<q1>"|\')(?P<href>.+?)(?P=q1)>(?P<body>.*?)</a>', re.DOTALL | re.IGNORECASE)
+
+def _strip_simple_tags(html_fragment: str) -> str:
     """
-    Очікує таблицю channels_meta(channel_id, owner_display, owner_link) — залишено без змін.
+    Видаляє прості теги форматування (<b>, <u>, <i>, <strong>, <em>) з фрагмента,
+    залишаючи тільки текст усередині.
     """
-    try:
-        conn = raw_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT owner_display, owner_link FROM channels_meta WHERE channel_id = ? LIMIT 1",
-            (int(channel_id),),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None, None
-        od, ol = row[0], row[1]
-        return (str(od) if od else None, str(ol) if ol else None)
-    except Exception:
-        _pylog.exception("_db_get_owner_for_channel failed (cid=%s)", channel_id)
-        return None, None
+    # прибираємо відкриваючі/закриваючі теги b/u/i/strong/em (без атрибутів)
+    return re.sub(r'</?(?:b|u|i|strong|em)>', '', html_fragment, flags=re.IGNORECASE)
 
 
-def _sheet_date_from_time_window_start(tws: Optional[str]) -> str:
-    if tws:
-        try:
-            dt = datetime.strptime(tws, "%Y-%m-%d %H:%M:%S")
-            return dt.strftime("%Y-%m-%d")
-        except Exception:
-            pass
-    return datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
+def _normalize_html_links(html: str) -> str:
+    """
+    Нормалізує HTML так, щоб такі варіанти вважалися однаковими:
+
+      X
+      <u>X</u>
+      <b><u>X</u></b>
+      <a href="X">X</a>
+      <a href="X"><u>X</u></a>
+      <a href="X"><b><u>X</u></b></a>
+      та подібні комбінації форматування навколо X.
+
+    Якщо весь текст усередині <a> після видалення простих тегів дорівнює href,
+    ми розкриваємо <a> і залишаємо лише його тіло (з форматуванням).
+    """
+    if not html:
+        return html
+
+    def _replace_a(m: re.Match) -> str:
+        href = m.group("href")
+        body = m.group("body")
+
+        # Текст усередині <a> без b/u/i/strong/em
+        inner_plain = _strip_simple_tags(body)
+        # Також прибираємо зайві пробіли
+        inner_plain_stripped = inner_plain.strip()
+        href_stripped = href.strip()
+
+        if inner_plain_stripped == href_stripped:
+            # href і (розформатований) текст однакові → прибираємо сам <a>,
+            # але зберігаємо внутрішні теги форматування (<b>, <u>, ...)
+            return body
+        else:
+            # інакше залишаємо <a> як є
+            return m.group(0)
+
+    # 1) Нормалізація <a href="X">...</a>, де ... по суті X з простим форматуванням
+    html = _A_TAG_RE.sub(_replace_a, html)
+
+    # 2) &amp; → &
+    html = html.replace("&amp;", "&")
+
+    # 3) Прибрати зайві пробіли навколо <a> (якщо ще лишилися)
+    html = re.sub(r">\s+([^<])", r">\1", html)        # <a ...>  X -> <a ...>X
+    html = re.sub(r"([^>])\s+</a>", r"\1</a>", html)  # X  </a> -> X</a>
+
+    return html
 
 
-def _resolve_channel_title(entity: Optional[Channel | Chat]) -> Optional[str]:
-    try:
-        if entity and getattr(entity, "title", None):
-            return str(entity.title)
-    except Exception:
-        pass
-    return None
-
-
-def _links_text_from_json(links_json: Optional[str]) -> str:
-    try:
-        if not links_json:
-            return ""
-        arr = json.loads(links_json)
-        if isinstance(arr, list):
-            return "\n".join(str(x) for x in arr if x)
-    except Exception:
-        pass
-    return ""
+# --- Workers -----------------------------------------------------------------
 
 
 async def _views_worker():
     if not config.WATCH_VIEWS_ENABLED:
-        log.info("posts_watch_listener: views disabled; worker not started")
+        log.info("posts_watch_listener: views disabled")
         return
 
     log.info("posts_watch_listener: views worker started (tick=%ss)", COVERAGE_POLL_TICK_SEC)
@@ -246,9 +236,6 @@ async def _views_worker():
             pool_map = {session_name(s.client): s.client for s in slots}
 
             due = list_due_coverage()
-            if due:
-                log.debug("views: due rows=%s", len(due))
-
             for watch_id, channel_id, msg_id, matched_session in due:
                 cli = MAIN_CLIENT if not matched_session or matched_session == "MAIN" else pool_map.get(matched_session)
                 if cli is None:
@@ -256,25 +243,30 @@ async def _views_worker():
                 try:
                     msg: Message | None = await cli.get_messages(entity=channel_id, ids=msg_id)
                 except Exception as e:
-                    _pylog.exception(
-                        "views: get_messages failed (wid=%s cid=%s mid=%s session=%s): %s",
-                        watch_id, channel_id, msg_id, matched_session, e
-                    )
+                    _pylog.exception("views: get_messages failed (wid=%s cid=%s mid=%s): %s", watch_id, channel_id,
+                                     msg_id, e)
                     msg = None
 
                 if msg is None:
-                    log.debug("views: msg not fetched (wid=%s) — skip until next tick", watch_id)
                     continue
 
                 views = int(getattr(msg, "views", 0) or 0)
                 try:
                     mark_done_views(watch_id, views)
-                    log.info("views: views=%s -> done (wid=%s cid=%s mid=%s session=%s)",
-                             views, watch_id, channel_id, msg_id, matched_session)
+                    insert_watch_event(
+                        watch_id,
+                        "views",
+                        {
+                            "watch_id": watch_id,
+                            "channel_id": channel_id,
+                            "message_id": msg_id,
+                            "views": views,
+                        },
+                    )
+                    log.info("views: wid=%s views=%s -> done", watch_id, views)
                 except Exception:
                     _pylog.exception("views: mark_done_views failed (wid=%s)", watch_id)
 
-                # ⬇️ оновлення у Google Sheets через буфер (коалесинг, 30s флаш)
                 if SHEETS_OK and gsheets_buffer:
                     try:
                         gsheets_buffer.record_views(watch_id, views)
@@ -285,7 +277,7 @@ async def _views_worker():
             log.warning("views worker cancelled")
             break
         except Exception:
-            _pylog.exception("views: tick failed")
+            _pylog.exception("views tick failed")
 
         await asyncio.sleep(COVERAGE_POLL_TICK_SEC)
 
@@ -298,22 +290,150 @@ async def _pending_expire_worker():
             for wid in due_ids:
                 try:
                     mark_expired(wid)
-                    log.info("expire: wid=%s -> expired (pending window elapsed)", wid)
+                    insert_watch_event(wid, "expired", {"watch_id": wid})
+                    log.info("expire: wid=%s -> expired", wid)
                 except Exception:
                     _pylog.exception("expire: mark_expired failed (wid=%s)", wid)
+
+                if SHEETS_OK and gsheets_buffer:
+                    try:
+                        gsheets_buffer.record_expired(wid)
+                    except Exception:
+                        _pylog.exception("gsheets_buffer.record_expired failed (wid=%s)", wid)
+
         except asyncio.CancelledError:
             log.warning("pending-expire worker cancelled")
             break
         except Exception:
-            _pylog.exception("expire: tick failed")
+            _pylog.exception("pending-expire tick failed")
+
         await asyncio.sleep(COVERAGE_POLL_TICK_SEC)
 
 
-def _attach_listener_for_client(tag: str, cli) -> None:
-    # Локальний кеш для дідуплікації повторних deleted-подій
+def _mark_done_edited_other(wid: int) -> str:
+    now_str = _human(datetime.now(MOSCOW_TZ))
+    try:
+        conn = raw_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE watch_posts
+            SET status='done', updated_at=?
+            WHERE id=? AND status IN ('matched','done')
+            """,
+            (now_str, int(wid)),
+        )
+        conn.commit()
+    except Exception:
+        _pylog.exception("mark edited-other failed (wid=%s)", wid)
+    return now_str
 
+
+# --- Telethon listeners ------------------------------------------------------
+
+
+def _attach_listener_for_client(tag: str, cli) -> None:
     @cli.on(events.NewMessage())
     async def _on_new_message(ev: events.NewMessage.Event):
+        _pylog.info("We here!!!!!!!!! fffffff")
+
+        m: Message = ev.message
+        _pylog.info(m)
+        cid = None
+        # ігноруємо MAIN
+        if tag == "MAIN":
+            return
+        try:
+            if hasattr(m, "peer_id") and getattr(m.peer_id, "channel_id", None) is not None:
+                cid = int(m.peer_id.channel_id)
+            elif getattr(m, "chat_id", None) is not None:
+                cid = int(m.chat_id)
+        except Exception as e:
+            _pylog.info(f"Exception: {m.message}{e}")
+            cid = None
+
+        if not cid or cid <= 0:
+            return
+
+        mid = int(getattr(m, "id", 0) or 0)
+
+        _pylog.info("listen: NEW_MESSAGE cid=%s mid=%s session=%s", cid, mid, tag)
+
+        try:
+            pending = get_pending_by_channel(cid)
+        except Exception:
+            _pylog.exception("listen: get_pending_by_channel failed (cid=%s)", cid)
+            return
+
+        if not pending:
+            _pylog.info("listen: no pending watches for cid=%s", cid)
+            return
+
+        _pylog.info("listen: found %s pending watches for cid=%s", len(pending), cid)
+
+        try:
+            msg_html = _HTML_RENDER(m) if _HTML_RENDER else (getattr(m, "message", "") or "")
+        except Exception:
+            _pylog.exception("listen: HTML render failed (cid=%s mid=%s)", cid, mid)
+            msg_html = (getattr(m, "message", "") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        matched_any = False
+
+        for row in pending:
+            wid = int(row["id"])
+            expected_html = row.get("expected_text_hash")
+            if not expected_html:
+                _pylog.info("listen: wid=%s has no expected_html, skip", wid)
+                continue
+
+            try:
+                # нормалізуємо HTML так, щоб <a href="X">X</a> і X вважались однаковими
+                msg_html_norm = _normalize_html_links(msg_html)
+                expected_html_norm = _normalize_html_links(expected_html)
+
+                ok = exact_html_equal(msg_html_norm, expected_html_norm)
+                _pylog.info(
+                    "listen: compare wid=%s cid=%s mid=%s session=%s -> %s",
+                    wid, cid, mid, tag, ok,
+                )
+            except Exception:
+                _pylog.exception("listen: exact_html_equal failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
+                ok = False
+
+            if not ok:
+                continue
+
+            coverage_at = _calc_coverage_at()
+            matched_session = tag
+            try:
+                mark_matched(wid, mid, coverage_at, matched_session=matched_session)
+                insert_watch_event(
+                    wid,
+                    "matched",
+                    {
+                        "watch_id": wid,
+                        "channel_id": cid,
+                        "message_id": mid,
+                        "session": matched_session,
+                    },
+                )
+                matched_any = True
+                log.info("listen: MATCH wid=%s cid=%s mid=%s session=%s", wid, cid, mid, matched_session)
+            except Exception:
+                _pylog.exception("listen: mark_matched failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
+                continue
+
+            if SHEETS_OK and gsheets_buffer:
+                try:
+                    gsheets_buffer.record_matched(wid)
+                except Exception:
+                    _pylog.exception("gsheets_buffer.record_matched failed (wid=%s)", wid)
+
+        if not matched_any:
+            return
+
+    @cli.on(events.MessageEdited())
+    async def _on_edited(ev: events.MessageEdited.Event):
         m: Message = ev.message
 
         cid = None
@@ -329,78 +449,66 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             return
 
         mid = int(getattr(m, "id", 0) or 0)
-
-        try:
-            pending = get_pending_by_channel(cid)
-        except Exception:
-            _pylog.exception("listen: get_pending_by_channel failed (cid=%s)", cid)
+        if not mid:
             return
 
-        if not pending:
-            log.debug("listen: [%s] new msg cid=%s mid=%s bytes=%s (no pending)",
-                      tag, cid, mid, len((getattr(m, 'message', '') or "")))
+        try:
+            wids = find_matched_by_message(cid, mid)
+        except Exception:
+            _pylog.exception("edited: find_matched_by_message failed (cid=%s mid=%s)", cid, mid)
+            return
+
+        if not wids:
             return
 
         try:
             msg_html = _HTML_RENDER(m) if _HTML_RENDER else (getattr(m, "message", "") or "")
         except Exception:
-            _pylog.exception("listen: HTML render failed (cid=%s mid=%s)", cid, mid)
-            msg_html = (getattr(m, "message", "") or "") \
-                .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            _pylog.exception("edited: HTML render failed (cid=%s mid=%s)", cid, mid)
+            msg_html = (getattr(m, "message", "") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-        log.debug("listen: [%s] new msg cid=%s mid=%s msg_html_len=%s pending=%s",
-                  tag, cid, mid, len(msg_html or ""), len(pending))
+        for wid in wids:
+            wc = _db_get_watch_core(int(wid))
+            if not wc:
+                continue
+            expected_html = wc.get("expected_text_hash")
+            if not expected_html:
+                continue
 
-        matched_any = False
+            try:
+                msg_html_norm = _normalize_html_links(msg_html)
+                expected_html_norm = _normalize_html_links(expected_html)
+                ok = exact_html_equal(msg_html_norm, expected_html_norm)
+            except Exception:
+                _pylog.exception("edited: exact_html_equal failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
 
-        try:
-            for row in pending:
-                wid = int(row["id"])
-                expected_html = row.get("expected_text_hash")
-                if not expected_html:
-                    log.warning("listen: wid=%s has empty expected_html — skip", wid)
-                    continue
+                ok = False
 
+            if ok:
+                continue
+
+            now_str = _mark_done_edited_other(int(wid))
+            try:
+                insert_watch_event(
+                    int(wid),
+                    "edited_other",
+                    {
+                        "watch_id": int(wid),
+                        "channel_id": cid,
+                        "message_id": mid,
+                        "edited_at": now_str,
+                    },
+                )
+            except Exception:
+                pass
+
+            log.info("edited: wid=%s cid=%s mid=%s -> edited_other at=%s", wid, cid, mid, now_str)
+
+            if SHEETS_OK and gsheets_buffer:
                 try:
-                    ok = exact_html_equal(msg_html, expected_html)
+                    gsheets_buffer.record_edited_other_post(int(wid), now_str)
                 except Exception:
-                    _pylog.exception("listen: exact_html_equal failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
-                    ok = False
-
-                if ok:
-                    coverage_at = _calc_coverage_at()
-                    matched_session = tag
-                    try:
-                        mark_matched(wid, mid, coverage_at, matched_session=matched_session)
-                        matched_any = True
-                        log.info("listen: [%s] MATCH wid=%s cid=%s mid=%s cov_at=%s session=%s",
-                                 tag, wid, cid, mid, coverage_at, matched_session)
-                    except Exception:
-                        _pylog.exception("listen: mark_matched failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
-                        continue
-
-                    # ⬇️ Google Sheets (коалесинг у буфері)
-                    if SHEETS_OK and gsheets_buffer:
-                        try:
-                            gsheets_buffer.record_matched(wid)
-                        except Exception:
-                            _pylog.exception("gsheets_buffer.record_matched failed (wid=%s)", wid)
-
-                else:
-                    log.debug(
-                        "listen: [%s] no-match wid=%s cid=%s mid=%s (lens: msg=%s vs tpl=%s)\n"
-                        "  msg[:160]=%r\n  tpl[:160]=%r",
-                        tag, wid, cid, mid,
-                        len(msg_html or ""), len(expected_html or ""),
-                        (msg_html or "")[:160], (expected_html or "")[:160]
-                    )
-
-        finally:
-            # Нічого не флашимо вручну — це робить фоновий флашер кожні ~30с (або за порогом)
-            pass
-
-        if not matched_any:
-            log.debug("listen: [%s] ended with no matches (cid=%s mid=%s)", tag, cid, mid)
+                    _pylog.exception("gsheets_buffer.record_edited_other_post failed (wid=%s)", wid)
 
     @cli.on(events.MessageDeleted())
     async def _on_deleted(ev: events.MessageDeleted.Event):
@@ -424,7 +532,6 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 cid = None
 
         if not cid or cid <= 0:
-            log.debug("deleted: cannot resolve cid (raw chat_id=%s)", getattr(ev, "chat_id", None))
             return
 
         for mid in (ev.deleted_ids or []):
@@ -435,24 +542,30 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 continue
 
             if not wids:
-                log.debug("deleted: no matched rows for cid=%s mid=%s", cid, mid)
                 continue
 
             now_m = _now_monotonic()
 
             for wid in wids:
-                # 🔒 Глобальна дідупка між усіма лістенерами (процес-wide)
                 last = _GLOBAL_DELETED_SEEN.get(wid)
                 if last is not None and (now_m - last) < GLOBAL_DELETED_TTL:
-                    log.debug("deleted: wid=%s skipped (global dedup within %.0fs)", wid, GLOBAL_DELETED_TTL)
                     continue
-                _GLOBAL_DELETED_SEEN[wid] = now_m  # тільки перший робить БД+Sheets
+                _GLOBAL_DELETED_SEEN[wid] = now_m
 
                 try:
                     mark_done_deleted(wid)
-                    log.info("deleted: wid=%s -> done (cid=%s mid=%s)", wid, cid, mid)
+                    insert_watch_event(
+                        wid,
+                        "deleted",
+                        {
+                            "watch_id": wid,
+                            "channel_id": cid,
+                            "message_id": int(mid),
+                        },
+                    )
+                    log.info("deleted: wid=%s cid=%s mid=%s -> done", wid, cid, mid)
                 except Exception:
-                    _pylog.exception("deleted: mark_done_deleted failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
+                    _pylog.exception("deleted: mark_done_deleted failed (wid=%s)", wid)
 
                 if SHEETS_OK and gsheets_buffer:
                     try:
@@ -461,17 +574,16 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                         _pylog.exception("gsheets_buffer.record_deleted failed (wid=%s)", wid)
 
 
+# --- Setup -------------------------------------------------------------------
+
+
 def setup(client=None, control_peer=None, monitor_buffer=None, **_):
     active_channels = set(list_active_channels())
-    if not active_channels:
-        log.info("posts_watch_listener: no active channels at load (listens to all and filters by DB)")
-    else:
-        log.info("posts_watch_listener: active channels at load: %s", len(active_channels))
+    log.info("posts_watch_listener: active_channels=%s", len(active_channels))
 
-    # Запускаємо фоновий флашер буфера (коалесинг і батчі кожні ~30с)
     if SHEETS_OK and gsheets_buffer:
         try:
-            gsheets_buffer.set_flush_interval(15)  # за ТЗ — частіше ніж година; 15с, якщо є що флашити
+            gsheets_buffer.set_flush_interval(15)
             gsheets_buffer.start_flusher()
             log.info("posts_watch_listener: gsheets_buffer flusher started")
         except Exception:
@@ -482,20 +594,18 @@ def setup(client=None, control_peer=None, monitor_buffer=None, **_):
         try:
             tag = session_name(s.client)
             _attach_listener_for_client(tag, s.client)
-            log.info("posts_watch_listener: attached listener to pool client: %s", tag)
+            log.info("posts_watch_listener: attached listener to pool client: %s %s", tag, s.client )
         except Exception:
             _pylog.exception("attach failed for pool client: %s", getattr(s, "name", "?"))
 
-    _attach_listener_for_client("MAIN", MAIN_CLIENT)
-    log.info("posts_watch_listener: attached listener to MAIN client")
+    #_attach_listener_for_client("MAIN", MAIN_CLIENT)
+    #log.info("posts_watch_listener: attached listener to MAIN client")
 
     loop = asyncio.get_event_loop()
 
     if config.WATCH_VIEWS_ENABLED:
         loop.create_task(_views_worker(), name="posts_watch_views")
         log.info("posts_watch_listener: views worker scheduled")
-    else:
-        log.info("posts_watch_listener: views disabled; no views worker started")
 
     loop.create_task(_pending_expire_worker(), name="posts_watch_expire_pending")
     log.info("posts_watch_listener: pending-expire worker scheduled")

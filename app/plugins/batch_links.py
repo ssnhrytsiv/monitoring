@@ -122,6 +122,7 @@ def setup(client, control_peer=None, monitor_buffer=None, **kwargs):
 
     @client.on(events.NewMessage())
     async def _msg(evt):
+        log.info("WE ARE IN BATCH")
         # фільтри доступу/режиму
         if _CONTROL_PEER_ID is not None and evt.chat_id != _CONTROL_PEER_ID:
             return

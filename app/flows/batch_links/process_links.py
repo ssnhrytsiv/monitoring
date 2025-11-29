@@ -6,6 +6,13 @@ from html import escape as _escape
 
 from telethon.tl import types as ttypes  # для читання MessageEntityTextUrl
 
+import os
+import re
+from typing import Optional, List
+
+from aiogram import Bot
+from app.bot.processing_guard import set_processing
+
 from app.plugins.progress_live import DebouncedProgress
 from app.utils.link_parser import extract_links
 from app.utils.throttle import throttle_between_links
@@ -14,6 +21,13 @@ from app.services.joiner import probe_channel_id, ensure_join
 from app.services.account_pool import (
     iter_ready_pool_clients, bump_cooldown, mark_flood, mark_limit, session_name as _session_name
 )
+
+from aiogram import Bot
+from aiogram.client.default import DefaultBotProperties
+from app.bot.processing_guard import get_processing, set_processing
+from app.bot.keyboards import main_menu_kb
+from app.bot.keyboards import back_to_menu_kb
+
 from app.services.membership_db import (
     upsert_membership, get_membership, any_final_for_channel, url_get, url_put,
 )
@@ -393,7 +407,19 @@ def _invite_owner_conflict(invite_hash: Optional[str],
 
 
 async def process_links(message, text: str, owner_display: Optional[str] = None, owner_username: Optional[str] = None):
-    # snapshot owner (із буфера, якщо не передали явно)
+    bot_user_id: Optional[int] = None
+    raw_text = text or ""
+    first_line, _, rest_text = raw_text.partition("\n")
+    m_uid = re.match(r"\[BOT_UID:(\d+)\]", first_line.strip())
+    if m_uid:
+        try:
+            bot_user_id = int(m_uid.group(1))
+        except Exception:
+            bot_user_id = None
+        text = rest_text
+    else:
+        text = raw_text
+
     od = owner_display
     ou = owner_username
     if od is None or ou is None:
@@ -408,7 +434,6 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
         except Exception:
             pass
 
-    # ---- GUARD FIX: ключ для guard має бути не порожнім
     _chat = getattr(message, "chat", None)
     _cid = getattr(_chat, "id", None)
     _src = str(_cid or "")
@@ -421,13 +446,16 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
         return
 
     try:
-        # 1) URL із raw-тексту + 2) приховані (entities)
         links_text = extract_links(text)
         hidden = _extract_hidden_links_from_message(message)
-        links_all = links_text + hidden
-        log.debug("[PL] parsed links: raw=%d hidden=%d", len(links_text), len(hidden))
 
-        # нормалізація + дедуп
+        # 🔍 ДЛЯ ДЕБАГУ: показати, що саме ми бачимо
+        log.info("[PL] extract_links (plain) -> %r", links_text)
+        log.info("[PL] hidden_links (entities) -> %r", hidden)
+
+        links_all = links_text + hidden
+        log.info("[PL] parsed links: raw=%d hidden=%d", len(links_text), len(hidden))
+
         seen, links = set(), []
         for u in links_all:
             if not u:
@@ -458,7 +486,6 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
         if slots_probe:
             probe_client = getattr(slots_probe[0], "client", slots_probe[0])
 
-        # початковий бекоф для першої перевірки requested (з .env)
         try:
             REQ_START = int(os.getenv("REQUESTED_RECONCILE_BACKOFF_START", "21600"))
         except Exception:
@@ -470,19 +497,14 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
             title_current: Optional[str] = None
             channel_id: Optional[int] = None
             kind_for_link: Optional[str] = None
-            # позначка можливого конфлікту власника для інвайт-лінка (коли cid ще нема)
             invite_owner_conflict_repr: Optional[str] = None
             probe_kind: Optional[str] = None
             probe_invite: Optional[str] = None
-            # інвайт із ensure_join (або None)
             invite_hash_var: Optional[str] = None
-
-            # прапорець, щоб не дублювати запис конфлікту в межах одного URL
             conflict_logged: bool = False
 
             log.debug("[PL] #%d start url=%s", idx, url)
 
-            # дублі в межах одного пакету
             if url in used:
                 log.debug("[PL] #%d duplicate, skipping ensure_join", idx)
                 line = fmt_result_line(idx, url, "duplicate")
@@ -498,14 +520,12 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 continue
             used.add(url)
 
-            # легка проба
             if probe_client is not None:
                 try:
                     log.debug("[PL] #%d probe_channel_id(url=%s)", idx, url)
                     cid, title_probe, probe_kind, probe_invite = await probe_channel_id(probe_client, url)
                     log.debug("[PL] #%d probe result: cid=%s title=%s kind=%s invite=%s", idx, cid, title_probe, probe_kind, probe_invite)
 
-                    # Seed власника інвайту, якщо cid ще невідомий і це інвайт
                     if cid is None and probe_kind == "invite" and probe_invite:
                         try:
                             row_inv = channel_db.get_invite_owner(str(probe_invite))
@@ -533,7 +553,6 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                             if not is_conflict:
                                 channel_db.upsert_channel(channel_id, None, title_current, od, ou, "probe")
                             else:
-                                # записати конфлікт (probe)
                                 if not conflict_logged:
                                     if _persist_owner_conflict(channel_id, od, ou, probe_invite or url, "probe_mismatch"):
                                         conflict_logged = True
@@ -544,7 +563,6 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     log.debug("[PL] #%d probe_channel_id error: %s", idx, e)
                     channel_id = None
 
-            # кеш по channel_id
             if channel_id is not None:
                 final = any_final_for_channel(channel_id)
                 log.debug("[PL] #%d any_final_for_channel(%s) -> %s", idx, channel_id, final)
@@ -553,13 +571,11 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     is_conflict, ex_owner = _owner_conflict(channel_id, od, ou)
                     if is_conflict:
                         line = f"{line} | owner_conflict(existing={ex_owner})"
-                        # записати конфлікт (cached)
                         if not conflict_logged:
                             if _persist_owner_conflict(channel_id, od, ou, probe_invite or url, "cached_mismatch"):
                                 conflict_logged = True
                         log.debug("[PL] #%d owner conflict on cached, not updating channel row", idx)
                     results.append(line)
-                    # OK: розвʼязування лічильника в прогресі для final
                     if final == "joined":
                         progress.add_status("joined")
                     elif final == "already":
@@ -584,26 +600,21 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     await _short_pause()
                     continue
             else:
-                # кеш по URL
                 ust = url_get(url)
                 log.debug("[PL] #%d url_get(%s) -> %s", idx, url, ust)
                 if ust in ("joined", "already", "requested", "invalid", "private"):
                     if ust == "requested" and probe_kind == "invite" and probe_invite:
                         try:
-                            # Підштовхуємо лише ті сесії, що вже мають pending для цього інвайта
                             sess_list = reqdb.get_invite_sessions(str(probe_invite))
                             if sess_list:
                                 for sess0 in sess_list:
                                     reqdb.note_requested_invite(sess0, str(probe_invite), start_after_sec=REQ_START)
                             else:
-                                # Немає зафіксованих сесій — не створюємо запис «наосліп»
-                                log.debug(
-                                    "[PL] requested+invite cached but no invite sessions recorded; skip creating new check")
+                                log.debug("[PL] requested+invite cached but no invite sessions recorded; skip creating new check")
                         except Exception:
                             pass
 
                     line = fmt_result_line(idx, url, "cached", extra=ust)
-                    # Для requested+invite: визначити конфлікт і додати маркер
                     _ic_req_inv, _ex_req_inv = (False, None)
                     if ust == "requested" and probe_kind == "invite" and probe_invite:
                         try:
@@ -618,7 +629,6 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     if _ic_req_inv and _ex_req_inv:
                         status_part += f" | owner_conflict(existing={_ex_req_inv})"
                     result_items.append({"idx": idx, "url": url, "title": title_current, "status": status_part, "channel_id": channel_id})
-                    # OK: розвʼязування лічильника в прогресі для ust
                     if ust == "joined":
                         progress.add_status("joined")
                     elif ust == "already":
@@ -634,7 +644,6 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     await _short_pause()
                     continue
 
-            # немає вільних клієнтів — у чергу
             slots_raw = list(iter_ready_pool_clients())
             slots = _RR.pick_order(slots_raw)
             if not slots:
@@ -657,7 +666,6 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 break
             log.debug("[PL] slots available for ensure_join=%d for url=%s (RR applied)", len(slots), url)
 
-            # основна спроба
             line = None
             last_kind = None
             cid_eff: Optional[int] = channel_id
@@ -682,7 +690,7 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
 
                     acc_status = get_membership(who_sess, cid_eff)
                     log.debug("[PL] #%d membership(%s, %s) -> %s", idx, who_sess, cid_eff, acc_status)
-                    if acc_status in ("joined","already","requested","invalid","private","blocked","too_many"):
+                    if acc_status in ("joined", "already", "requested", "invalid", "private", "blocked", "too_many"):
                         if acc_status == "requested":
                             line = fmt_result_line(idx, url, "requested", who_display)
                             progress.add_status("requested")
@@ -693,7 +701,6 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 status, title, kind, cid_after, invite_hash = await ensure_join(client, url)
                 log.debug("[PL] #%d ensure_join done: status=%s kind=%s cid_after=%s invite_hash=%s", idx, status, kind, cid_after, invite_hash)
 
-                # зафіксувати інвайт, який повернув ensure_join
                 invite_hash_var = invite_hash or invite_hash_var
 
                 last_kind = kind
@@ -702,9 +709,9 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 if title and not title_current:
                     title_current = title
 
-                if cid_eff is not None and status in ("joined","already","requested","invalid","private","blocked","too_many"):
+                if cid_eff is not None and status in ("joined", "already", "requested", "invalid", "private", "blocked", "too_many"):
                     upsert_membership(who_sess, cid_eff, status)
-                if cid_eff is None and status in ("joined","already","requested","invalid","private"):
+                if cid_eff is None and status in ("joined", "already", "requested", "invalid", "private"):
                     url_put(url, status)
 
                 if cid_eff is not None:
@@ -713,7 +720,6 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                         if not is_conflict:
                             channel_db.upsert_channel(cid_eff, None, title_current, od, ou, status)
                         else:
-                            # записати конфлікт (upsert)
                             if not conflict_logged:
                                 if _persist_owner_conflict(cid_eff, od, ou, (invite_hash or invite_hash_var or url), "upsert_mismatch"):
                                     conflict_logged = True
@@ -730,7 +736,7 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     except Exception:
                         pass
 
-                if cid_eff is not None and status in ("joined","already","invalid","private","blocked","too_many"):
+                if cid_eff is not None and status in ("joined", "already", "invalid", "private", "blocked", "too_many"):
                     try:
                         reqdb.clear(who_sess, cid_eff)
                     except Exception:
@@ -787,12 +793,9 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
             if not line:
                 line = fmt_result_line(idx, url, "waiting")
 
-            # Спершу перевірка конфлікту за channel_id (якщо він відомий),
-            # інакше — спроба підсвітити конфлікт за інвайтом (requested-case).
             is_conflict, ex_owner = _owner_conflict(cid_eff, od, ou)
             invite_ex_owner = None
             if not is_conflict:
-                # Обрати ефективний інвайт: з ensure_join або з probe
                 _invite_eff = invite_hash_var or probe_invite
                 if _invite_eff:
                     try:
@@ -831,5 +834,69 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
             footer_full = "📊 Підсумок (всі):\n(помилка формування футера)"
         await progress.finish(footer=footer_full)
         log.info("batch done: total=%d uniq=%d", len(links), len(set(links)))
+
+        if bot_user_id is not None:
+            try:
+                token = os.getenv("BOT_TOKEN")
+                if token:
+                    summary_text = progress._last_render or progress._render(
+                        header_suffix="— готово ✅",
+                        final=True,
+                    )
+
+                    async with Bot(
+                            token=token,
+                            default=DefaultBotProperties(parse_mode="HTML"),
+                    ) as bot:
+                        pdata = get_processing(bot_user_id) or {}
+                        msg_id = pdata.get("msg_id")
+
+                        log.debug(
+                            "bot_notify_start",
+                            extra={"user_id": bot_user_id, "msg_id": msg_id},
+                        )
+
+                        if msg_id:
+                            try:
+                                await bot.edit_message_text(
+                                    chat_id=bot_user_id,
+                                    message_id=msg_id,
+                                    text=summary_text,
+                                    reply_markup=back_to_menu_kb(),
+                                    disable_web_page_preview=True,
+                                )
+                                log.info(
+                                    "bot_notify_edited",
+                                    extra={"user_id": bot_user_id, "msg_id": msg_id},
+                                )
+                            except Exception as e:
+                                log.exception(
+                                    "bot_notify_edit_failed",
+                                    extra={
+                                        "user_id": bot_user_id,
+                                        "msg_id": msg_id,
+                                        "err": str(e),
+                                    },
+                                )
+                                await bot.send_message(
+                                    bot_user_id,
+                                    summary_text,
+                                    reply_markup=back_to_menu_kb(),
+                                    disable_web_page_preview=True,
+                                )
+                        else:
+                            # fallback: msg_id немає – шлемо нове повідомлення
+                            await bot.send_message(
+                                bot_user_id,
+                                summary_text,
+                                reply_markup=back_to_menu_kb(),
+                                disable_web_page_preview=True,
+                            )
+                set_processing(bot_user_id, False)
+            except Exception as e:
+                log.exception(
+                    "bot_notify_failed",
+                    extra={"user_id": bot_user_id, "err": str(e)},
+                )
     finally:
         _guard_end(_owner_key, _src, "process_links", "done")

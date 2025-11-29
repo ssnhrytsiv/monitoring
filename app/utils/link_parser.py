@@ -1,8 +1,6 @@
-# app/utils/link_parser.py
 from __future__ import annotations
 import re
 from typing import Iterable, List, Optional, Union
-from typing import List
 
 try:
     # Імпортимо типи тільки якщо є telethon (щоб утиліта жила і без нього)
@@ -26,9 +24,9 @@ RE_HTML_TG = re.compile(
 )
 
 # 3) Сирі лінки та @username
-#    група 1 — шлях після t.me/, група 2 — @username
+#    група 1 — повний t.me-URL, група 2 — @username
 RE_TG_RAW = re.compile(
-    r"(?:https?://)?t\.me/([^\s)\]]+)|(@[A-Za-z0-9_]{3,})",
+    r"((?:https?://)?t\.me/[^\s<>'\")]+)|(@[A-Za-z0-9_]{3,})",
     re.IGNORECASE,
 )
 
@@ -109,8 +107,8 @@ def extract_links(text: str) -> List[str]:
 
     # 3) Сирі URL/username
     for m in RE_TG_RAW.finditer(text):
-        if m.group(1):  # шлях після t.me/
-            candidates.append("https://t.me/" + m.group(1).strip())
+        if m.group(1):  # повний t.me-URL
+            candidates.append(m.group(1).strip())
         elif m.group(2):  # @username
             candidates.append(m.group(2))
 
@@ -185,6 +183,7 @@ def extract_links_any(msg_or_text: Union[str, "TgMessage"]) -> List[str]:
 
     # випадок звичайного тексту
     return extract_links(str(msg_or_text or ""))
+
 
 async def collect_links(evt) -> List[str]:
     links: List[str] = []

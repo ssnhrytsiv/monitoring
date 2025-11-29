@@ -5,12 +5,13 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List
 from zoneinfo import ZoneInfo
+import asyncio
 
 from telethon import events
 
 from app.telethon_client import client as main_client  # базовий клієнт
 from app.logging_json import get_logger
-from app.utils.link_parser import extract_links
+from app.utils.link_parser import extract_links, extract_links_any
 from app.utils.tg_links import sanitize_link
 
 from app.services.joiner import probe_channel_id
@@ -243,16 +244,22 @@ def setup(*, client=None, control_peer=None, monitor_buffer=None):
             templates = list_templates_full(limit=200)
             tpl = next((t for t in templates if t[0] == template_id), None)
             if not tpl:
-                await ev.reply(f"❌ Шаблон #{template_id} не знайдено")
-                return
+                log.warning("watch_from_links: template not found first try tpl=%s, retrying", template_id)
+                await asyncio.sleep(0.3)
+                templates = list_templates_full(limit=200)
+                tpl = next((t for t in templates if t[0] == template_id), None)
+                if not tpl:
+                    await ev.reply(f"❌ Шаблон #{template_id} не знайдено (після retry)")
+                    return
 
             tpl_id, tpl_html, tpl_mode, tpl_thr, created_at, tpl_title, tpl_links_json = tpl
 
             body = ev.raw_text.split("\n", 1)[1] if "\n" in ev.raw_text else ""
             raw_links = extract_links(body)
+            ent_links = extract_links_any(ev.message)
             links: List[str] = []
             seen = set()
-            for u in raw_links:
+            for u in (raw_links + ent_links):
                 su = sanitize_link(u) or u
                 if su not in seen:
                     seen.add(su)
@@ -272,6 +279,21 @@ def setup(*, client=None, control_peer=None, monitor_buffer=None):
             duplicates: List[tuple[str, dict]] = []
             skipped = []
 
+            # 🕒 ЄДИНИЙ час для всієї партії вотчів
+            now_msq = datetime.now(MOSCOW_TZ)
+
+            # Старт для всіх однаковий
+            time_window_start = now_msq.strftime("%Y-%m-%d %H:%M:%S")
+
+            # Дедлайн (може бути None для безстрокового моніторингу)
+            if isinstance(window_minutes, int) and window_minutes > 0:
+                tw_end_dt = now_msq + timedelta(minutes=int(window_minutes))
+                # Нормалізуємо: секунда = 0, microsecond = 0
+                tw_end_dt = tw_end_dt.replace(second=0, microsecond=0)
+                time_window_end = tw_end_dt.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                time_window_end = None
+
             for url in links:
                 try:
                     cid, kind, inv = await _resolve_channel_id_from_link(url)
@@ -289,28 +311,18 @@ def setup(*, client=None, control_peer=None, monitor_buffer=None):
                         )
                         continue
 
-                    # Старт = момент створення (у Moscow TZ)
-                    time_window_start = _now_msq_str()
-
-                    # Дедлайн (може бути None для безстрокового моніторингу)
-                    time_window_end = (
-                        _delta_minutes_msq_str(int(window_minutes))
-                        if isinstance(window_minutes, int) and window_minutes > 0
-                        else None
-                    )
-
                     # --- створення watch (з підтримкою нового аргументу source_url, але без ламання старої сигнатури) ---
                     try:
                         wid = create_watch(
                             channel_id=cid,
                             template_id=template_id,
-                            expected_text_hash=tpl_html,                 # HTML шаблону
+                            expected_text_hash=tpl_html,  # HTML шаблону
                             expected_text_norm_len=len(tpl_html or ""),
                             expected_links_json=tpl_links_json,
                             expected_media_fingerprint=None,
                             time_window_start=time_window_start,
                             time_window_end=time_window_end,
-                            source_url=url,                              # нове поле (лише якщо воно вже є)
+                            source_url=url,  # нове поле (лише якщо воно вже є)
                         )
                     except TypeError:
                         # стара сигнатура без source_url
@@ -355,7 +367,7 @@ def setup(*, client=None, control_peer=None, monitor_buffer=None):
 
                             # 4) назва каналу + адмін з таблиці channels
                             ch_title, owner_display = _db_channel_meta(cid)
-                            ch_title = ch_title or ""       # якщо не знайшли — лишаємо порожньо
+                            ch_title = ch_title or ""  # якщо не знайшли — лишаємо порожньо
                             owner_display = owner_display or ""
 
                             # 5) формуємо рядок під поточну версію HEADER:
@@ -380,15 +392,15 @@ def setup(*, client=None, control_peer=None, monitor_buffer=None):
                                 # H Адмін
                                 # I Watch ID
                                 row_vals = [
-                                    ch_title,        # A
-                                    url,             # B (source_url)
-                                    "",              # C (PostedAt — заповниться при MATCH)
-                                    "",              # D (Views)
-                                    "",              # E (DeletedAt)
-                                    post_name,       # F
-                                    links_text,      # G
-                                    owner_display,   # H
-                                    wid,             # I
+                                    ch_title,  # A
+                                    url,  # B (source_url)
+                                    "",  # C (PostedAt — заповниться при MATCH)
+                                    "",  # D (Views)
+                                    "",  # E (DeletedAt)
+                                    post_name,  # F
+                                    links_text,  # G
+                                    owner_display,  # H
+                                    wid,  # I
                                 ]
                             else:
                                 # Легасі A..H (повністю як було):
@@ -401,14 +413,14 @@ def setup(*, client=None, control_peer=None, monitor_buffer=None):
                                 # G Адмін (owner_display)
                                 # H Watch ID
                                 row_vals = [
-                                    ch_title,        # A
-                                    post_name,       # B
-                                    links_text,      # C
-                                    "",              # D
-                                    "",              # E
-                                    "",              # F
-                                    owner_display,   # G
-                                    wid,             # H
+                                    ch_title,  # A
+                                    post_name,  # B
+                                    links_text,  # C
+                                    "",  # D
+                                    "",  # E
+                                    "",  # F
+                                    owner_display,  # G
+                                    wid,  # H
                                 ]
 
                             append_daily_row(date_str, row_vals)
@@ -438,14 +450,14 @@ def setup(*, client=None, control_peer=None, monitor_buffer=None):
                     tw = dup.get("time_window_end")
                     msg.append(f" – {url} (існує wid={wid}, status={st}, window_end={tw})")
                 if len(duplicates) > 10:
-                    msg.append(f" …і ще {len(duplicates)-10}")
+                    msg.append(f" …і ще {len(duplicates) - 10}")
 
             if skipped:
                 msg.append(f"⚠️ Пропущено (без channel_id у кеші): {len(skipped)}")
                 for (u, k, inv) in skipped[:10]:
                     msg.append(f" – {u} (kind={k}, invite={inv})")
                 if len(skipped) > 10:
-                    msg.append(f" …і ще {len(skipped)-10}")
+                    msg.append(f" …і ще {len(skipped) - 10}")
 
             await ev.reply("\n".join(msg))
         except Exception:

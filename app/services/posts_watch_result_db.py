@@ -4,6 +4,7 @@ import os
 import sqlite3
 import threading
 import logging
+import json
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -17,12 +18,19 @@ __all__ = [
     "mark_done_views",
     "mark_done_deleted",
     "mark_expired",
+    "mark_unmatched_after_edit",
     "cancel_watch",
     "get_pending_by_channel",
     "list_active_channels",
     "list_due_coverage",
     "list_due_pending_expire",
     "find_active_duplicate",
+    "get_watch_source_url",
+    "get_watch_created_by",
+    "get_watch_created_via",
+    "insert_watch_event",
+    "fetch_unsent_events",
+    "mark_event_sent",
     "raw_connection",
     "DuplicateWatchError",
 ]
@@ -36,11 +44,10 @@ _DB_PATH = (
 _conn: Optional[sqlite3.Connection] = None
 _lock = threading.Lock()
 
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")  # єдина TZ для всіх полів часу
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
 def _now() -> str:
-    # YYYY-MM-DD HH:MM:SS у Europe/Moscow
     return datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -57,7 +64,6 @@ def _has_column(conn: sqlite3.Connection, table: str, col: str) -> bool:
 
 
 def init() -> None:
-    """Ініціалізує SQLite (ідемпотентно) + виконує просту міграцію."""
     global _conn
     if _conn is not None:
         return
@@ -68,7 +74,6 @@ def init() -> None:
     _conn.execute("PRAGMA synchronous=NORMAL;")
     _conn.execute("PRAGMA foreign_keys=OFF;")
 
-    # Базова схема
     _conn.execute(
         """
         CREATE TABLE IF NOT EXISTS watch_posts (
@@ -81,7 +86,7 @@ def init() -> None:
             expected_media_fingerprint TEXT,
             time_window_start TEXT,
             time_window_end TEXT,
-            status TEXT, -- pending | matched | done | expired | cancelled
+            status TEXT,
             matched_message_id BIGINT,
             matched_at TEXT,
             coverage_check_at TEXT,
@@ -90,22 +95,45 @@ def init() -> None:
             created_at TEXT,
             updated_at TEXT,
             matched_session TEXT,
-            source_url TEXT
+            source_url TEXT,
+            created_by BIGINT,
+            created_via TEXT
         )
         """
     )
 
-    # Міграція: якщо старі інсталяції без source_url — додаємо
     if not _has_column(_conn, "watch_posts", "source_url"):
         _conn.execute("ALTER TABLE watch_posts ADD COLUMN source_url TEXT")
 
-    # Індекси
+    if not _has_column(_conn, "watch_posts", "created_by"):
+        _conn.execute("ALTER TABLE watch_posts ADD COLUMN created_by BIGINT")
+
+    if not _has_column(_conn, "watch_posts", "created_via"):
+        _conn.execute("ALTER TABLE watch_posts ADD COLUMN created_via TEXT")
+
+    _conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS watch_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            watch_id BIGINT NOT NULL,
+            event_type TEXT NOT NULL,
+            payload_json TEXT,
+            created_at TEXT NOT NULL,
+            sent_to BIGINT,
+            sent_at TEXT
+        )
+        """
+    )
+
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_wp_channel ON watch_posts(channel_id)")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_wp_status ON watch_posts(status)")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_wp_covcheck ON watch_posts(coverage_check_at)")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_wp_matched_session ON watch_posts(matched_session)")
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_wp_created_by ON watch_posts(created_by)")
 
-    # Унікальний частковий індекс на активні (pending|matched) — захист від дублів
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_we_sent_at ON watch_events(sent_at)")
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_we_unsent ON watch_events(sent_at, id)")
+
     _conn.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS uq_active_watch
@@ -119,7 +147,7 @@ def init() -> None:
 
 
 class DuplicateWatchError(RuntimeError):
-    """Спроба створити дубль активного моніторингу."""
+    pass
 
 
 def create_watch(
@@ -132,8 +160,9 @@ def create_watch(
     time_window_start: Optional[str],
     time_window_end: Optional[str],
     source_url: Optional[str] = None,
+    created_by: Optional[int] = None,
+    created_via: Optional[str] = None,
 ) -> int:
-    """Створює нову задачу моніторингу: статус 'pending'."""
     conn = _ensure_conn()
     now = _now()
     with _lock:
@@ -148,8 +177,10 @@ def create_watch(
                     time_window_start, time_window_end,
                     status,
                     created_at, updated_at,
-                    source_url
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    source_url,
+                    created_by,
+                    created_via
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     channel_id, template_id,
@@ -158,6 +189,8 @@ def create_watch(
                     time_window_start, time_window_end,
                     "pending", now, now,
                     source_url,
+                    created_by,
+                    created_via,
                 ),
             )
             conn.commit()
@@ -168,14 +201,13 @@ def create_watch(
             ) from e
 
     log.info(
-        "[posts_watch_result_db.create_watch] watch_id=%s channel_id=%s status=pending source_url=%s",
-        wid, channel_id, source_url,
+        "[posts_watch_result_db.create_watch] watch_id=%s channel_id=%s status=pending source_url=%s created_by=%s created_via=%s",
+        wid, channel_id, source_url, created_by, created_via,
     )
     return wid
 
 
 def get_watch_source_url(watch_id: int) -> Optional[str]:
-    """Повертає source_url для конкретного watch_id, якщо є."""
     conn = _ensure_conn()
     with _lock:
         cur = conn.cursor()
@@ -188,16 +220,104 @@ def get_watch_source_url(watch_id: int) -> Optional[str]:
         return None
     return str(row[0]) if row[0] else None
 
+
+def get_watch_created_by(watch_id: int) -> Optional[int]:
+    conn = _ensure_conn()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT created_by FROM watch_posts WHERE id=? LIMIT 1",
+            (watch_id,),
+        )
+        row = cur.fetchone()
+    if not row or row[0] is None:
+        return None
+    try:
+        return int(row[0])
+    except Exception:
+        return None
+
+
+def get_watch_created_via(watch_id: int) -> Optional[str]:
+    conn = _ensure_conn()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT created_via FROM watch_posts WHERE id=? LIMIT 1",
+            (watch_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return str(row[0]) if row[0] else None
+
+
+def insert_watch_event(watch_id: int, event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+    conn = _ensure_conn()
+    now = _now()
+    try:
+        payload_json = json.dumps(payload or {}, ensure_ascii=False)
+    except Exception:
+        payload_json = "{}"
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO watch_events (watch_id, event_type, payload_json, created_at)
+            VALUES (?,?,?,?)
+            """,
+            (
+                int(watch_id),
+                str(event_type),
+                payload_json,
+                now,
+            ),
+        )
+        conn.commit()
+
+
+def fetch_unsent_events(limit: int = 100) -> List[Tuple[int, int, str, str, str]]:
+    conn = _ensure_conn()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, watch_id, event_type, payload_json, created_at
+            FROM watch_events
+            WHERE sent_at IS NULL
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+    return [
+        (int(r[0]), int(r[1]), str(r[2]), str(r[3] or ""), str(r[4] or ""))
+        for r in rows
+    ]
+
+
+def mark_event_sent(event_id: int, sent_to: int) -> None:
+    conn = _ensure_conn()
+    now = _now()
+    with _lock:
+        conn.execute(
+            """
+            UPDATE watch_events
+            SET sent_to=?, sent_at=?
+            WHERE id=? AND sent_at IS NULL
+            """,
+            (int(sent_to), now, int(event_id)),
+        )
+        conn.commit()
+
+
 def mark_matched(
     watch_id: int,
     message_id: int,
     coverage_check_at: Optional[str],
     matched_session: Optional[str] = None,
 ) -> None:
-    """
-    Знайшли пост: фіксуємо message_id, matched_at, coverage_check_at (може бути NULL),
-    статус 'matched', і сесію пошуку.
-    """
     conn = _ensure_conn()
     now = _now()
     with _lock:
@@ -218,7 +338,6 @@ def mark_matched(
 
 
 def mark_done_views(watch_id: int, final_views: Optional[int]) -> None:
-    """Через coverage_check_at (коли views увімкнено): зчитали views, статус 'done'."""
     conn = _ensure_conn()
     now = _now()
     with _lock:
@@ -235,7 +354,6 @@ def mark_done_views(watch_id: int, final_views: Optional[int]) -> None:
 
 
 def mark_done_deleted(watch_id: int) -> None:
-    """Пост зник/видалений: статус 'done', фіксуємо deleted_at."""
     conn = _ensure_conn()
     now = _now()
     with _lock:
@@ -268,7 +386,6 @@ def find_matched_by_message(channel_id: int, message_id: int) -> list[int]:
 
 
 def mark_expired(watch_id: int) -> None:
-    """Вікно очікування минуло, а пост не знайшли."""
     conn = _ensure_conn()
     now = _now()
     with _lock:
@@ -280,8 +397,25 @@ def mark_expired(watch_id: int) -> None:
     log.info("[posts_watch_result_db.mark_expired] watch_id=%s status=expired", watch_id)
 
 
+def mark_unmatched_after_edit(watch_id: int) -> None:
+    conn = _ensure_conn()
+    now = _now()
+    with _lock:
+        conn.execute(
+            """
+            UPDATE watch_posts
+            SET status=CASE WHEN status='matched' THEN 'expired' ELSE status END,
+                coverage_check_at=NULL,
+                updated_at=?
+            WHERE id=? AND status IN ('matched','done')
+            """,
+            (now, watch_id),
+        )
+        conn.commit()
+    log.info("[posts_watch_result_db.mark_unmatched_after_edit] watch_id=%s edited->unmatched", watch_id)
+
+
 def cancel_watch(watch_id: int) -> None:
-    """Ручне скасування задачі."""
     conn = _ensure_conn()
     now = _now()
     with _lock:
@@ -294,7 +428,6 @@ def cancel_watch(watch_id: int) -> None:
 
 
 def get_pending_by_channel(channel_id: int) -> List[Dict[str, Any]]:
-    """Усі pending-задачі для каналу (для матчингу у слухачі)."""
     conn = _ensure_conn()
     with _lock:
         cur = conn.cursor()
@@ -326,7 +459,6 @@ def get_pending_by_channel(channel_id: int) -> List[Dict[str, Any]]:
 
 
 def list_active_channels() -> List[int]:
-    """Канали, де є незавершені задачі (pending або matched)."""
     conn = _ensure_conn()
     with _lock:
         cur = conn.cursor()
@@ -342,10 +474,6 @@ def list_active_channels() -> List[int]:
 
 
 def list_due_coverage(now_ts: Optional[str] = None) -> List[Tuple[int, int, int, Optional[str]]]:
-    """
-    Список matched-задач, у яких пора перевіряти охоплення (views).
-    Повертає: (watch_id, channel_id, matched_message_id, matched_session)
-    """
     conn = _ensure_conn()
     if not now_ts:
         now_ts = _now()
@@ -369,10 +497,6 @@ def list_due_coverage(now_ts: Optional[str] = None) -> List[Tuple[int, int, int,
 
 
 def list_due_pending_expire(now_ts: Optional[str] = None) -> List[int]:
-    """
-    Список pending-задач, у яких минув дедлайн пошуку (time_window_end).
-    Повертає: [watch_id, ...]
-    """
     conn = _ensure_conn()
     if not now_ts:
         now_ts = _now()
@@ -398,10 +522,6 @@ def find_active_duplicate(
     template_id: Optional[int],
     expected_text_hash: Optional[str],
 ) -> Optional[Dict[str, Any]]:
-    """
-    Шукає активний (pending|matched) дубль моніторингу по ключу:
-    (channel_id, template_id, expected_text_hash).
-    """
     conn = _ensure_conn()
     with _lock:
         cur = conn.cursor()
@@ -430,4 +550,8 @@ def find_active_duplicate(
 
 
 def raw_connection() -> sqlite3.Connection:
-    return _ensure_conn()
+    conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA foreign_keys=OFF;")
+    return conn

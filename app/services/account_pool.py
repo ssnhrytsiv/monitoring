@@ -12,6 +12,7 @@ from typing import Optional, List, Union
 from telethon import TelegramClient
 from telethon.tl import types
 from telethon.tl.functions.channels import GetParticipantRequest
+from telethon.network.connection import ConnectionTcpAbridged
 
 log = logging.getLogger("services.account_pool")
 
@@ -172,7 +173,7 @@ async def start_pool() -> None:
 
     pool: List[ClientSlot] = []
     for sess in POOL_SESSIONS:
-        client = TelegramClient(sess, API_ID, API_HASH)
+        client = TelegramClient(sess, API_ID, API_HASH,connection=ConnectionTcpAbridged)
         slot = ClientSlot(name=sess, client=client)
         await _ensure_connected(slot)
         pool.append(slot)

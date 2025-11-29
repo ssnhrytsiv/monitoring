@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import asyncio
 import time
+import os
 
 from app.telethon_client import client, load_plugins
 from app.services.account_pool import start_pool, stop_pool
@@ -9,23 +12,24 @@ from app.services import channel_db
 from app.services import channel_maps
 from app.services.requested_reconciler import run_requested_reconciler
 from app.services import requested_reconciler_db as reqdb
-# ✅ ORM-метадані (idempotent create_all)
 from app.services.models import init_db as orm_init_db
 from app.services.owner_conflict_guard import init as owner_guard_init
-
 from app.services.posts_watch_result_db import init as posts_result_init
-
 from app.settings import MONITOR_LINKS_V2
+from dotenv import load_dotenv
 
-# Якщо ввімкнено V2 — реєструємо новий плагін. Інакше працює стара логіка.
+load_dotenv()
+
 if MONITOR_LINKS_V2:
-    import app.plugins.monitor_links  # реєструє хендлери V2
+    import app.plugins.monitor_links
 
-# ДОДАНО: експортер каналів у Google Sheets (миттєвий запуск + далі щодоби)
 from app.services.googlesheets.channels_export_service import (
     start_channels_exporter,
     stop_channels_exporter,
 )
+
+from app.bot.run import run_bot
+
 
 def setup_logging():
     configure_logging()
@@ -36,9 +40,17 @@ async def _main():
     log = get_logger("main")
 
     reconciler_task = None
-    exporter_task = None  # ДОДАНО
+    exporter_task = None
+    bot_task = None
 
-    # ---- DB init (одноразово, без дублювань)
+    def _log_task_result(t: asyncio.Task):
+        try:
+            t.result()
+        except asyncio.CancelledError:
+            log.warning("Bot UI task cancelled")
+        except Exception:
+            log.exception("Bot UI task crashed")
+
     log.info("Ініціалізую БД…")
     t0 = time.perf_counter()
     try:
@@ -46,8 +58,8 @@ async def _main():
         posts_result_init()
         channel_db.init()
         await channel_maps.init()
-        reqdb.init()       # legacy-схеми/міграції для reconciler
-        orm_init_db()      # ORM create_all (idempotent, нічого не ламає)
+        reqdb.init()
+        orm_init_db()
         owner_guard_init()
         log.debug("DB init complete")
     except Exception:
@@ -56,7 +68,6 @@ async def _main():
     finally:
         log.debug("DB init took %.3fs", time.perf_counter() - t0)
 
-    # ---- Telegram client + pool
     log.info("Запускаю головний клієнт…")
     t0 = time.perf_counter()
     try:
@@ -75,7 +86,6 @@ async def _main():
         log.debug("Account pool started")
     except Exception:
         log.exception("Failed to start account pool")
-        # спробуємо від'єднати головний клієнт перед виходом
         try:
             await client.disconnect()
         except Exception:
@@ -84,7 +94,6 @@ async def _main():
     finally:
         log.debug("Account pool start took %.3fs", time.perf_counter() - t0)
 
-    # ---- Запускаємо reconciler ПІСЛЯ старту пулу
     log.info("Запускаю reconciler заявок…")
     try:
         reconciler_task = asyncio.create_task(
@@ -94,7 +103,6 @@ async def _main():
         log.debug("Reconciler task created: %s", reconciler_task.get_name())
     except Exception:
         log.exception("Failed to create reconciler task")
-        # якщо не вийшло — зупиняємося чисто
         try:
             await stop_pool()
         except Exception:
@@ -105,7 +113,6 @@ async def _main():
             log.exception("client.disconnect() failed after reconciler create failure")
         raise SystemExit(1)
 
-    # ---- ДОДАНО: Старт експортера каналів (миттєво + далі щодоби)
     try:
         exporter_task = start_channels_exporter()
         if exporter_task:
@@ -114,9 +121,7 @@ async def _main():
             log.info("Channels exporter is disabled or not configured; skipping")
     except Exception:
         log.exception("Failed to start channels exporter")
-        # не критично для основного бота — продовжуємо
 
-    # ---- Плагіни
     log.info("Завантажую плагіни…")
     t0 = time.perf_counter()
     try:
@@ -127,7 +132,6 @@ async def _main():
         log.debug("Plugins loaded")
     except Exception:
         log.exception("Failed to load plugins")
-        # акуратно завершуємо
         try:
             if reconciler_task:
                 reconciler_task.cancel()
@@ -149,6 +153,14 @@ async def _main():
     finally:
         log.debug("Plugins load took %.3fs", time.perf_counter() - t0)
 
+    try:
+        log.info("BOT_TOKEN present=%s", bool(os.getenv("BOT_TOKEN")))
+        bot_task = asyncio.create_task(run_bot(), name="bot_api_ui")
+        bot_task.add_done_callback(_log_task_result)
+        log.info("Bot UI task created: %s", bot_task.get_name())
+    except Exception:
+        log.exception("Failed to start Bot UI task")
+
     log.info("✅ Бот готовий. Чекаю подій…")
 
     try:
@@ -160,7 +172,16 @@ async def _main():
         log.exception("Main run loop error")
         raise
     finally:
-        # ДОДАНО: Акуратно зупиняємо експортер
+        if bot_task:
+            log.info("Зупиняю Bot UI…")
+            bot_task.cancel()
+            try:
+                await bot_task
+            except asyncio.CancelledError:
+                log.debug("Bot UI task cancelled")
+            except Exception:
+                log.exception("Bot UI task finished with error")
+
         if exporter_task:
             log.info("Зупиняю експортер каналів…")
             try:
@@ -168,7 +189,6 @@ async def _main():
             except Exception:
                 log.exception("Channels exporter stop failed")
 
-        # Акуратно зупиняємо reconciler
         if reconciler_task:
             log.info("Зупиняю reconciler…")
             reconciler_task.cancel()
@@ -179,14 +199,12 @@ async def _main():
             except Exception:
                 log.exception("Reconciler task finished with error")
 
-        # Акуратно зупиняємо пул
         log.info("Зупиняю пул акаунтів…")
         try:
             await stop_pool()
         except Exception:
             log.exception("stop_pool() failed")
 
-        # Від'єднуємо головний клієнт
         log.info("Від'єдную головний клієнт…")
         try:
             await client.disconnect()

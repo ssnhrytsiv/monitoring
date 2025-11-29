@@ -117,6 +117,8 @@ def setup(client, control_peer=None, monitor_buffer=None, **kwargs):
     # ---- вільний ввід owner без команди
     @client.on(events.NewMessage())
     async def _on_owner_freeform(event):
+        log.info(
+            "WE ARE IN OWNER")
         if control_peer is not None and event.chat_id != control_peer:
             return
         if not (monitor_buffer and getattr(monitor_buffer, "pending_batch", None)):

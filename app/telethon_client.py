@@ -7,11 +7,12 @@ import re
 
 from telethon import TelegramClient
 from app.config import API_ID, API_HASH, SESSION, CONTROL_PEER, PLUGINS_PACKAGE
+from telethon.network.connection import ConnectionTcpAbridged
 from app.settings import MONITOR_LINKS_V2  # ← прапор V2
 
 log = logging.getLogger("telethon_client")
 
-client = TelegramClient(SESSION, API_ID, API_HASH)
+client = TelegramClient(SESSION, API_ID, API_HASH, connection=ConnectionTcpAbridged)
 client.parse_mode = "html"
 
 # Плагіни, які мають працювати лише в контрольному чаті

@@ -1,0 +1,64 @@
+--- app/services/gsheets_buffer.py
++++ app/services/gsheets_buffer.py
+@@
+ def _build_row_for_matched(wid: int) -> Tuple[str, List[str]]:
+     wc = _db_get_watch_core(wid)
+     if not wc:
+         date_str = gw.sheet_title_from_time_window_start(None)
+         return date_str, [""] * 9
+@@
+     ]
+     return date_str, row
+
++def _build_row_for_expired(wid: int) -> Tuple[str, List[str]]:
++    wc = _db_get_watch_core(wid)
++    if not wc:
++        date_str = gw.sheet_title_from_time_window_start(None)
++        return date_str, [""] * 9
++    date_str = gw.sheet_title_from_time_window_start(wc.get("time_window_start"))
++    ch_title, owner_display = _db_get_channel_title_and_owner(wc["channel_id"])
++    t_title = _db_get_template_title(wc.get("template_id"))
++    links_text = _links_text_from_json(wc.get("expected_links_json"))
++    source_url = wc.get("source_url") or ""
++    row = [
++        ch_title or "",        # A
++        source_url,            # B
++        "Не вийшов",           # C
++        "",                    # D
++        "",                    # E
++        t_title or "",         # F
++        links_text,            # G
++        owner_display or "",   # H
++        wid,                   # I
++    ]
++    return date_str, row
++
+ # ---------- публічні entrypoints подій ----------
+ def record_matched(watch_id: int) -> bool:
+     """Прийняти подію MATCHED — просто покласти повний рядок у буфер append."""
+     date_str, row = _build_row_for_matched(watch_id)
+     if not date_str:
+         return False
+     with _buf_lock:
+         gw.ensure_daily_sheet(date_str)
+         _pending_appends.setdefault(date_str, []).append((watch_id, row))
+         _touch_oldest_event_ts()
+     return True
+
++def record_expired(watch_id: int) -> bool:
++    date_str, row = _build_row_for_expired(watch_id)
++    if not date_str:
++        return False
++    if not _dedup_ttl_key(date_str, watch_id, "expired"):
++        return True
++    with _buf_lock:
++        gw.ensure_daily_sheet(date_str)
++        _pending_appends.setdefault(date_str, []).append((watch_id, row))
++        _touch_oldest_event_ts()
++    return True
++
+ def record_views(watch_id: int, views: int | None) -> bool:
+     """Прийняти подію VIEWS — оновити pending_updates по D."""
+     wc = _db_get_watch_core(watch_id)
+     if not wc:
+         return False
