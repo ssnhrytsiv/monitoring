@@ -26,9 +26,9 @@ ENV/
 
 # ключові секрети
 service_account.json
-*.session
-*.session-journal
-*.sqlite3
+#*.session
+#*.session-journal
+#*.sqlite3
 *.sqlite3-journal
 
 # ---- IDE ----
