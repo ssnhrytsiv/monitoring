@@ -1,6 +1,6 @@
 # Project Map (auto-generated)
 
-- Generated: 2025-11-30 10:53:48 UTC
+- Generated: 2025-11-30 11:02:00 UTC
 - Branch: watcherchannels
 
 ## Structure (depth=4)
@@ -156,7 +156,7 @@ CFG_API_HASH     variable     27 app/services/feature/seed_creator.py CFG_API_HA
 CFG_API_ID       unknown      24 app/services/feature/seed_creator.py from app.config import API_ID as CFG_API_ID, API_HASH as CFG_API_HASH
 CFG_API_ID       variable     26 app/services/feature/seed_creator.py CFG_API_ID = None
 CONTROL_PEER     variable     10 app/config.py    CONTROL_PEER = os.getenv("CONTROL_CHAT", "")
-COVERAGE_POLL_TICK_SEC variable     50 app/plugins/posts_watch_listener.py COVERAGE_POLL_TICK_SEC = 30
+COVERAGE_POLL_TICK_SEC variable     51 app/plugins/posts_watch_listener.py COVERAGE_POLL_TICK_SEC = 30
 CREATE_TABLE_SQL variable      9 app/services/link_queue.py CREATE_TABLE_SQL = """
 CREATOR_SESSION_NAME variable     10 app/settings.py  CREATOR_SESSION_NAME = os.getenv('CREATOR_SESSION_NAME', 'tg_session_3')
 CREATOR_SESSION_NAME variable     57 app/services/feature/seed_creator.py CREATOR_SESSION_NAME = getattr(settings, "CREATOR_SESSION_NAME", "tg_session_3")
@@ -188,7 +188,7 @@ DDL              variable      9 app/services/membership_db.py DDL = """
 DDL              variable     11 app/services/feature/seed_db.py DDL = r"""
 DDL              variable     22 app/services/channel_facts.py DDL = r"""
 DDL              variable     24 app/services/channel_maps.py DDL = r"""
-DEFAULT_COVERAGE_HOURS variable     78 app/plugins/posts_watch_listener.py DEFAULT_COVERAGE_HOURS: float = _read_default_coverage_hours()
+DEFAULT_COVERAGE_HOURS variable     79 app/plugins/posts_watch_listener.py DEFAULT_COVERAGE_HOURS: float = _read_default_coverage_hours()
 DEFAULT_DB       variable     14 app/services/channel_maps.py DEFAULT_DB = getattr(_S, "DB_FILE", "post_watchdog.sqlite3")
 DEFAULT_DB       variable     16 app/services/channel_maps.py DEFAULT_DB = "post_watchdog.sqlite3"
 DEFAULT_FIND_INTERVAL variable     13 app/config.py    DEFAULT_FIND_INTERVAL = os.getenv("DEFAULT_FIND_INTERVAL", "30m")
@@ -232,7 +232,7 @@ FINAL_GLOBAL     variable     46 app/services/membership_db.py FINAL_GLOBAL = ("
 FINAL_PER_ACC    variable     47 app/services/membership_db.py FINAL_PER_ACC = ("joined", "already", "requested", "invalid", "private", "blocked", "too_many")
 FLOOD_MAX_WAIT_SEC variable     54 app/services/requested_reconciler.py FLOOD_MAX_WAIT_SEC = int(os.getenv("REQUESTED_RECONCILER_FLOOD_MAX_WAIT", "3600") or "3600")
 FLOOD_SLACK_SEC  variable     53 app/services/requested_reconciler.py FLOOD_SLACK_SEC = int(os.getenv("REQUESTED_RECONCILER_FLOOD_SLACK_SEC", "45") or "45")
-GLOBAL_DELETED_TTL variable     53 app/plugins/posts_watch_listener.py GLOBAL_DELETED_TTL = 180.0
+GLOBAL_DELETED_TTL variable     54 app/plugins/posts_watch_listener.py GLOBAL_DELETED_TTL = 180.0
 GSHEET_CHANNELS_SHEET variable     32 app/config.py    GSHEET_CHANNELS_SHEET= os.getenv("GSHEET_CHANNELS_SHEET", "Канали")
 GSHEET_CHANNELS_SPREADSHEET_ID variable     31 app/config.py    GSHEET_CHANNELS_SPREADSHEET_ID= os.getenv("GSHEET_CHANNELS_SPREADSHEET_ID", "")
 GSHEET_CREDS_FILE variable     26 app/config.py    GSHEET_CREDS_FILE = os.getenv("GSHEET_CREDS_FILE", "service_account.json")
@@ -344,7 +344,7 @@ MOSCOW_TZ        variable     12 app/services/gsheets_buffer.py MOSCOW_TZ = Zone
 MOSCOW_TZ        variable     43 app/services/gsheets_writer.py MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 MOSCOW_TZ        variable     46 app/plugins/monitor_watch.py MOSCOW_TZ = ZoneInfo("Europe/Moscow") # єдина TZ для цього плагіна
 MOSCOW_TZ        variable     47 app/services/posts_watch_result_db.py MOSCOW_TZ = ZoneInfo("Europe/Moscow")
-MOSCOW_TZ        variable     49 app/plugins/posts_watch_listener.py MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+MOSCOW_TZ        variable     50 app/plugins/posts_watch_listener.py MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 MSK_TZ           variable      4 app/services/time_utils.py MSK_TZ = pytz.timezone("Europe/Moscow")
 MemberStatus     class        67 app/services/requested_reconciler.py class MemberStatus(Enum):
 MemberStatus.BLOCKED variable     72 app/services/requested_reconciler.py BLOCKED = "blocked"
@@ -420,8 +420,8 @@ SEED_MAX_PER_10_MIN variable     15 app/settings.py  SEED_MAX_PER_10_MIN = int(o
 SEED_TARGET      variable     11 app/settings.py  SEED_TARGET = os.getenv('SEED_TARGET', 'tg_session')
 SEED_TARGET      variable     58 app/services/feature/seed_creator.py SEED_TARGET = getattr(settings, "SEED_TARGET", "me") # дефолтно відправляємо у Saved Messages
 SESSION          variable      8 app/config.py    SESSION = os.getenv("SESSION_NAME", "tg_session")
-SHEETS_OK        variable     38 app/plugins/posts_watch_listener.py SHEETS_OK = False
-SHEETS_OK        variable     42 app/plugins/posts_watch_listener.py SHEETS_OK = True
+SHEETS_OK        variable     39 app/plugins/posts_watch_listener.py SHEETS_OK = False
+SHEETS_OK        variable     43 app/plugins/posts_watch_listener.py SHEETS_OK = True
 SHEET_NAME_DEFAULT variable     19 app/services/googlesheets/export_channels_table.py SHEET_NAME_DEFAULT = "Канали"
 SQLALCHEMY_DATABASE_URI variable     40 app/services/models.py SQLALCHEMY_DATABASE_URI = _mk_sqlite_url(DB_PATH)
 SQLITE_URL       variable     22 app/services/requested_reconciler_db.py SQLITE_URL = f"sqlite:///{DB_PATH}"
@@ -473,7 +473,7 @@ _                function     12 app/plugins/resolve_channel.py async def _(ev: 
 _                function    175 app/plugins/monitor_watch.py async def _(ev: events.NewMessage.Event):
 _ACTIVE          variable     56 app/plugins/monitor_links.py _ACTIVE = False
 _ALIAS_TO_IDX    variable    114 app/services/join_scheduler.py _ALIAS_TO_IDX: Dict[str, int] = {}
-_A_TAG_RE        variable    164 app/plugins/posts_watch_listener.py _A_TAG_RE = re.compile(r'<a\s+href=(?P<q1>"|\')(?P<href>.+?)(?P=q1)>(?P<body>.*?)</a>', re.DOTALL | re.IGNORECASE)
+_A_TAG_RE        variable    165 app/plugins/posts_watch_listener.py _A_TAG_RE = re.compile(r'<a\s+href=(?P<q1>"|\')(?P<href>.+?)(?P=q1)>(?P<body>.*?)</a>', re.DOTALL | re.IGNORECASE)
 _BATCHES         variable     13 app/services/monitor_links_bridge.py _BATCHES: Dict[int, Dict[str, int]] = {}
 _BOT             variable     18 app/services/monitor_links_bridge.py _BOT: Optional[Bot] = None
 _CLIENT          variable     58 app/plugins/monitor_links.py _CLIENT = None
@@ -487,11 +487,11 @@ _DB_PATH         variable     38 app/services/posts_watch_result_db.py _DB_PATH 
 _FALLBACK_TME_RE variable     28 app/plugins/monitor_links.py _FALLBACK_TME_RE = re.compile(
 _FALLBACK_TME_RE variable     70 app/bot/handlers/join_channels.py _FALLBACK_TME_RE = re.compile(
 _GC              variable     38 app/services/gsheets_writer.py _GC = None
-_GLOBAL_DELETED_SEEN variable     52 app/plugins/posts_watch_listener.py _GLOBAL_DELETED_SEEN: Dict[int, float] = {}
+_GLOBAL_DELETED_SEEN variable     53 app/plugins/posts_watch_listener.py _GLOBAL_DELETED_SEEN: Dict[int, float] = {}
 _GS_OK           variable     37 app/plugins/monitor_watch.py _GS_OK = True
 _GS_OK           variable     41 app/plugins/monitor_watch.py _GS_OK = False
-_HTML_RENDER     variable     89 app/plugins/posts_watch_listener.py _HTML_RENDER: Optional[Callable[[Message], str]] = None
-_HTML_RENDER_SRC variable     90 app/plugins/posts_watch_listener.py _HTML_RENDER_SRC = None
+_HTML_RENDER     variable     90 app/plugins/posts_watch_listener.py _HTML_RENDER: Optional[Callable[[Message], str]] = None
+_HTML_RENDER_SRC variable     91 app/plugins/posts_watch_listener.py _HTML_RENDER_SRC = None
 _INVIS           variable     34 app/utils/link_parser.py _INVIS = ("\u200b", "\u200e", "\u200f")
 _INVITE_RE       variable     46 app/services/feature/seed_posts.py _INVITE_RE = re.compile(r"https?://t\.me/\+([A-Za-z0-9_\-]+)")
 _INV_RE          variable      9 app/bot/services/channels_repo.py _INV_RE = re.compile(r"(?:t\.me/(?:\+|joinchat/)|tg://join\?invite=)([A-Za-z0-9_-]{6,})")
@@ -568,10 +568,10 @@ _allow_note_reset function    142 app/services/requested_reconciler_db.py def _a
 _already_joined  function    266 app/plugins/monitor_links.py async def _already_joined(cid: int) -> bool:
 _apply_default_sheet_formatting function    129 app/services/gsheets_writer.py def _apply_default_sheet_formatting(ws) -> None:
 _apply_session_cooldown_db function    200 app/services/requested_reconciler.py def _apply_session_cooldown_db(sess: str, cooldown_until_epoch: float):
-_attach_listener_for_client function    335 app/plugins/posts_watch_listener.py def _attach_listener_for_client(tag: str, cli) -> None:
-_attach_listener_for_client._on_deleted function    514 app/plugins/posts_watch_listener.py async def _on_deleted(ev: events.MessageDeleted.Event):
-_attach_listener_for_client._on_edited function    436 app/plugins/posts_watch_listener.py async def _on_edited(ev: events.MessageEdited.Event):
-_attach_listener_for_client._on_new_message function    337 app/plugins/posts_watch_listener.py async def _on_new_message(ev: events.NewMessage.Event):
+_attach_listener_for_client function    367 app/plugins/posts_watch_listener.py def _attach_listener_for_client(tag: str, cli) -> None:
+_attach_listener_for_client._on_deleted function    547 app/plugins/posts_watch_listener.py async def _on_deleted(ev: events.MessageDeleted.Event):
+_attach_listener_for_client._on_edited function    470 app/plugins/posts_watch_listener.py async def _on_edited(ev: events.MessageEdited.Event):
+_attach_listener_for_client._on_new_message function    369 app/plugins/posts_watch_listener.py async def _on_new_message(ev: events.NewMessage.Event):
 _auto_resize_columns function    102 app/services/gsheets_writer.py def _auto_resize_columns(ws) -> None:
 _bar             member      133 app/plugins/progress_live.py def _bar(done: int, total: int, width: int = 20) -> str:
 _batch_cancel    function     84 app/plugins/batch_links.py async def _batch_cancel(evt):
@@ -589,7 +589,7 @@ _build_row_for_edited_other function    208 app/services/gsheets_buffer.py def _
 _build_row_for_expired function    184 app/services/gsheets_buffer.py def _build_row_for_expired(wid: int) -> Tuple[str, List[str]]:
 _build_row_for_matched function    158 app/services/gsheets_buffer.py def _build_row_for_matched(wid: int) -> Tuple[str, List[str]]:
 _busy_reply      function     56 app/bot/handlers/join_channels.py async def _busy_reply(message: Message):
-_calc_coverage_at function     81 app/plugins/posts_watch_listener.py def _calc_coverage_at(hours_after: float | None = None) -> Optional[str]:
+_calc_coverage_at function     82 app/plugins/posts_watch_listener.py def _calc_coverage_at(hours_after: float | None = None) -> Optional[str]:
 _calc_next       function    123 app/services/requested_reconciler_db.py def _calc_next(base: int, tries: int, max_cap: int, factor: float = 2.0) -> int:
 _canon_url       function     30 app/services/post_matcher.py def _canon_url(u: str) -> str:
 _changed         variable     35 app/plugins/progress_live.py _changed: bool = False
@@ -640,7 +640,7 @@ _db_channel_meta function    134 app/plugins/monitor_watch.py def _db_channel_me
 _db_get_channel_title_and_owner function    108 app/services/gsheets_buffer.py def _db_get_channel_title_and_owner(channel_id: int):
 _db_get_template_title function    125 app/services/gsheets_buffer.py def _db_get_template_title(tid: int | None):
 _db_get_watch_core function     78 app/services/gsheets_buffer.py def _db_get_watch_core(wid: int):
-_db_get_watch_core function    133 app/plugins/posts_watch_listener.py def _db_get_watch_core(wid: int) -> Optional[Dict[str, Any]]:
+_db_get_watch_core function    134 app/plugins/posts_watch_listener.py def _db_get_watch_core(wid: int) -> Optional[Dict[str, Any]]:
 _debounced_edit  member       93 app/plugins/progress_live.py async def _debounced_edit(self) -> None:
 _dedup_ttl_key   function     68 app/services/gsheets_buffer.py def _dedup_ttl_key(sheet: str, wid: int, etype: str) -> bool:
 _delayed_monitor_off function    389 app/bot/handlers/join_channels.py async def _delayed_monitor_off():
@@ -690,7 +690,7 @@ _extract_urls    function     39 app/bot/handlers1.py def _extract_urls(text: st
 _extract_urls    function     39 bot_create_watch.py def _extract_urls(text: str) -> List[str]:
 _extract_urls    function     43 app/bot/handlers/create_watch.py def _extract_urls(text: str) -> List[str]:
 _f               function     10 app/utils/throttle.py def _f(name: str, default: str) -> float:
-_fallback_render function    122 app/plugins/posts_watch_listener.py def _fallback_render(m: Message) -> str:
+_fallback_render function    123 app/plugins/posts_watch_listener.py def _fallback_render(m: Message) -> str:
 _fetchall        function     95 app/services/channel_maps.py async def _fetchall(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
 _fetchall._inner function     96 app/services/channel_maps.py def _inner():
 _fetchone        function     87 app/services/channel_maps.py async def _fetchone(sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
@@ -723,15 +723,16 @@ _handle_flood    function     88 app/services/feature/seed_creator.py async def 
 _has_active_duplicate function     97 app/plugins/monitor_watch.py def _has_active_duplicate(channel_id: int, template_id: Optional[int], expected_text_hash: Optional[str]) -> Optional[dict]:
 _has_column      function     56 app/services/membership_db.py def _has_column(c: sqlite3.Connection, table: str, col: str) -> bool:
 _has_column      function     61 app/services/posts_watch_result_db.py def _has_column(conn: sqlite3.Connection, table: str, col: str) -> bool:
+_html_mod        namespace    32 app/plugins/posts_watch_listener.py import html as _html_mod
 _human           function     37 app/services/gsheets_buffer.py def _human(dt: datetime) -> str:
-_human           function     60 app/plugins/posts_watch_listener.py def _human(dt: datetime) -> str:
+_human           function     61 app/plugins/posts_watch_listener.py def _human(dt: datetime) -> str:
 _idem            function     13 app/services/owner_conflict_guard.py def _idem(owner: str, source_ref: str, action: str) -> str:
 _in_flood_cooldown function    180 app/services/requested_reconciler.py def _in_flood_cooldown(sess: str) -> bool:
 _index_exists    function     42 app/services/link_queue.py def _index_exists(c: sqlite3.Connection, name: str) -> bool:
-_init_html_renderer function     93 app/plugins/posts_watch_listener.py def _init_html_renderer():
-_init_html_renderer._fallback_render function    122 app/plugins/posts_watch_listener.py def _fallback_render(m: Message) -> str:
-_init_html_renderer._rh unknown      96 app/plugins/posts_watch_listener.py from app.plugins.post_templates import _extract_message_html as _rh # type: ignore
-_init_html_renderer._rh unknown     103 app/plugins/posts_watch_listener.py from app.services.html_render import render_html as _rh # type: ignore
+_init_html_renderer function     94 app/plugins/posts_watch_listener.py def _init_html_renderer():
+_init_html_renderer._fallback_render function    123 app/plugins/posts_watch_listener.py def _fallback_render(m: Message) -> str:
+_init_html_renderer._rh unknown      97 app/plugins/posts_watch_listener.py from app.plugins.post_templates import _extract_message_html as _rh # type: ignore
+_init_html_renderer._rh unknown     104 app/plugins/posts_watch_listener.py from app.services.html_render import render_html as _rh # type: ignore
 _initialized     variable      8 app/services/owner_conflict_guard.py _initialized = False
 _inner           function     74 app/services/channel_maps.py def _inner():
 _inner           function     81 app/services/channel_maps.py def _inner():
@@ -775,7 +776,7 @@ _loop            function    324 app/services/gsheets_buffer.py def _loop():
 _main            function     38 main.py          async def _main():
 _main._log_task_result function     46 main.py          def _log_task_result(t: asyncio.Task):
 _mark_changed    member       85 app/plugins/progress_live.py def _mark_changed(self) -> None:
-_mark_done_edited_other function    313 app/plugins/posts_watch_listener.py def _mark_done_edited_other(wid: int) -> str:
+_mark_done_edited_other function    345 app/plugins/posts_watch_listener.py def _mark_done_edited_other(wid: int) -> str:
 _max_line_len    function     92 app/services/googlesheets/export_channels_table.py def _max_line_len(s: str) -> int:
 _maybe           function     69 app/plugins/monitor_links.py async def _maybe(awaitable_or_value):
 _meta_cache      variable     18 app/plugins/post_templates.py _meta_cache = None
@@ -785,8 +786,9 @@ _msg             function    124 app/plugins/batch_links.py async def _msg(evt):
 _norm_html       function     10 app/services/html_match.py def _norm_html(s: str | None) -> str:
 _norm_user       function     25 app/flows/batch_links/queue_worker.py def _norm_user(u: Optional[str]) -> Optional[str]:
 _norm_user       function    307 app/flows/batch_links/process_links.py def _norm_user(u: Optional[str]) -> Optional[str]:
-_normalize_html_links function    175 app/plugins/posts_watch_listener.py def _normalize_html_links(html: str) -> str:
-_normalize_html_links._replace_a function    193 app/plugins/posts_watch_listener.py def _replace_a(m: re.Match) -> str:
+_normalize_html_full function    177 app/plugins/posts_watch_listener.py def _normalize_html_full(html_text: str) -> str:
+_normalize_html_links function    207 app/plugins/posts_watch_listener.py def _normalize_html_links(html: str) -> str:
+_normalize_html_links._replace_a function    225 app/plugins/posts_watch_listener.py def _replace_a(m: re.Match) -> str:
 _normalize_list  function    100 app/plugins/monitor_links.py def _normalize_list(obj) -> List[Any]:
 _note_reset_window variable    140 app/services/requested_reconciler_db.py _note_reset_window = {} # key: (session, invite_hash) -> dict(start:int, count:int)
 _notify          function     81 app/plugins/monitor_links.py async def _notify(text: str):
@@ -795,14 +797,14 @@ _now             function     34 app/services/channel_db.py def _now() -> str:
 _now             function     50 app/services/posts_watch_result_db.py def _now() -> str:
 _now             function    120 app/services/requested_reconciler_db.py def _now() -> int:
 _now             function    143 app/services/join_scheduler.py def _now() -> float:
-_now_monotonic   function     56 app/plugins/posts_watch_listener.py def _now_monotonic() -> float:
+_now_monotonic   function     57 app/plugins/posts_watch_listener.py def _now_monotonic() -> float:
 _now_msq_str     function     49 app/plugins/monitor_watch.py def _now_msq_str() -> str:
 _off             function     59 app/plugins/batch_links.py async def _off(evt):
 _oldest_event_ts variable     29 app/services/gsheets_buffer.py _oldest_event_ts: Optional[float] = None
 _on              function     46 app/plugins/batch_links.py async def _on(evt):
-_on_deleted      function    514 app/plugins/posts_watch_listener.py async def _on_deleted(ev: events.MessageDeleted.Event):
-_on_edited       function    436 app/plugins/posts_watch_listener.py async def _on_edited(ev: events.MessageEdited.Event):
-_on_new_message  function    337 app/plugins/posts_watch_listener.py async def _on_new_message(ev: events.NewMessage.Event):
+_on_deleted      function    547 app/plugins/posts_watch_listener.py async def _on_deleted(ev: events.MessageDeleted.Event):
+_on_edited       function    470 app/plugins/posts_watch_listener.py async def _on_edited(ev: events.MessageEdited.Event):
+_on_new_message  function    369 app/plugins/posts_watch_listener.py async def _on_new_message(ev: events.NewMessage.Event):
 _on_owner_clear  function    107 app/plugins/owner_set.py async def _on_owner_clear(event):
 _on_owner_freeform function    119 app/plugins/owner_set.py async def _on_owner_freeform(event):
 _on_owner_set    function     48 app/plugins/owner_set.py async def _on_owner_set(event):
@@ -827,7 +829,7 @@ _parse_template_id function     66 bot_create_watch.py def _parse_template_id(re
 _parse_template_id function     73 app/bot/handlers/create_watch.py def _parse_template_id(res: Any) -> Optional[int]:
 _parse_window_spec function     57 app/plugins/monitor_watch.py def _parse_window_spec(spec: str) -> Optional[int]:
 _pending_appends variable     25 app/services/gsheets_buffer.py _pending_appends: Dict[str, List[Tuple[int, List[str]]]] = {}
-_pending_expire_worker function    285 app/plugins/posts_watch_listener.py async def _pending_expire_worker():
+_pending_expire_worker function    317 app/plugins/posts_watch_listener.py async def _pending_expire_worker():
 _pending_updates variable     26 app/services/gsheets_buffer.py _pending_updates: Dict[str, Dict[int, Dict[str, str]]] = {}
 _persist_owner_conflict function    314 app/flows/batch_links/process_links.py def _persist_owner_conflict(channel_id: Optional[int],
 _pick_idx_by_alias function    121 app/services/join_scheduler.py def _pick_idx_by_alias(alias: Optional[str]) -> Optional[int]:
@@ -842,10 +844,10 @@ _probe_any       function    155 app/plugins/monitor_links.py async def _probe_a
 _process_links   function    295 app/plugins/monitor_links.py async def _process_links(urls: Iterable[str]):
 _processing_state variable      7 app/bot/processing_guard.py _processing_state: Dict[int, Dict[str, Any]] = {}
 _pylog           variable     44 app/plugins/monitor_watch.py _pylog = logging.getLogger("plugin.monitor_watch")
-_pylog           variable     47 app/plugins/posts_watch_listener.py _pylog = logging.getLogger("plugin.posts_watch_listener")
+_pylog           variable     48 app/plugins/posts_watch_listener.py _pylog = logging.getLogger("plugin.posts_watch_listener")
 _rand_uniform    function    139 app/services/join_scheduler.py def _rand_uniform(a: float, b: float) -> float:
 _rate_wait_session function    180 app/services/join_scheduler.py async def _rate_wait_session(idx: int, kind: str):
-_read_default_coverage_hours function     64 app/plugins/posts_watch_listener.py def _read_default_coverage_hours() -> float:
+_read_default_coverage_hours function     65 app/plugins/posts_watch_listener.py def _read_default_coverage_hours() -> float:
 _recent_events   variable     28 app/services/gsheets_buffer.py _recent_events: Dict[Tuple[str, int, str], float] = {}
 _record_meta     function     43 app/plugins/post_templates.py def _record_meta(tid: int, chat_id: int, message_id: int, has_media: bool):
 _refill          member       64 app/services/join_scheduler.py def _refill(self):
@@ -853,7 +855,7 @@ _render          member      117 app/plugins/progress_live.py def _render(self, 
 _render_html     function     56 app/debug/debug_post_diff_interactive.py def _render_html(msg: Message) -> str:
 _render_html._rh unknown      62 app/debug/debug_post_diff_interactive.py from app.plugins.post_templates import _extract_message_html as _rh # type: ignore
 _render_html._rh2 unknown      69 app/debug/debug_post_diff_interactive.py from app.services.html_render import render_html as _rh2 # type: ignore
-_replace_a       function    193 app/plugins/posts_watch_listener.py def _replace_a(m: re.Match) -> str:
+_replace_a       function    225 app/plugins/posts_watch_listener.py def _replace_a(m: re.Match) -> str:
 _reply           function     34 app/plugins/channel_info.py async def _reply(msg: Message, text: str):
 _requested_rl    variable    167 app/services/requested_reconciler.py _requested_rl = SlidingWindowRateLimiter(
 _resend_last     function     70 app/services/feature/seed.py async def _resend_last(n: int, target: str, send_batch: int):
@@ -862,8 +864,8 @@ _resolve_channel_id_from_link function     79 app/plugins/monitor_watch.py async
 _resolve_control_peer function     40 app/telethon_client.py async def _resolve_control_peer() -> tuple[int | None, str]:
 _resolve_url     function    201 app/plugins/monitor_links.py async def _resolve_url(url: str) -> Dict[str, Any]:
 _rh              unknown      62 app/debug/debug_post_diff_interactive.py from app.plugins.post_templates import _extract_message_html as _rh # type: ignore
-_rh              unknown      96 app/plugins/posts_watch_listener.py from app.plugins.post_templates import _extract_message_html as _rh # type: ignore
-_rh              unknown     103 app/plugins/posts_watch_listener.py from app.services.html_render import render_html as _rh # type: ignore
+_rh              unknown      97 app/plugins/posts_watch_listener.py from app.plugins.post_templates import _extract_message_html as _rh # type: ignore
+_rh              unknown     104 app/plugins/posts_watch_listener.py from app.services.html_render import render_html as _rh # type: ignore
 _rh2             unknown      69 app/debug/debug_post_diff_interactive.py from app.services.html_render import render_html as _rh2 # type: ignore
 _rr              variable     55 app/services/account_pool.py _rr = 0 # round-robin індекс
 _run             function     88 app/services/feature/seed.py async def _run(args):
@@ -890,7 +892,7 @@ _snapshot_from_msg function     79 app/debug/debug_post_diff_interactive.py def 
 _sqlite_pragmas  function     53 app/services/models.py def _sqlite_pragmas(dbapi_conn, _):
 _status          function     71 app/plugins/batch_links.py async def _status(evt):
 _strip_conflict  function    135 app/flows/batch_links/process_links.py def _strip_conflict(status: str) -> str:
-_strip_simple_tags function    166 app/plugins/posts_watch_listener.py def _strip_simple_tags(html_fragment: str) -> str:
+_strip_simple_tags function    168 app/plugins/posts_watch_listener.py def _strip_simple_tags(html_fragment: str) -> str:
 _strip_zw        function     13 app/services/post_matcher.py def _strip_zw(s: str) -> str:
 _table_exists    function     47 app/services/link_queue.py def _table_exists(c: sqlite3.Connection, name: str) -> bool:
 _tag_for_entity  function     25 app/services/html_render.py def _tag_for_entity(e) -> Tuple[str, str]:
@@ -904,7 +906,7 @@ _unique_preserve function     96 app/bot/handlers1.py def _unique_preserve(items
 _unique_preserve function     96 bot_create_watch.py def _unique_preserve(items: List[str]) -> List[str]:
 _unique_preserve function    105 app/bot/handlers/create_watch.py def _unique_preserve(items: List[str]) -> List[str]:
 _update_maps     function    250 app/plugins/monitor_links.py async def _update_maps(res: Dict[str, Any]):
-_views_worker    function    227 app/plugins/posts_watch_listener.py async def _views_worker():
+_views_worker    function    259 app/plugins/posts_watch_listener.py async def _views_worker():
 _worker          function    259 app/services/join_scheduler.py async def _worker(idx: int):
 account          variable     88 app/services/models.py account = Column(Text, nullable=False)
 acquire          member      124 app/services/requested_reconciler.py async def acquire(self, key: str):
@@ -1043,7 +1045,7 @@ get_watch_created_by function    224 app/services/posts_watch_result_db.py def g
 get_watch_created_via function    241 app/services/posts_watch_result_db.py def get_watch_created_via(watch_id: int) -> Optional[str]:
 get_watch_source_url function    210 app/services/posts_watch_result_db.py def get_watch_source_url(watch_id: int) -> Optional[str]:
 group_active     function     24 app/bot/services/watches_repo.py def group_active(
-gsheets_buffer   variable     44 app/plugins/posts_watch_listener.py gsheets_buffer = None # type: ignore
+gsheets_buffer   variable     45 app/plugins/posts_watch_listener.py gsheets_buffer = None # type: ignore
 gspread          variable     10 app/services/gsheets.py gspread = None
 gspread          variable     19 app/services/gsheets_writer.py gspread = None # type: ignore
 gw               unknown      10 app/services/gsheets_buffer.py from app.services import gsheets_writer as gw
@@ -1100,7 +1102,7 @@ list_recent      function     96 app/services/feature/seed_post_db.py def list_r
 list_session_names function     97 app/services/account_pool.py def list_session_names() -> List[str]:
 list_templates   function    105 app/services/post_watch_db.py def list_templates(limit: int = 50) -> List[Tuple[int, str, str, float, int]]:
 list_templates_full function    117 app/services/post_watch_db.py def list_templates_full(limit: int = 50) -> List[Tuple[int, str, str, float, int, Optional[str], Optional[str]]]:
-list_templates_full variable     36 app/plugins/posts_watch_listener.py list_templates_full = None # type: ignore
+list_templates_full variable     37 app/plugins/posts_watch_listener.py list_templates_full = None # type: ignore
 load_plugins     function     65 app/telethon_client.py async def load_plugins():
 load_sql         function     37 app/services/googlesheets/export_channels_table.py def load_sql(path: str) -> str:
 load_templates_map function      7 app/bot/services/templates_repo.py def load_templates_map() -> Dict[int, Dict[str, Any]]:
@@ -1143,7 +1145,7 @@ log              variable     26 app/services/feature/seed_posts.py log = loggin
 log              variable     26 app/services/models.py log = logging.getLogger("services.models")
 log              variable     43 app/plugins/monitor_watch.py log = get_logger("plugin.monitor_watch")
 log              variable     45 app/flows/batch_links/process_links.py log = logging.getLogger("flow.batch_links.process")
-log              variable     46 app/plugins/posts_watch_listener.py log = get_logger("plugin.posts_watch_listener")
+log              variable     47 app/plugins/posts_watch_listener.py log = get_logger("plugin.posts_watch_listener")
 log              variable     53 app/plugins/monitor_links.py log = logging.getLogger("monitor_links")
 log              variable     55 app/services/feature/seed_creator.py log = logging.getLogger("seed_creator")
 lq_enqueue       unknown      34 app/flows/batch_links/process_links.py from app.services.link_queue import enqueue as lq_enqueue
@@ -1297,7 +1299,7 @@ setup            function    154 app/plugins/channel_info.py def setup(client, c
 setup            function    156 app/plugins/monitor_watch.py def setup(*, client=None, control_peer=None, monitor_buffer=None):
 setup            function    269 app/plugins/post_templates.py def setup(client, control_peer=None, **kwargs):
 setup            function    346 app/plugins/monitor_links.py def setup(client, control_peer: Optional[int] = None, monitor_buffer=None, **kwargs):
-setup            function    580 app/plugins/posts_watch_listener.py def setup(client=None, control_peer=None, monitor_buffer=None, **_):
+setup            function    613 app/plugins/posts_watch_listener.py def setup(client=None, control_peer=None, monitor_buffer=None, **_):
 setup._          function     12 app/plugins/resolve_channel.py async def _(ev: events.NewMessage.Event):
 setup._          function    175 app/plugins/monitor_watch.py async def _(ev: events.NewMessage.Event):
 setup._._json    namespace   359 app/plugins/monitor_watch.py import json as _json
