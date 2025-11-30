@@ -29,6 +29,7 @@ from app.services.posts_watch_result_db import (
 from app.services.html_match import exact_html_equal
 from app.services.account_pool import iter_pool_clients, session_name
 from app import config
+import html as _html_mod
 
 try:
     from app.services.post_watch_db import list_templates_full
@@ -163,6 +164,7 @@ def _db_get_watch_core(wid: int) -> Optional[Dict[str, Any]]:
 
 _A_TAG_RE = re.compile(r'<a\s+href=(?P<q1>"|\')(?P<href>.+?)(?P=q1)>(?P<body>.*?)</a>', re.DOTALL | re.IGNORECASE)
 
+
 def _strip_simple_tags(html_fragment: str) -> str:
     """
     Видаляє прості теги форматування (<b>, <u>, <i>, <strong>, <em>) з фрагмента,
@@ -170,6 +172,36 @@ def _strip_simple_tags(html_fragment: str) -> str:
     """
     # прибираємо відкриваючі/закриваючі теги b/u/i/strong/em (без атрибутів)
     return re.sub(r'</?(?:b|u|i|strong|em)>', '', html_fragment, flags=re.IGNORECASE)
+
+
+def _normalize_html_full(html_text: str) -> str:
+    """
+    Розширена нормалізація HTML для вотчів:
+      - застосовує _normalize_html_links (розкриває <a>, приводить &amp; -> &);
+      - декодує HTML-ентіті (&quot; -> ", &nbsp; -> пробіл, ...);
+      - трохи чистить пробіли.
+
+    Це якраз фіксить кейси типу:
+      <i>&quot;Бывший коллега</i> ...
+      <i>"Бывший коллега</i> ...
+    щоб вони вважалися однаковими.
+    """
+    if not html_text:
+        return ""
+
+    # 1) твоя існуюча нормалізація лінків
+    s = _normalize_html_links(html_text)
+
+    # 2) декодуємо HTML-ентіті (&quot; -> ", &nbsp; -> пробіл, &amp; -> &, ...)
+    s = _html_mod.unescape(s)
+
+    # 3) легка нормалізація пробілів
+    # прибираємо подвоєні/троєні пробіли
+    s = re.sub(r"\s{2,}", " ", s)
+    # обрізаємо зайві пробіли по краях
+    s = s.strip()
+
+    return s
 
 
 def _normalize_html_links(html: str) -> str:
@@ -215,7 +247,7 @@ def _normalize_html_links(html: str) -> str:
     html = html.replace("&amp;", "&")
 
     # 3) Прибрати зайві пробіли навколо <a> (якщо ще лишилися)
-    html = re.sub(r">\s+([^<])", r">\1", html)        # <a ...>  X -> <a ...>X
+    html = re.sub(r">\s+([^<])", r">\1", html)  # <a ...>  X -> <a ...>X
     html = re.sub(r"([^>])\s+</a>", r"\1</a>", html)  # X  </a> -> X</a>
 
     return html
@@ -387,9 +419,11 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 continue
 
             try:
-                # нормалізуємо HTML так, щоб <a href="X">X</a> і X вважались однаковими
-                msg_html_norm = _normalize_html_links(msg_html)
-                expected_html_norm = _normalize_html_links(expected_html)
+                # РОЗШИРЕНА нормалізація:
+                #  - _normalize_html_links (a href="X" vs X)
+                #  - html.unescape (&quot; vs ")
+                msg_html_norm = _normalize_html_full(msg_html)
+                expected_html_norm = _normalize_html_full(expected_html)
 
                 ok = exact_html_equal(msg_html_norm, expected_html_norm)
                 _pylog.info(
@@ -476,12 +510,11 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 continue
 
             try:
-                msg_html_norm = _normalize_html_links(msg_html)
-                expected_html_norm = _normalize_html_links(expected_html)
+                msg_html_norm = _normalize_html_full(msg_html)
+                expected_html_norm = _normalize_html_full(expected_html)
                 ok = exact_html_equal(msg_html_norm, expected_html_norm)
             except Exception:
                 _pylog.exception("edited: exact_html_equal failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
-
                 ok = False
 
             if ok:
@@ -594,12 +627,12 @@ def setup(client=None, control_peer=None, monitor_buffer=None, **_):
         try:
             tag = session_name(s.client)
             _attach_listener_for_client(tag, s.client)
-            log.info("posts_watch_listener: attached listener to pool client: %s %s", tag, s.client )
+            log.info("posts_watch_listener: attached listener to pool client: %s %s", tag, s.client)
         except Exception:
             _pylog.exception("attach failed for pool client: %s", getattr(s, "name", "?"))
 
-    #_attach_listener_for_client("MAIN", MAIN_CLIENT)
-    #log.info("posts_watch_listener: attached listener to MAIN client")
+    # _attach_listener_for_client("MAIN", MAIN_CLIENT)
+    # log.info("posts_watch_listener: attached listener to MAIN client")
 
     loop = asyncio.get_event_loop()
 
