@@ -387,7 +387,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
 
         mid = int(getattr(m, "id", 0) or 0)
 
-        _pylog.info("listen: NEW_MESSAGE cid=%s mid=%s session=%s", cid, mid, tag)
+        #_pylog.info("listen: NEW_MESSAGE cid=%s mid=%s session=%s", cid, mid, tag)
 
         try:
             pending = get_pending_by_channel(cid)
@@ -424,10 +424,10 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 expected_html_norm = _normalize_html_full(expected_html)
 
                 ok = exact_html_equal(msg_html_norm, expected_html_norm)
-                _pylog.info(
-                    "listen: compare wid=%s cid=%s mid=%s session=%s -> %s",
-                    wid, cid, mid, tag, ok,
-                )
+               # _pylog.info(
+                #    "listen: compare wid=%s cid=%s mid=%s session=%s -> %s",
+                #    wid, cid, mid, tag, ok,
+                #)
             except Exception:
                 _pylog.exception("listen: exact_html_equal failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                 ok = False
@@ -450,9 +450,9 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                     },
                 )
                 matched_any = True
-                log.info("listen: MATCH wid=%s cid=%s mid=%s session=%s", wid, cid, mid, matched_session)
+                #log.info("listen: MATCH wid=%s cid=%s mid=%s session=%s", wid, cid, mid, matched_session)
             except Exception:
-                _pylog.exception("listen: mark_matched failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
+                #_pylog.exception("listen: mark_matched failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                 continue
 
             if SHEETS_OK and gsheets_buffer:
