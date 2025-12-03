@@ -3,18 +3,18 @@ from typing import Iterable
 import re
 
 STATUS_ICON = {
-    "joined": "✅ Підписано",
-    "already": "↪️ Вже підписаний",
-    "requested": "📨 Заявку на вступ відправлено",
-    "invalid": "❌ Невалідне посилання",
-    "private": "🔒 Приватний / неприєднуваний",
-    "blocked": "🚫 Обмеження для акаунта",
-    "too_many": "⚠️ Ліміт каналів на акаунті",
+    "joined": "✅ Подписано",
+    "already": "↪️ Был подписан",
+    "requested": "📨 Заявку отправлено",
+    "invalid": "❌ Нерабочий",
+    "private": "🔒 Приватный ",
+    "blocked": "🚫 Ограничено",
+    "too_many": "⚠️ Лимит каналов на аккаунте",
     "flood_wait": "⏳ FLOOD_WAIT",
-    "duplicate": "🔁 Дублікат",
+    "duplicate": "🔁 Дубликат",
     "cached": "☑️",  # без хвостового пробілу
-    "temp": "⚠️ Тимчасова помилка",
-    "waiting": "⌛ Очікування / спроби іншими акаунтами",
+    "temp": "⚠️ Временная ошибка",
+    "waiting": "⌛ Ожидание другим аккаунтом",
 }
 
 def fmt_result_line(idx: int, url: str, status: str, who: str | None = None, extra: str | None = None) -> str:
