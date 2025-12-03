@@ -1,6 +1,6 @@
 # Project Map (auto-generated)
 
-- Generated: 2025-12-03 13:29:27 UTC
+- Generated: 2025-12-03 16:39:19 UTC
 - Branch: watcherchannels-update
 
 ## Structure (depth=4)
@@ -345,13 +345,13 @@ JoinChannels     class         3 app/bot/states.py class JoinChannels(StatesGrou
 JoinChannels.await_action variable      5 app/bot/states.py await_action = State()
 JoinChannels.channel_input variable      4 app/bot/states.py channel_input = State()
 JoinChannels.owner_input variable      6 app/bot/states.py owner_input = State()
-LINK_DELAY_INVITE_MAX variable     31 app/utils/throttle.py LINK_DELAY_INVITE_MAX = _f("LINK_DELAY_INVITE_MAX", "10")
+LINK_DELAY_INVITE_MAX variable     31 app/utils/throttle.py LINK_DELAY_INVITE_MAX = _f("LINK_DELAY_INVITE_MAX", "50")
 LINK_DELAY_INVITE_MAX variable     35 app/utils/throttle.py LINK_DELAY_INVITE_MIN, LINK_DELAY_INVITE_MAX = _clamp_pair(LINK_DELAY_INVITE_MIN, LINK_DELAY_INVITE_MAX)
-LINK_DELAY_INVITE_MIN variable     30 app/utils/throttle.py LINK_DELAY_INVITE_MIN = _f("LINK_DELAY_INVITE_MIN", "6")
+LINK_DELAY_INVITE_MIN variable     30 app/utils/throttle.py LINK_DELAY_INVITE_MIN = _f("LINK_DELAY_INVITE_MIN", "35")
 LINK_DELAY_INVITE_MIN variable     35 app/utils/throttle.py LINK_DELAY_INVITE_MIN, LINK_DELAY_INVITE_MAX = _clamp_pair(LINK_DELAY_INVITE_MIN, LINK_DELAY_INVITE_MAX)
-LINK_DELAY_PUBLIC_MAX variable     29 app/utils/throttle.py LINK_DELAY_PUBLIC_MAX = _f("LINK_DELAY_PUBLIC_MAX", "4")
+LINK_DELAY_PUBLIC_MAX variable     29 app/utils/throttle.py LINK_DELAY_PUBLIC_MAX = _f("LINK_DELAY_PUBLIC_MAX", "12")
 LINK_DELAY_PUBLIC_MAX variable     34 app/utils/throttle.py LINK_DELAY_PUBLIC_MIN, LINK_DELAY_PUBLIC_MAX = _clamp_pair(LINK_DELAY_PUBLIC_MIN, LINK_DELAY_PUBLIC_MAX)
-LINK_DELAY_PUBLIC_MIN variable     28 app/utils/throttle.py LINK_DELAY_PUBLIC_MIN = _f("LINK_DELAY_PUBLIC_MIN", "2")
+LINK_DELAY_PUBLIC_MIN variable     28 app/utils/throttle.py LINK_DELAY_PUBLIC_MIN = _f("LINK_DELAY_PUBLIC_MIN", "8")
 LINK_DELAY_PUBLIC_MIN variable     34 app/utils/throttle.py LINK_DELAY_PUBLIC_MIN, LINK_DELAY_PUBLIC_MAX = _clamp_pair(LINK_DELAY_PUBLIC_MIN, LINK_DELAY_PUBLIC_MAX)
 LOG_LEVEL        variable     37 app/config.py    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 MAIN_CLIENT      unknown      14 app/plugins/posts_watch_listener.py from app.telethon_client import client as MAIN_CLIENT
@@ -600,8 +600,8 @@ _already_joined  function    266 app/plugins/monitor_links.py async def _already
 _apply_default_sheet_formatting function    129 app/services/gsheets_writer.py def _apply_default_sheet_formatting(ws) -> None:
 _apply_session_cooldown_db function    200 app/services/requested_reconciler.py def _apply_session_cooldown_db(sess: str, cooldown_until_epoch: float):
 _attach_listener_for_client function    367 app/plugins/posts_watch_listener.py def _attach_listener_for_client(tag: str, cli) -> None:
-_attach_listener_for_client._on_deleted function    547 app/plugins/posts_watch_listener.py async def _on_deleted(ev: events.MessageDeleted.Event):
-_attach_listener_for_client._on_edited function    470 app/plugins/posts_watch_listener.py async def _on_edited(ev: events.MessageEdited.Event):
+_attach_listener_for_client._on_deleted function    545 app/plugins/posts_watch_listener.py async def _on_deleted(ev: events.MessageDeleted.Event):
+_attach_listener_for_client._on_edited function    468 app/plugins/posts_watch_listener.py async def _on_edited(ev: events.MessageEdited.Event):
 _attach_listener_for_client._on_new_message function    369 app/plugins/posts_watch_listener.py async def _on_new_message(ev: events.NewMessage.Event):
 _auto_resize_columns function    102 app/services/gsheets_writer.py def _auto_resize_columns(ws) -> None:
 _bar             member      133 app/plugins/progress_live.py def _bar(done: int, total: int, width: int = 20) -> str:
@@ -835,8 +835,8 @@ _now_msq_str     function     49 app/plugins/monitor_watch.py def _now_msq_str()
 _off             function     59 app/plugins/batch_links.py async def _off(evt):
 _oldest_event_ts variable     29 app/services/gsheets_buffer.py _oldest_event_ts: Optional[float] = None
 _on              function     46 app/plugins/batch_links.py async def _on(evt):
-_on_deleted      function    547 app/plugins/posts_watch_listener.py async def _on_deleted(ev: events.MessageDeleted.Event):
-_on_edited       function    470 app/plugins/posts_watch_listener.py async def _on_edited(ev: events.MessageEdited.Event):
+_on_deleted      function    545 app/plugins/posts_watch_listener.py async def _on_deleted(ev: events.MessageDeleted.Event):
+_on_edited       function    468 app/plugins/posts_watch_listener.py async def _on_edited(ev: events.MessageEdited.Event):
 _on_new_message  function    369 app/plugins/posts_watch_listener.py async def _on_new_message(ev: events.NewMessage.Event):
 _on_owner_clear  function    107 app/plugins/owner_set.py async def _on_owner_clear(event):
 _on_owner_freeform function    119 app/plugins/owner_set.py async def _on_owner_freeform(event):
@@ -1361,7 +1361,7 @@ setup            function    154 app/plugins/channel_info.py def setup(client, c
 setup            function    156 app/plugins/monitor_watch.py def setup(*, client=None, control_peer=None, monitor_buffer=None):
 setup            function    269 app/plugins/post_templates.py def setup(client, control_peer=None, **kwargs):
 setup            function    346 app/plugins/monitor_links.py def setup(client, control_peer: Optional[int] = None, monitor_buffer=None, **kwargs):
-setup            function    613 app/plugins/posts_watch_listener.py def setup(client=None, control_peer=None, monitor_buffer=None, **_):
+setup            function    611 app/plugins/posts_watch_listener.py def setup(client=None, control_peer=None, monitor_buffer=None, **_):
 setup._          function     12 app/plugins/resolve_channel.py async def _(ev: events.NewMessage.Event):
 setup._          function    175 app/plugins/monitor_watch.py async def _(ev: events.NewMessage.Event):
 setup._._json    namespace   359 app/plugins/monitor_watch.py import json as _json
