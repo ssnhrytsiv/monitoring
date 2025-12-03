@@ -367,10 +367,8 @@ def _mark_done_edited_other(wid: int) -> str:
 def _attach_listener_for_client(tag: str, cli) -> None:
     @cli.on(events.NewMessage())
     async def _on_new_message(ev: events.NewMessage.Event):
-        _pylog.info("We here!!!!!!!!! fffffff")
-
         m: Message = ev.message
-        _pylog.info(m)
+        #_pylog.info(m)
         cid = None
         # ігноруємо MAIN
         if tag == "MAIN":
