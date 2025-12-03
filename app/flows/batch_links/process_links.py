@@ -449,7 +449,6 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
         links_text = extract_links(text)
         hidden = _extract_hidden_links_from_message(message)
 
-        # 🔍 ДЛЯ ДЕБАГУ: показати, що саме ми бачимо
         log.info("[PL] extract_links (plain) -> %r", links_text)
         log.info("[PL] hidden_links (entities) -> %r", hidden)
 
@@ -520,11 +519,47 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 continue
             used.add(url)
 
+            # 1) Спершу пробуємо кеш по URL.
+            # Early-return ТІЛЬКИ для joined/already/invalid/private.
+            ust = url_get(url)
+            log.debug("[PL] #%d url_get(%s) -> %s", idx, url, ust)
+            if ust in ("joined", "already", "invalid", "private"):
+                line = fmt_result_line(idx, url, "cached", extra=ust)
+                results.append(line)
+
+                if ust == "joined":
+                    progress.add_status("joined")
+                elif ust == "already":
+                    progress.add_status("already")
+                else:  # invalid/private
+                    progress.add_status("invalid")
+
+                status_part = line.split(" — ", 1)[1] if " — " in line else line
+                result_items.append({
+                    "idx": idx,
+                    "url": url,
+                    "title": title_current,
+                    "status": status_part,
+                    "channel_id": None,
+                })
+                try:
+                    channel_db.add_link(None, url, None, message.id, od, ou)
+                except Exception:
+                    pass
+                await _short_pause()
+                continue
+            # Якщо ust == "requested" або ust is None — НЕ робимо continue.
+            # Даємо коду пройти далі: probe_channel_id -> any_final_for_channel -> membership.
+
+            # 2) Тепер можна робити probe_channel_id (один легкий API-виклик)
             if probe_client is not None:
                 try:
                     log.debug("[PL] #%d probe_channel_id(url=%s)", idx, url)
                     cid, title_probe, probe_kind, probe_invite = await probe_channel_id(probe_client, url)
-                    log.debug("[PL] #%d probe result: cid=%s title=%s kind=%s invite=%s", idx, cid, title_probe, probe_kind, probe_invite)
+                    log.debug(
+                        "[PL] #%d probe result: cid=%s title=%s kind=%s invite=%s",
+                        idx, cid, title_probe, probe_kind, probe_invite
+                    )
 
                     if cid is None and probe_kind == "invite" and probe_invite:
                         try:
@@ -554,7 +589,9 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                                 channel_db.upsert_channel(channel_id, None, title_current, od, ou, "probe")
                             else:
                                 if not conflict_logged:
-                                    if _persist_owner_conflict(channel_id, od, ou, probe_invite or url, "probe_mismatch"):
+                                    if _persist_owner_conflict(
+                                        channel_id, od, ou, probe_invite or url, "probe_mismatch"
+                                    ):
                                         conflict_logged = True
                                 log.debug("[PL] #%d owner conflict on probe, skip upsert", idx)
                         except Exception:
@@ -563,6 +600,7 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     log.debug("[PL] #%d probe_channel_id error: %s", idx, e)
                     channel_id = None
 
+            # 3) Якщо ми вже знаємо channel_id – пробуємо кеш по каналу
             if channel_id is not None:
                 final = any_final_for_channel(channel_id)
                 log.debug("[PL] #%d any_final_for_channel(%s) -> %s", idx, channel_id, final)
@@ -572,9 +610,12 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     if is_conflict:
                         line = f"{line} | owner_conflict(existing={ex_owner})"
                         if not conflict_logged:
-                            if _persist_owner_conflict(channel_id, od, ou, probe_invite or url, "cached_mismatch"):
+                            if _persist_owner_conflict(
+                                channel_id, od, ou, probe_invite or url, "cached_mismatch"
+                            ):
                                 conflict_logged = True
                         log.debug("[PL] #%d owner conflict on cached, not updating channel row", idx)
+
                     results.append(line)
                     if final == "joined":
                         progress.add_status("joined")
@@ -584,10 +625,17 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                         progress.add_status("requested")
                     else:
                         progress.add_status("invalid")
+
                     status_part = line.split(" — ", 1)[1] if " — " in line else line
                     if is_conflict:
                         status_part += f" | owner_conflict(existing={ex_owner})"
-                    result_items.append({"idx": idx, "url": url, "title": title_current, "status": status_part, "channel_id": channel_id})
+                    result_items.append({
+                        "idx": idx,
+                        "url": url,
+                        "title": title_current,
+                        "status": status_part,
+                        "channel_id": channel_id,
+                    })
                     if not is_conflict:
                         try:
                             channel_db.upsert_channel(channel_id, None, title_current, od, ou, final)
@@ -599,51 +647,8 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                         pass
                     await _short_pause()
                     continue
-            else:
-                ust = url_get(url)
-                log.debug("[PL] #%d url_get(%s) -> %s", idx, url, ust)
-                if ust in ("joined", "already", "requested", "invalid", "private"):
-                    if ust == "requested" and probe_kind == "invite" and probe_invite:
-                        try:
-                            sess_list = reqdb.get_invite_sessions(str(probe_invite))
-                            if sess_list:
-                                for sess0 in sess_list:
-                                    reqdb.note_requested_invite(sess0, str(probe_invite), start_after_sec=REQ_START)
-                            else:
-                                log.debug("[PL] requested+invite cached but no invite sessions recorded; skip creating new check")
-                        except Exception:
-                            pass
 
-                    line = fmt_result_line(idx, url, "cached", extra=ust)
-                    _ic_req_inv, _ex_req_inv = (False, None)
-                    if ust == "requested" and probe_kind == "invite" and probe_invite:
-                        try:
-                            _ic_req_inv, _ex_req_inv = _invite_owner_conflict(str(probe_invite), od, ou)
-                            if _ic_req_inv:
-                                line = f"{line} | owner_conflict(existing={_ex_req_inv})"
-                        except Exception:
-                            _ic_req_inv, _ex_req_inv = (False, None)
-
-                    results.append(line)
-                    status_part = line.split(" — ", 1)[1] if " — " in line else line
-                    if _ic_req_inv and _ex_req_inv:
-                        status_part += f" | owner_conflict(existing={_ex_req_inv})"
-                    result_items.append({"idx": idx, "url": url, "title": title_current, "status": status_part, "channel_id": channel_id})
-                    if ust == "joined":
-                        progress.add_status("joined")
-                    elif ust == "already":
-                        progress.add_status("already")
-                    elif ust == "requested":
-                        progress.add_status("requested")
-                    else:
-                        progress.add_status("invalid")
-                    try:
-                        channel_db.add_link(None, url, None, message.id, od, ou)
-                    except Exception:
-                        pass
-                    await _short_pause()
-                    continue
-
+            # 4) Далі — все як було: вибираємо слоти, ensure_join, membership, reqdb і т.д.
             slots_raw = list(iter_ready_pool_clients())
             slots = _RR.pick_order(slots_raw)
             if not slots:
@@ -657,7 +662,13 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 line = f"{idx}. {url} — 💤 Немає вільних акаунтів; додано у чергу: {added} URL"
                 results.append(line)
                 status_part = line.split(" — ", 1)[1] if " — " in line else line
-                result_items.append({"idx": idx, "url": url, "title": title_current, "status": status_part, "channel_id": channel_id})
+                result_items.append({
+                    "idx": idx,
+                    "url": url,
+                    "title": title_current,
+                    "status": status_part,
+                    "channel_id": channel_id,
+                })
                 progress.add_status("flood_wait")
                 try:
                     channel_db.add_link(None, url, None, message.id, od, ou)
@@ -676,12 +687,16 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 who_sess = _session_name(client)
 
                 progress.set_current(url, actor=who_display)
-                log.debug("[PL] #%d try with session=%s (display=%s) cid_eff=%s", idx, who_sess, who_display, cid_eff)
+                log.debug("[PL] #%d try with session=%s (display=%s) cid_eff=%s",
+                          idx, who_sess, who_display, cid_eff)
 
                 if cid_eff is not None:
                     try:
                         if reqdb.is_requested(who_sess, cid_eff):
-                            log.debug("[PL] #%d session=%s has pending requested for cid=%s -> skip ensure_join", idx, who_sess, cid_eff)
+                            log.debug(
+                                "[PL] #%d session=%s has pending requested for cid=%s -> skip ensure_join",
+                                idx, who_sess, cid_eff
+                            )
                             line = fmt_result_line(idx, url, "requested", who_display)
                             progress.add_status("requested")
                             break
@@ -690,7 +705,8 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
 
                     acc_status = get_membership(who_sess, cid_eff)
                     log.debug("[PL] #%d membership(%s, %s) -> %s", idx, who_sess, cid_eff, acc_status)
-                    if acc_status in ("joined", "already", "requested", "invalid", "private", "blocked", "too_many"):
+                    if acc_status in ("joined", "already", "requested", "invalid",
+                                      "private", "blocked", "too_many"):
                         if acc_status == "requested":
                             line = fmt_result_line(idx, url, "requested", who_display)
                             progress.add_status("requested")
@@ -699,7 +715,10 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
 
                 log.debug("[PL] #%d ensure_join start (session=%s, url=%s)", idx, who_sess, url)
                 status, title, kind, cid_after, invite_hash = await ensure_join(client, url)
-                log.debug("[PL] #%d ensure_join done: status=%s kind=%s cid_after=%s invite_hash=%s", idx, status, kind, cid_after, invite_hash)
+                log.debug(
+                    "[PL] #%d ensure_join done: status=%s kind=%s cid_after=%s invite_hash=%s",
+                    idx, status, kind, cid_after, invite_hash
+                )
 
                 invite_hash_var = invite_hash or invite_hash_var
 
@@ -709,9 +728,14 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 if title and not title_current:
                     title_current = title
 
-                if cid_eff is not None and status in ("joined", "already", "requested", "invalid", "private", "blocked", "too_many"):
+                if cid_eff is not None and status in (
+                    "joined", "already", "requested", "invalid",
+                    "private", "blocked", "too_many"
+                ):
                     upsert_membership(who_sess, cid_eff, status)
-                if cid_eff is None and status in ("joined", "already", "requested", "invalid", "private"):
+                if cid_eff is None and status in (
+                    "joined", "already", "requested", "invalid", "private"
+                ):
                     url_put(url, status)
 
                 if cid_eff is not None:
@@ -721,7 +745,9 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                             channel_db.upsert_channel(cid_eff, None, title_current, od, ou, status)
                         else:
                             if not conflict_logged:
-                                if _persist_owner_conflict(cid_eff, od, ou, (invite_hash or invite_hash_var or url), "upsert_mismatch"):
+                                if _persist_owner_conflict(
+                                    cid_eff, od, ou, (invite_hash or invite_hash_var or url), "upsert_mismatch"
+                                ):
                                     conflict_logged = True
                             log.debug("[PL] #%d owner conflict on upsert_channel -> skip", idx)
                     except Exception:
@@ -732,11 +758,15 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                         if cid_eff is not None:
                             reqdb.note_requested(who_sess, cid_eff, start_after_sec=REQ_START)
                         elif kind == "invite" and invite_hash:
-                            reqdb.note_requested_invite(who_sess, str(invite_hash), start_after_sec=REQ_START)
+                            reqdb.note_requested_invite(
+                                who_sess, str(invite_hash), start_after_sec=REQ_START
+                            )
                     except Exception:
                         pass
 
-                if cid_eff is not None and status in ("joined", "already", "invalid", "private", "blocked", "too_many"):
+                if cid_eff is not None and status in (
+                    "joined", "already", "invalid", "private", "blocked", "too_many"
+                ):
                     try:
                         reqdb.clear(who_sess, cid_eff)
                     except Exception:
@@ -816,7 +846,13 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 status_part += f" | owner_conflict(existing={ex_owner})"
             elif invite_ex_owner:
                 status_part += f" | owner_conflict(existing={invite_ex_owner})"
-            result_items.append({"idx": idx, "url": url, "title": title_current, "status": status_part, "channel_id": channel_id})
+            result_items.append({
+                "idx": idx,
+                "url": url,
+                "title": title_current,
+                "status": status_part,
+                "channel_id": channel_id,
+            })
 
             try:
                 channel_db.add_link(cid_eff, url, last_kind, message.id, od, ou)
@@ -845,8 +881,8 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     )
 
                     async with Bot(
-                            token=token,
-                            default=DefaultBotProperties(parse_mode="HTML"),
+                        token=token,
+                        default=DefaultBotProperties(parse_mode="HTML"),
                     ) as bot:
                         pdata = get_processing(bot_user_id) or {}
                         msg_id = pdata.get("msg_id")
@@ -885,7 +921,6 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                                     disable_web_page_preview=True,
                                 )
                         else:
-                            # fallback: msg_id немає – шлемо нове повідомлення
                             await bot.send_message(
                                 bot_user_id,
                                 summary_text,
