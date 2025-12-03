@@ -1,6 +1,6 @@
 # Project Map (auto-generated)
 
-- Generated: 2025-12-03 17:05:28 UTC
+- Generated: 2025-12-03 17:15:24 UTC
 - Branch: watcherchannels-update
 
 ## Structure (depth=4)
@@ -132,13 +132,9 @@
 ├── scripts
 │   └── generate-project-map.sh
 ├── seed_channels.sqlite3
-├── tg_session.session
-├── tg_session_2.session
-├── tg_session_3.session
-├── tg_session_4.session
 └── tree.txt
 
-19 directories, 112 files
+19 directories, 108 files
 ```
 
 ## Symbols index (functions/classes)
@@ -472,7 +468,7 @@ StructuredAdapter class        52 app/logging_json.py class StructuredAdapter(lo
 StructuredAdapter.__init__ member       53 app/logging_json.py def __init__(self, logger: logging.Logger, context: Optional[Dict[str, Any]] = None):
 StructuredAdapter.add_context member       56 app/logging_json.py def add_context(self, **ctx):
 StructuredAdapter.log member       59 app/logging_json.py def log(self, level: int, msg: Any, *args, **kwargs):
-Symbols index (functions/classes) section     144 docs/PROJECT_MAP.md ## Symbols index (functions/classes)
+Symbols index (functions/classes) section     140 docs/PROJECT_MAP.md ## Symbols index (functions/classes)
 TARGET_FLUSH_SEC variable     14 app/services/gsheets_buffer.py TARGET_FLUSH_SEC = 15.0
 TERMINAL         variable     64 app/services/requested_reconciler.py TERMINAL = "terminal"
 TICK_SEC         variable     24 app/services/requested_reconciler.py TICK_SEC = int(os.getenv("REQUESTED_RECONCILER_TICK", "60") or "60")
