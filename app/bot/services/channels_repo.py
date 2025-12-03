@@ -168,3 +168,36 @@ def get_owners_by_channel_ids(cids: List[int]) -> Dict[int, str]:
         log.exception(f"get_owners_by_channel_ids failed: {e}")
 
     return mp
+
+def get_titles_by_channel_ids(cids: List[int]) -> Dict[int, str]:
+    """
+    Повертає map channel_id -> title (Telegram-назва каналу) з таблиці channels.
+    """
+    ids = [int(x) for x in cids or [] if x]
+    if not ids:
+        return {}
+
+    mp: Dict[int, str] = {}
+    try:
+        conn = raw_connection()
+        cur = conn.cursor()
+        qmarks = ",".join("?" for _ in ids)
+        cur.execute(
+            f"""
+            SELECT channel_id, title
+            FROM channels
+            WHERE channel_id IN ({qmarks})
+            """,
+            ids,
+        )
+        for cid, title in cur.fetchall():
+            if cid is None:
+                continue
+            cid_i = int(cid)
+            t = str(title).strip() if title is not None else ""
+            if t:
+                mp[cid_i] = t
+    except Exception as e:
+        log.exception(f"get_titles_by_channel_ids failed: {e}")
+
+    return mp

@@ -12,7 +12,7 @@ def list_active_watches(user_id: int) -> List[Tuple[Any, Any, Any, Any, Any, Any
         SELECT id, template_id, status, time_window_end, created_by, channel_id
         FROM watch_posts
         WHERE (created_by=? OR created_by IS NULL)
-          AND status IN ('pending','matched')
+          AND status IN ('pending','matched', 'expired')
         ORDER BY id DESC
         LIMIT 200
         """,

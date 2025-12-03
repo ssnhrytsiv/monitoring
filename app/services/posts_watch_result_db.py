@@ -8,6 +8,8 @@ import json
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from app.services import channel_db
+from app.services.membership_db import get_any_session_for_channel
 
 log = logging.getLogger("services.posts_watch_result_db")
 
@@ -494,6 +496,68 @@ def list_due_coverage(now_ts: Optional[str] = None) -> List[Tuple[int, int, int,
             continue
         out.append((int(wid), int(cid), int(mid), (sess if sess is not None else None)))
     return out
+
+def force_mark_matched(
+    watch_id: int,
+    message_id: int,
+    coverage_check_at: Optional[str],
+    matched_session: Optional[str] = None,
+) -> None:
+    """
+    Примусово ставить вотч у matched як з pending, так і з expired.
+    Використовується для ручного матчу через бота.
+    """
+    conn = _ensure_conn()
+    now = _now()
+    with _lock:
+        conn.execute(
+            """
+            UPDATE watch_posts
+            SET matched_message_id=?, matched_at=?, coverage_check_at=?,
+                matched_session=?, status='matched', updated_at=?
+            WHERE id=? AND status IN ('pending','expired')
+            """,
+            (message_id, now, coverage_check_at, matched_session, now, watch_id),
+        )
+        conn.commit()
+    log.info(
+        "[posts_watch_result_db.force_mark_matched] watch_id=%s msg_id=%s status=matched (from pending/expired) cov_at=%s session=%s",
+        watch_id, message_id, coverage_check_at, matched_session,
+    )
+
+def get_watch_channel_id(watch_id: int) -> Optional[int]:
+    conn = _ensure_conn()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT channel_id FROM watch_posts WHERE id=? LIMIT 1",
+            (watch_id,),
+        )
+        row = cur.fetchone()
+    if not row or row[0] is None:
+        return None
+    try:
+        return int(row[0])
+    except Exception:
+        return None
+
+def get_session_for_source_url(source_url: str) -> Optional[str]:
+    """
+    Знаходить сесію, яка вже працювала з каналом для цього source_url:
+      source_url -> channel_id (channel_db.links) -> account (membership.account).
+    """
+    if not source_url:
+        return None
+    try:
+        cid = channel_db.get_channel_id_by_url(source_url)
+    except Exception:
+        cid = None
+    if not cid:
+        return None
+    try:
+        return get_any_session_for_channel(cid)
+    except Exception:
+        return None
 
 
 def list_due_pending_expire(now_ts: Optional[str] = None) -> List[int]:

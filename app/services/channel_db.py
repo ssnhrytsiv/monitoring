@@ -189,6 +189,35 @@ def add_link(
         conn.commit()
 
 
+def get_channel_id_by_url(raw_url: str) -> Optional[int]:
+    """
+    Повертає channel_id для даного raw_url, якщо він колись зʼявлявся в links
+    з ненульовим channel_id.
+    """
+    if not raw_url:
+        return None
+    conn = _ensure_conn()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT channel_id
+            FROM links
+            WHERE raw_url = ? AND channel_id IS NOT NULL
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (raw_url,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        return int(row[0])
+    except Exception:
+        return None
+
+
 def get_channels_by_owner(owner: str, limit: int = 50) -> List[Tuple]:
     clean = owner.lstrip("@").lower()
     conn = _ensure_conn()

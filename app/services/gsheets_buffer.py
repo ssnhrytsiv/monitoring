@@ -170,7 +170,7 @@ def _build_row_for_matched(wid: int) -> Tuple[str, List[str]]:
     row = [
         ch_title or "",
         source_url,
-        posted_time,
+        posted_time,  # C
         "",
         "",
         t_title or "",
@@ -230,11 +230,66 @@ def _build_row_for_edited_other(wid: int, when_str: str | None) -> Tuple[str, Li
 
 
 def record_matched(watch_id: int) -> bool:
+    """
+    Записує matched у буфер.
+
+    Логіка:
+      - якщо вже є append для цього watch_id у цьому дні – перезаписуємо рядок;
+      - якщо відомий індекс рядка (через _known_row_index) – додаємо update по C;
+      - якщо в кеші немає, але рядок уже існує в шиті – знаходимо його по колонці I і додаємо update;
+      - лише якщо рядка взагалі ніде немає – додаємо новий append.
+    """
     date_str, row = _build_row_for_matched(watch_id)
     if not date_str:
         return False
+
+    # Спочатку перевіряємо буфери під локом
     with _buf_lock:
         gw.ensure_daily_sheet(date_str)
+
+        # 1) оновлюємо вже запланований append, якщо він є
+        bucket_app = _pending_appends.setdefault(date_str, [])
+        for idx, (wid, existing_row) in enumerate(bucket_app):
+            if wid == watch_id:
+                bucket_app[idx] = (watch_id, row)
+                _touch_oldest_event_ts()
+                return True
+
+        # 2) якщо знаємо рядок у вже записаному шиті – робимо update по C
+        known_rows = _known_row_index.get(date_str, {})
+        if watch_id in known_rows:
+            bucket_upd = _pending_updates.setdefault(date_str, {})
+            entry = bucket_upd.setdefault(watch_id, {})
+            entry["C"] = row[2]
+            _touch_oldest_event_ts()
+            return True
+
+    # 2.5) поза локом: спробувати знайти рядок напряму в Google Sheets по колонці I
+    values_i = gw.read_col_I(date_str)
+    mapping: Dict[int, int] = {}
+    for idx in range(2, len(values_i) + 1):
+        try:
+            wid = int(str(values_i[idx - 1]).strip())
+        except Exception:
+            continue
+        mapping[wid] = idx
+
+    row_idx = mapping.get(watch_id)
+
+    with _buf_lock:
+        # оновлюємо кеш відомих рядків
+        km = _known_row_index.setdefault(date_str, {})
+        km.update(mapping)
+
+        if row_idx:
+            # 3) тепер знаємо рядок -> робимо update по C
+            bucket_upd = _pending_updates.setdefault(date_str, {})
+            entry = bucket_upd.setdefault(watch_id, {})
+            entry["C"] = row[2]
+            _touch_oldest_event_ts()
+            return True
+
+        # 4) взагалі не знайшли цей watch_id у шиті -> створюємо новий рядок
         _pending_appends.setdefault(date_str, []).append((watch_id, row))
         _touch_oldest_event_ts()
     return True
@@ -374,6 +429,7 @@ def _flush_sheet(sheet: str) -> None:
 
     if appends:
         for wid, row in appends:
+            # якщо є update для цього wid – застосовуємо його до рядка
             fields = updates.pop(wid, None)
             if fields:
                 if "C" in fields:
@@ -387,6 +443,7 @@ def _flush_sheet(sheet: str) -> None:
             for i in range(0, len(merged_rows), APPEND_CHUNK):
                 gw.append_rows(sheet, merged_rows[i: i + APPEND_CHUNK])
 
+    # у updates залишилися тільки ті wid, для яких немає append'ів
     if updates:
         values_i = gw.read_col_I(sheet)
         mapping: Dict[int, int] = {}

@@ -4,6 +4,7 @@ import sqlite3
 import time
 from typing import Optional, Tuple
 
+
 DB_PATH = os.getenv("DB_PATH", "post_watchdog.sqlite3")
 
 DDL = """
@@ -140,6 +141,36 @@ def any_final_for_channel(channel_id: int) -> Optional[str]:
         )
         row = cur.fetchone()
         return row[0] if row else None
+
+
+def get_any_session_for_channel(channel_id: int) -> Optional[str]:
+    """
+    Повертає якусь сесію (account), що має запис у membership для цього channel_id.
+    Пріоритезує joined/already/requested над іншими статусами.
+    """
+    with _conn() as c:
+        # account = назва сесії (tg_session_2 і т.д.)
+        cur = c.execute(
+            """
+            SELECT account, status
+            FROM membership
+            WHERE channel_id = ?
+            ORDER BY
+                CASE status
+                    WHEN 'joined'   THEN 1
+                    WHEN 'already'  THEN 1
+                    WHEN 'requested' THEN 2
+                    ELSE 3
+                END,
+                ts DESC
+            LIMIT 1
+            """,
+            (int(channel_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return str(row[0])
 
 
 # ---------- invite_map (інвайт-хеш → channel_id, title) ----------
