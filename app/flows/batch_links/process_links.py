@@ -10,6 +10,9 @@ import os
 import re
 from typing import Optional, List
 
+from typing import Optional
+
+from app.services import membership_db, channel_db
 from aiogram import Bot
 from app.bot.processing_guard import set_processing
 
@@ -105,24 +108,21 @@ _RR = _RoundRobinOrder()
 
 def _build_full_footer(items: List[dict]) -> str:
     """
-    Порядок секцій:
-    1) Чисті (без конфліктів і без дублікатів)
-    2) Конфлікти (згруповані за адміном)
-    3) Інші без конфліктів, але з дублікатами (по одному "оригіналу" на channel_id)
-    4) Приватні
-    5) Недійсні/помилки
-    6) Дублікати (усі «повтори» channel_id) — внизу
-
-    У рядках статусів НЕ показувати 'owner_conflict(existing=...)' (прибираємо для читабельності).
+    Порядок секций:
+    1) Чистые (без конфликтов и без дубликатов)
+    2) Конфликты (сгруппированы по админу)
+    3) Другие без конфликтов, но с дубликатами (по одному "оригиналу" на channel_id)
+    4) Приватные
+    5) Неправильные ссылки / ошибки
+    6) Дубликаты (все «повторы» channel_id) — внизу
+    7) Заявки отправлены — отдельным блоком в самом низу
     """
     import re
     from html import escape as _escape
-    from typing import Optional, Any, Dict, List
 
     def _esc(s: str) -> str:
         return _escape(s or "")
 
-    # Витягнути імʼя з owner_conflict(existing=...)
     RE_CONFLICT = re.compile(r"owner_conflict\(existing=([^)]+)\)", re.IGNORECASE)
 
     def _conflict_name(status: str) -> Optional[str]:
@@ -131,14 +131,13 @@ def _build_full_footer(items: List[dict]) -> str:
         m = RE_CONFLICT.search(status)
         return m.group(1).strip() if m else None
 
-    # Прибрати маркер owner_conflict(...) з тексту статусу + почистити роздільники
     def _strip_conflict(status: str) -> str:
         if not status:
-            return status or ""
+            return ""
         s = RE_CONFLICT.sub("", status)
-        s = re.sub(r"\s*\|\s*\|\s*", " | ", s)   # подвійні |
-        s = re.sub(r"^\s*\|\s*|\s*\|\s*$", "", s)  # крайові |
-        s = re.sub(r"\s{2,}", " ", s).strip()      # зайві пробіли
+        s = re.sub(r"\s*\|\s*\|\s*", " | ", s)
+        s = re.sub(r"^\s*\|\s*|\s*\|\s*$", "", s)
+        s = re.sub(r"\s{2,}", " ", s).strip()
         return s
 
     def _is_private(status: str) -> bool:
@@ -152,15 +151,79 @@ def _build_full_footer(items: List[dict]) -> str:
         tokens = ("invalid", "error", "temp", "blocked", "too_many", "waiting")
         return any(tok in s for tok in tokens)
 
-    def _link_line(idx: int, url: str, title: Optional[str], status: str, tag: str = "") -> str:
-        clean_status = _strip_conflict(status)
-        suffix = f" {tag}" if tag else ""
-        if title:
-            return f"{idx}. {_esc(title)}{suffix}\n   <a href=\"{_esc(url)}\">Посилання</a> — {clean_status}"
-        else:
-            return f"{idx}. <a href=\"{_esc(url)}\">Посилання</a>{suffix} — {clean_status}"
+    def _looks_requested(status: str) -> bool:
+        """
+        Визначаємо заявки максимально надійно:
+        - шукаємо 'requested' у status
+        - або слово 'заявк' / 'заявка' / 'заявку' (на випадок, якщо fmt_result_line вже переклав)
+        """
+        s = _strip_conflict(status).lower()
+        return (
+            "requested" in s
+            or "заявк" in s
+        )
 
-    # 0) Групування за channel_id і визначення дублікатів
+    def _status_human(status: str) -> str:
+        base = _strip_conflict(status).lower()
+
+        if _looks_requested(status):
+            session = ""
+            if "[" in status and "]" in status:
+                session = status[status.find("[") : status.rfind("]") + 1]
+            return f"📨 Заявка отправлена {session}".strip()
+        if "joined" in base:
+            return "✅ Подписался"
+        if "already" in base:
+            return "☑️ Был подписан"
+        if "flood" in base:
+            return "⏳ Flood"
+        if (
+            "invalid" in base
+            or "private" in base
+            or "error" in base
+            or "blocked" in base
+            or "too_many" in base
+        ):
+            return "❌ Невалидное"
+        return _strip_conflict(status) or "…"
+
+    def _should_link_be_clickable(status: str) -> bool:
+        s = _strip_conflict(status).lower()
+        if _looks_requested(status):
+            return False
+        if (
+            "invalid" in s
+            or "private" in s
+            or "error" in s
+            or "blocked" in s
+            or "too_many" in s
+            or "flood" in s
+        ):
+            return False
+        return True  # joined / already / інше нормальне
+
+    def _link_line(idx: int, url: str, title: Optional[str], status: str, tag: str = "") -> str:
+        """
+        Рендер для всіх, крім блоку заявок (requested_items).
+        Для заявок використовуємо окрему гілку нижче.
+        """
+        human_status = _status_human(status)
+        suffix = f" {tag}" if tag else ""
+        clickable = _should_link_be_clickable(status)
+
+        if title:
+            title_part = f"{idx}. {_esc(title)}{suffix}"
+        else:
+            title_part = f"{idx}."
+
+        if clickable:
+            link_part = f'<a href="{_esc(url)}">Ссылка</a>'
+            return f"{title_part}\n   {link_part} — {human_status}"
+
+        return f"{title_part}\n   Ссылка: {_esc(url)} — {human_status}"
+
+    # --- групування і дублікати ---
+
     cid_to_items: Dict[Any, List[dict]] = {}
     for it in (items or []):
         cid = it.get("channel_id")
@@ -169,23 +232,20 @@ def _build_full_footer(items: List[dict]) -> str:
         cid_to_items.setdefault(cid, []).append(it)
     dup_cids = {cid for cid, lst in cid_to_items.items() if len(lst) > 1}
 
-    # 0.1) Для кожного дублікатного channel_id обрати ПРЕДСТАВНИКА (оригінал, що лишається в секції):
-    # - якщо у цього cid є рядки з конфліктом — обираємо той із мінімальним idx серед конфліктних (піде в "Конфлікти")
-    # - інакше — рядок із мінімальним idx (піде в "Інші (мають дублікати)")
     rep_idx_by_cid: Dict[Any, int] = {}
     for cid in dup_cids:
         lst = cid_to_items[cid]
         conflict_items = [it for it in lst if _conflict_name(it.get("status") or "") is not None]
         rep = min(conflict_items or lst, key=lambda x: (x.get("idx") or 10**9))
-        rep_idx_by_cid[cid] = rep.get("idx")
+        rep_idx_by_cid[cid] = rep.get("idx")  # type: ignore[arg-type]
 
-    # 1) Розподіл по секціях
-    clean_unique: List[str] = []          # чисті (без конфліктів, без дублікатів)
+    clean_unique: List[str] = []
     conflicts_by_admin: Dict[str, List[str]] = {}
-    other_clean_dup_reps: List[str] = []  # представники без конфліктів, але з дублями
+    other_clean_dup_reps: List[str] = []
     privates: List[str] = []
     invalids: List[str] = []
-    dup_lines_by_cid: Dict[Any, List[str]] = {}  # непредставники для блоку "Дублікати"
+    requested_items: List[str] = []          # окремий блок
+    dup_lines_by_cid: Dict[Any, List[str]] = {}
     title_by_cid: Dict[Any, Optional[str]] = {}
 
     for it in (items or []):
@@ -196,67 +256,68 @@ def _build_full_footer(items: List[dict]) -> str:
         cid = it.get("channel_id")
         admin = _conflict_name(status)
 
-        # Якщо це дублікатний channel_id і не представник — піде в блок "Дублікати" (внизу)
+        # дублікат, не представник
         if cid is not None and cid in dup_cids and rep_idx_by_cid.get(cid) != idx:
-            line = _link_line(idx, url, title, status, tag="[дублікат]")
+            line = _link_line(idx, url, title, status, tag="[дубликат]")
             dup_lines_by_cid.setdefault(cid, []).append(line)
             if cid not in title_by_cid:
                 title_by_cid[cid] = title
             continue
 
-        # Представник або унікальний запис:
         if admin:
             line = _link_line(idx, url, title, status)
             conflicts_by_admin.setdefault(admin, []).append(line)
+        elif _looks_requested(status):
+            # заявки: ссылка текстом + статус окремим рядком
+            human_status = _status_human(status)
+            if title:
+                title_part = f"{idx}. {_esc(title)}"
+            else:
+                title_part = f"{idx}."
+            requested_items.append(
+                f"{title_part}\n"
+                f"   Ссылка: {_esc(url)}\n"
+                f"   {human_status}"
+            )
         elif _is_private(status):
             privates.append(_link_line(idx, url, title, status))
         elif _is_invalid_or_error(status):
             invalids.append(_link_line(idx, url, title, status))
         else:
-            # чистий запис (без конфлікту)
             if cid is not None and cid in dup_cids:
-                # представник дублікатного cid без конфлікту -> у секцію "інші (мають дублікати)"
                 other_clean_dup_reps.append(_link_line(idx, url, title, status))
             else:
-                # унікальний канал без конфлікту
                 clean_unique.append(_link_line(idx, url, title, status))
 
-    # 2) Рендер у потрібному порядку
     out: List[str] = []
-    out.append("📊 Підсумок (всі):")
+    out.append("📋 <b>Список (все):</b>")
 
-    # 2.1) Чисті унікальні першими
     if clean_unique:
         out.extend(clean_unique)
 
-    # 2.2) Конфлікти (групами)
     for admin, lines in conflicts_by_admin.items():
         out.append("")
-        out.append(f"⚠️ Адмін вже є для цих каналів: {admin}")
+        out.append(f"⚠️ Админ уже есть для этих каналов: {admin}")
         out.extend(lines)
 
-    # 2.3) Інші (мають дублікати) — представники без конфлікту
     if other_clean_dup_reps:
         out.append("")
-        out.append("ℹ️ Канали (оригінали), які мають дублікати:")
+        out.append("ℹ️ Каналы, которые имеют дубликаты:")
         out.extend(other_clean_dup_reps)
 
-    # 2.4) Приватні/недоступні
     if privates:
         out.append("")
-        out.append("🔒 Приватні/недоступні:")
+        out.append("🔒 Приватные:")
         out.extend(privates)
 
-    # 2.5) Недійсні/помилки
     if invalids:
         out.append("")
-        out.append("❌ Недійсні/помилки:")
+        out.append("❌ Неправильные ссылки:")
         out.extend(invalids)
 
-    # 2.6) Дублікати — внизу
     if dup_lines_by_cid:
         out.append("")
-        out.append("🔁 Дублікати каналів (однаковий channel_id у кількох рядках):")
+        out.append("🔁 Дубликаты каналов")
         for cid in sorted(dup_lines_by_cid.keys()):
             title = title_by_cid.get(cid)
             if not title:
@@ -264,10 +325,16 @@ def _build_full_footer(items: List[dict]) -> str:
                     if it.get("title"):
                         title = it.get("title")
                         break
-            header = f"• {title or 'Без назви'} (ID: {cid})"
+            header = f"• {title or 'Без названия'} (ID: {cid})"
             out.append(header)
             for line in dup_lines_by_cid[cid]:
                 out.append("  " + line)
+
+    # окремий блок заявок в самому низу
+    if requested_items:
+        out.append("")
+        out.append("✉️ Заявки отправлены:")
+        out.extend(requested_items)
 
     return "\n".join(out)
 
@@ -406,6 +473,39 @@ def _invite_owner_conflict(invite_hash: Optional[str],
     return (True, ex_repr)
 
 
+def _resolve_title_for_url(url: str, channel_id: Optional[int]) -> Optional[str]:
+    """
+    Повертає назву каналу для даного URL з локальних кешів, без Telegram API.
+    Порядок:
+      1) invite_map (membership_db.map_invite_get) по URL/інвайту → (channel_id, title)
+      2) channel_db.channels по channel_id → title
+    """
+    cid_eff: Optional[int] = channel_id
+    title: Optional[str] = None
+
+    # 1) Пробуємо через invite_map по URL/інвайту
+    try:
+        cid_from_inv, title_from_inv = membership_db.map_invite_get(url)
+    except Exception:
+        cid_from_inv, title_from_inv = None, None
+
+    if title_from_inv:
+        return title_from_inv
+
+    if cid_from_inv:
+        cid_eff = cid_from_inv
+
+    # 2) Якщо є channel_id — шукаємо в channels
+    if cid_eff:
+        try:
+            ch = channel_db.find_channel(int(cid_eff))
+        except Exception:
+            ch = None
+        if ch and ch.get("title"):
+            return ch["title"]
+
+    return None
+
 async def process_links(message, text: str, owner_display: Optional[str] = None, owner_username: Optional[str] = None):
     bot_user_id: Optional[int] = None
     raw_text = text or ""
@@ -520,10 +620,16 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
             used.add(url)
 
             # 1) Спершу пробуємо кеш по URL.
-            # Early-return ТІЛЬКИ для joined/already/invalid/private.
             ust = url_get(url)
             log.debug("[PL] #%d url_get(%s) -> %s", idx, url, ust)
             if ust in ("joined", "already", "invalid", "private"):
+                # Спробуємо підтягнути title з кешу, якщо ще None
+                if title_current is None:
+                    try:
+                        title_current = _resolve_title_for_url(url, None)
+                    except Exception:
+                        pass
+
                 line = fmt_result_line(idx, url, "cached", extra=ust)
                 results.append(line)
 
@@ -548,10 +654,9 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     pass
                 await _short_pause()
                 continue
-            # Якщо ust == "requested" або ust is None — НЕ робимо continue.
-            # Даємо коду пройти далі: probe_channel_id -> any_final_for_channel -> membership.
+            # Якщо ust == "requested" або None – даємо коду піти далі.
 
-            # 2) Тепер можна робити probe_channel_id (один легкий API-виклик)
+            # 2) probe_channel_id
             if probe_client is not None:
                 try:
                     log.debug("[PL] #%d probe_channel_id(url=%s)", idx, url)
@@ -600,18 +705,25 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     log.debug("[PL] #%d probe_channel_id error: %s", idx, e)
                     channel_id = None
 
-            # 3) Якщо ми вже знаємо channel_id – пробуємо кеш по каналу
+            # 3) Кеш по каналу
             if channel_id is not None:
                 final = any_final_for_channel(channel_id)
                 log.debug("[PL] #%d any_final_for_channel(%s) -> %s", idx, channel_id, final)
                 if final:
+                    # Підтягнемо title з кешу, якщо ще не маємо
+                    if title_current is None:
+                        try:
+                            title_current = _resolve_title_for_url(url, channel_id)
+                        except Exception:
+                            pass
+
                     line = fmt_result_line(idx, url, "cached", extra=final)
                     is_conflict, ex_owner = _owner_conflict(channel_id, od, ou)
                     if is_conflict:
                         line = f"{line} | owner_conflict(existing={ex_owner})"
                         if not conflict_logged:
                             if _persist_owner_conflict(
-                                channel_id, od, ou, probe_invite or url, "cached_mismatch"
+                                    channel_id, od, ou, probe_invite or url, "cached_mismatch"
                             ):
                                 conflict_logged = True
                         log.debug("[PL] #%d owner conflict on cached, not updating channel row", idx)
@@ -648,7 +760,7 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     await _short_pause()
                     continue
 
-            # 4) Далі — все як було: вибираємо слоти, ensure_join, membership, reqdb і т.д.
+            # 4) ensure_join та решта логіки
             slots_raw = list(iter_ready_pool_clients())
             slots = _RR.pick_order(slots_raw)
             if not slots:
@@ -733,9 +845,9 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     "private", "blocked", "too_many"
                 ):
                     upsert_membership(who_sess, cid_eff, status)
-                if cid_eff is None and status in (
-                    "joined", "already", "requested", "invalid", "private"
-                ):
+
+                # ГОЛОВНА ЗМІНА: кеш по URL пишемо завжди, якщо статус фінальний.
+                if status in ("joined", "already", "requested", "invalid", "private"):
                     url_put(url, status)
 
                 if cid_eff is not None:

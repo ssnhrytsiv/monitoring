@@ -24,7 +24,7 @@ __all__ = [
 _DB_PATH = (
     os.environ.get("CHANNEL_DB_PATH")
     or os.environ.get("DB_PATH")
-    or "channel_meta.sqlite3"
+    or "post_watchdog.sqlite3"
 )
 
 _conn: Optional[sqlite3.Connection] = None

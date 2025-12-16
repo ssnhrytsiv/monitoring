@@ -121,11 +121,13 @@ class DebouncedProgress:
             who = f" • {self.actor}" if self.actor else ""
             line_now = f"\n🔄 Зараз: {self.current}{who}"
         footer = f"\n\n{self.footer}" if self.footer else ""
+
         return (
             f"📦 <b>{self.title}</b> {header_suffix}\n"
             f"{bar}  {self.done}/{self.total}\n"
-            f"✔ <b>joined:</b> {self.ok}   📨 <b>requested:</b> {self.requested}   🔁 <b>already:</b> {self.already}\n"
-            f"❌ <b>invalid/private/error:</b> {self.bad}   ⏳ <b>flood:</b> {self.flood}"
+            f"✅ <b>Подписался:</b> {self.ok}   🔁 <b>Был подписан:</b> {self.already}\n"
+            f"📨 <b>Заявки:</b> {self.requested}\n"
+            f"❌ <b>Невалидные/приватные/ошибки:</b> {self.bad}   ⏳ <b>Flood:</b> {self.flood}"
             f"{line_now}{footer}"
         )
 
