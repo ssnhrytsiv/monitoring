@@ -106,6 +106,35 @@ class _RoundRobinOrder:
 _RR = _RoundRobinOrder()
 
 
+def _split_text_for_telegram(text: str, max_len: int = 4000) -> List[str]:
+    """
+    Розбиває текст на шматки, що поміщаються в ліміт Telegram (4096 символів).
+    Розділяємо по рядках, щоб не рвати розмітку/посилання посередині.
+    """
+    base = text or ""
+    if len(base) <= max_len:
+        return [base]
+
+    parts: List[str] = []
+    current: List[str] = []
+    current_len = 0
+
+    for line in base.split("\n"):
+        # +1 за символ переносу, який додамо при join
+        line_len = len(line) + 1
+        if current and current_len + line_len > max_len:
+            parts.append("\n".join(current).strip())
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += line_len
+
+    if current:
+        parts.append("\n".join(current).strip())
+
+    return [p for p in parts if p]
+
+
 def _build_full_footer(items: List[dict]) -> str:
     """
     Порядок секций:
@@ -980,17 +1009,32 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
             footer_full = _build_full_footer(result_items)
         except Exception:
             footer_full = "📊 Підсумок (всі):\n(помилка формування футера)"
-        await progress.finish(footer=footer_full)
+
+        footer_parts = _split_text_for_telegram(footer_full, max_len=3500)
+        footer_main = footer_parts[0] if footer_parts else ""
+
+        await progress.finish(footer=footer_main)
+
+        # Додаткові шматки відправляємо окремими повідомленнями, щоб не впертися в ліміт 4096.
+        for idx, part in enumerate(footer_parts[1:], start=2):
+            try:
+                await message.reply(
+                    f"📋 Продовження списку ({idx}/{len(footer_parts)}):\n{part}",
+                    link_preview=False,
+                )
+            except Exception:
+                pass
+
         log.info("batch done: total=%d uniq=%d", len(links), len(set(links)))
 
         if bot_user_id is not None:
             try:
                 token = os.getenv("BOT_TOKEN")
                 if token:
-                    summary_text = progress._last_render or progress._render(
-                        header_suffix="— готово ✅",
-                        final=True,
+                    summary_text_full = progress._last_render or progress._render(
+                        header_suffix="— готово ✅", final=True
                     )
+                    summary_parts = _split_text_for_telegram(summary_text_full, max_len=4000)
 
                     async with Bot(
                         token=token,
@@ -1009,7 +1053,7 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                                 await bot.edit_message_text(
                                     chat_id=bot_user_id,
                                     message_id=msg_id,
-                                    text=summary_text,
+                                    text=summary_parts[0],
                                     reply_markup=back_to_menu_kb(),
                                     disable_web_page_preview=True,
                                 )
@@ -1028,17 +1072,36 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                                 )
                                 await bot.send_message(
                                     bot_user_id,
-                                    summary_text,
+                                    summary_parts[0],
                                     reply_markup=back_to_menu_kb(),
                                     disable_web_page_preview=True,
                                 )
                         else:
                             await bot.send_message(
                                 bot_user_id,
-                                summary_text,
+                                summary_parts[0],
                                 reply_markup=back_to_menu_kb(),
                                 disable_web_page_preview=True,
                             )
+
+                        # Якщо є продовження — шлемо окремо без клавіатури.
+                        extra_parts = summary_parts[1:]
+                        # Додаємо також «довгий» футер, який не помістився у progress.finish.
+                        if len(footer_parts) > 1:
+                            extra_parts.extend(footer_parts[1:])
+
+                        for idx, part in enumerate(extra_parts, start=2):
+                            try:
+                                await bot.send_message(
+                                    bot_user_id,
+                                    f"📋 Продовження ({idx}):\n{part}",
+                                    disable_web_page_preview=True,
+                                )
+                            except Exception:
+                                log.exception(
+                                    "bot_notify_extra_failed",
+                                    extra={"user_id": bot_user_id, "part_idx": idx},
+                                )
                 set_processing(bot_user_id, False)
             except Exception as e:
                 log.exception(
