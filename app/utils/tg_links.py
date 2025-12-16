@@ -1,52 +1,84 @@
 # app/utils/tg_links.py
 import re
-from typing import List
-
-# characters that often stick to URLs
-_TRIM_LEAD  = "(<[«\"' \u00A0\u200b\u200c\u200d\u2060"
-_TRIM_TRAIL = ".,;:!?)]}>»\"' \u00A0\u200b\u200c\u200d\u2060"
-
-def _fix_scheme(u: str) -> str:
-    u = (u or "").strip()
-    lu = u.lower()
-    if lu.startswith("tps://"):   u = "h" + u
-    elif lu.startswith("tp://"):  u = "ht" + u
-    elif lu.startswith("ttp://"): u = "h" + u
-    elif lu.startswith("www."):   u = "https://" + u
-    elif lu.startswith("t.me") or lu.startswith("telegram.me"):
-        u = "https://" + u
-    if not u.lower().startswith(("http://", "https://")):
-        u = "https://" + u.lstrip("/")
-    return u
-
-def _canon(u: str) -> str:
-    u = _fix_scheme(u)
-    # normalize domain + legacy path
-    u = re.sub(r'^(https?://)telegram\.me', r'\1t.me', u, flags=re.IGNORECASE)
-    u = re.sub(r'/joinchat/', '/', u, flags=re.IGNORECASE)
-    return u
+from urllib.parse import urlsplit, urlunsplit, SplitResult
 
 def sanitize_link(u: str) -> str:
-    """Trim junk around and normalize to canonical t.me link."""
-    u = (u or "").strip()
-    u = u.strip(_TRIM_LEAD + _TRIM_TRAIL).lstrip("—–-•· ").strip()
-    u = _canon(_fix_scheme(u))
-    u = u.strip(_TRIM_LEAD + _TRIM_TRAIL)
-    return u
+    """
+    Нормалізує/«лікує» URL:
+      - виправляє типові опечатки у схемі: tps://, htps://, https//, http//
+      - tg://resolve?domain=foo  ->  https://t.me/foo
+      - @username                ->  https://t.me/username
+      - t.me/... без схеми       ->  https://t.me/...
+      - прибирає «подвійну схему»: https://https://t.me/...
+      - для t.me завжди ставить HTTPS
+    Повертає стабільний рядок. Якщо не вдалось розпарсити — повертає виправлене «як є».
+    """
+    s = (u or "").strip()
+    if not s:
+        return s
 
-_TG_RE = re.compile(
-    r'((?:https?://|tps://|tp://|ttp://|www\.)?'
-    r'(?:t\.me|telegram\.me)'
-    r'/(?:\+[\w-]+|[A-Za-z0-9_]+(?:/\d+)?|c/\d+(?:/\d+)?))',
-    re.IGNORECASE
-)
+    low = s.lower()
 
-def parse_links(text: str) -> List[str]:
-    if not text:
-        return []
-    seen = {}
-    for m in _TG_RE.finditer(text):
-        raw = m.group(1)
-        url = sanitize_link(raw)
-        seen[url] = None
-    return list(seen.keys())
+    # 1) tg://resolve?domain=foo -> https://t.me/foo
+    if low.startswith("tg://resolve?domain="):
+        # беремо домен до першого '&' (якщо він є), і знімаємо '@'
+        name = s.split("=", 1)[-1].split("&", 1)[0].lstrip("@").strip()
+        if name:
+            s = f"https://t.me/{name}"
+            low = s.lower()
+
+    # 2) @username -> https://t.me/username
+    if s.startswith("@"):
+        s = f"https://t.me/{s[1:].strip()}"
+        low = s.lower()
+
+    # 3) Найчастіші опечатки/усічення схеми на початку
+    fixes = (
+        ("https//", "https://"),
+        ("http//",  "http://"),
+        ("tps://",  "https://"),
+        ("htps://", "https://"),
+        ("ttps://", "https://"),
+        ("ps://",   "https://"),
+        ("s://",    "https://"),
+    )
+    for bad, good in fixes:
+        if s.startswith(bad):
+            s = good + s[len(bad):]
+            low = s.lower()
+            break
+
+    # 4) t.me/... без схеми -> https://t.me/...
+    if low.startswith("t.me/"):
+        s = "https://" + s
+        low = s.lower()
+
+    # 5) Прибрати «подвійну схему»: https://https://t.me/...
+    m = re.match(r"^([a-zA-Z][a-zA-Z0-9+\-.]*://)(.+)$", s)
+    if m:
+        scheme = m.group(1)
+        rest = re.sub(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://", "", m.group(2))
+        s = scheme + rest
+        low = s.lower()
+
+    # 6) Розбір URL та фінальне доведення до ладу
+    try:
+        p = urlsplit(s)
+    except Exception:
+        return s  # як є, якщо дуже криво
+
+    # якщо схеми немає — вважаємо https
+    if not p.scheme:
+        s = "https://" + s.lstrip("/")
+        p = urlsplit(s)
+
+    # якщо netloc порожній, а шлях схожий на t.me/... → перетворюємо
+    if not p.netloc and p.path.startswith("t.me/"):
+        s = "https://" + p.path
+        p = urlsplit(s)
+
+    # Підвищуємо до HTTPS для t.me
+    if p.netloc.lower() == "t.me" and p.scheme != "https":
+        p = SplitResult("https", p.netloc, p.path, p.query, p.fragment)
+
+    return urlunsplit(p)

@@ -1,0 +1,131 @@
+.
+├── .env
+├── .github
+│   └── workflows
+│       └── project-map.yml
+├── .gitignore
+├── Oops.rej
+├── Oops.rej.orig
+├── README.md
+├── app
+│   ├── __init__.py
+│   ├── __pycache__
+│   ├── config.py
+│   ├── debug
+│   │   └── __pycache__
+│   ├── flows
+│   │   └── batch_links
+│   ├── logging_json.py
+│   ├── plugins
+│   │   ├── __init__.py
+│   │   ├── __pycache__
+│   │   ├── batch_links.py
+│   │   ├── batch_links.py.zip
+│   │   ├── channel_info.py
+│   │   ├── help_and_ping.py
+│   │   ├── metrics_watch.py
+│   │   ├── monitor_links.py
+│   │   ├── monitor_watch.py
+│   │   ├── needle_reply.py
+│   │   ├── owner_set.py
+│   │   ├── post_templates.py
+│   │   ├── posts_watch_listener.py
+│   │   ├── progress_live.py
+│   │   └── resolve_channel.py
+│   ├── services
+│   │   ├── __init__.py
+│   │   ├── __pycache__
+│   │   ├── account_pool.py
+│   │   ├── channel_db.py
+│   │   ├── channel_facts.py
+│   │   ├── channel_maps.py
+│   │   ├── db
+│   │   ├── feature
+│   │   ├── feature_seed.zip
+│   │   ├── gsheets.py
+│   │   ├── gsheets_buffer.py
+│   │   ├── gsheets_writer.py
+│   │   ├── html_match.py
+│   │   ├── html_render.py
+│   │   ├── join_scheduler.py
+│   │   ├── joiner.py
+│   │   ├── link_queue.py
+│   │   ├── membership_db.py
+│   │   ├── models.py
+│   │   ├── owner_conflict_guard.py
+│   │   ├── post_match.py
+│   │   ├── post_matcher.py
+│   │   ├── post_watch_db.py
+│   │   ├── posts_watch_result_db.py
+│   │   ├── requested_reconciler.py
+│   │   ├── requested_reconciler_db.py
+│   │   ├── scheduling
+│   │   ├── subscription_check.py
+│   │   └── time_utils.py
+│   ├── settings.py
+│   ├── telethon_client.py
+│   └── utils
+│       ├── __init__.py
+│       ├── __pycache__
+│       ├── formatting.py
+│       ├── link_parser.py
+│       ├── notices.py
+│       ├── text_norm.py
+│       ├── tg_links.py
+│       └── throttle.py
+├── app_deps.txt
+├── apply_anchored_patch.py
+├── data
+│   └── post_templates_meta.json
+├── db_dump
+│   ├── db_schema_dump.zip
+│   ├── post_watchdog.sqlite3
+│   ├── post_watchdog.sqlite3.ad_samples.columns.csv
+│   ├── post_watchdog.sqlite3.channels.columns.csv
+│   ├── post_watchdog.sqlite3.invite_check.columns.csv
+│   ├── post_watchdog.sqlite3.invite_map.columns.csv
+│   ├── post_watchdog.sqlite3.invite_status.columns.csv
+│   ├── post_watchdog.sqlite3.link_queue.columns.csv
+│   ├── post_watchdog.sqlite3.links.columns.csv
+│   ├── post_watchdog.sqlite3.membership.columns.csv
+│   ├── post_watchdog.sqlite3.monitor_channels.columns.csv
+│   ├── post_watchdog.sqlite3.monitors.columns.csv
+│   ├── post_watchdog.sqlite3.post_template.columns.csv
+│   ├── post_watchdog.sqlite3.post_watch.columns.csv
+│   ├── post_watchdog.sqlite3.requested_check.columns.csv
+│   ├── post_watchdog.sqlite3.rowcounts.tsv
+│   ├── post_watchdog.sqlite3.schema.sql
+│   ├── post_watchdog.sqlite3.settings.columns.csv
+│   ├── post_watchdog.sqlite3.sqlite_master.tsv
+│   ├── post_watchdog.sqlite3.sqlite_sequence.columns.csv
+│   └── post_watchdog.sqlite3.url_cache.columns.csv
+├── docs
+│   ├── ARCHITECTURE.md
+│   └── PROJECT_MAP.md
+├── imports.txt
+├── main.py
+├── patches.json
+├── post_watchdog.sqlite3
+├── post_watchdog.sqlite3-shm
+├── post_watchdog.sqlite3-wal
+├── post_watchdog.sqlite3.bak.1757577836
+├── posts_watch_result.sqlite3
+├── posts_watch_result.sqlite3-shm
+├── posts_watch_result.sqlite3-wal
+├── requirements.txt
+├── safe_apply_patch.py
+├── scripts
+│   └── generate-project-map.sh
+├── seed_channels.sqlite3
+├── seed_feature.zip
+├── service_account.json
+├── tg_monitor_clean.zip
+├── tg_monitor_release_clean_fixed_makefile.zip
+├── tg_session.session
+├── tg_session_2.session
+├── tg_session_3.session
+├── tg_session_3.session-journal
+├── tg_session_4.session
+└── tree.txt
+
+22 directories, 107 files
