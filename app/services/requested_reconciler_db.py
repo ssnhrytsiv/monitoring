@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+import math
 import logging
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -28,12 +29,11 @@ REQ_BACKOFF_BASE    = int(os.getenv("REQUESTED_BACKOFF_BASE", "30"))           #
 REQ_BACKOFF_MAX     = int(os.getenv("REQUESTED_BACKOFF_MAX", "3600"))          # сек
 
 # Нове: Множник експоненційного зростання (щоб зробити крок більшим)
-# Для requested за замовчуванням робимо агресивніше (×3), для invites лишаємо ×2.
+# Для requested за замовчуванням робимо агресивніше, для invites лишаємо ×2.
 INVITE_BACKOFF_FACTOR = float(os.getenv("REQUESTED_INVITE_BACKOFF_FACTOR", "2.0") or "2.0")
 REQ_BACKOFF_FACTOR    = float(os.getenv("REQUESTED_BACKOFF_FACTOR", "5.0") or "5.0")
 
 # Мінімальний інтервал до наступної ПОВТОРНОЇ перевірки інвайта
-# Тепер 6 годин за замовчуванням (21600 секунд)
 INVITE_RECHECK_MIN_SEC = int(os.getenv("REQUESTED_RECONCILER_INVITE_RECHECK_MIN_SEC", "200") or "200")
 
 # Анти-дребезг для повторних note_requested_invite
@@ -45,6 +45,7 @@ INVITE_NOTE_RESET_LIMIT_PER_HOUR = int(os.getenv("REQUESTED_RECONCILER_INVITE_RE
 # ---------------------------------------------------------------------
 class Base(DeclarativeBase):
     pass
+
 
 class InviteCheck(Base):
     __tablename__ = "invite_check"
@@ -60,6 +61,7 @@ class InviteCheck(Base):
         Index("idx_invite_check_next", "next_check_at"),
         Index("idx_invite_check_sess_next", "session", "next_check_at"),
     )
+
 
 class RequestedCheck(Base):
     __tablename__ = "requested_check"
@@ -120,24 +122,43 @@ def init(db_path: Optional[str] = None) -> None:
 def _now() -> int:
     return int(time.time())
 
+
 def _calc_next(base: int, tries: int, max_cap: int, factor: float = 2.0) -> int:
     """
-    Експоненційний backoff: base * (factor ** tries), обрізаний max_cap.
-    Повертає epoch-second when to run next.
+    Обчислює КРОК backoff'а в секундах: base * factor^(tries-1), обрізаний max_cap.
+
+    Повертає лише інтервал (step у секундах), без додавання _now().
+    Гарантує відсутність OverflowError (inf, nan) і не повертає <= 0.
     """
+    if tries < 1:
+        tries = 1
+
+    # Експоненційний backoff
     try:
-        step = base * (factor ** max(0, tries))
-    except Exception:
-        step = base * (2 ** max(0, tries))
-    step = int(step)
-    step = min(max_cap, step)
-    return _now() + step
+        raw = base * (factor ** (tries - 1))
+    except OverflowError:
+        raw = float("inf")
+
+    # Якщо результат не скінченний – одразу ставимо максимум
+    if not math.isfinite(raw):
+        step = max_cap if max_cap > 0 else base
+    else:
+        # Обрізаємо до max_cap ДО того, як конвертувати в int
+        if max_cap > 0:
+            raw = min(raw, max_cap)
+        step = int(raw)
+
+    if step <= 0:
+        step = 1
+
+    return step
 
 # ---------------------------------------------------------------------
 # Внутрішні: анти-дребезг для note_requested_invite
 # ---------------------------------------------------------------------
 # Пам'ять для ліміту скидань на годину
 _note_reset_window = {}  # key: (session, invite_hash) -> dict(start:int, count:int)
+
 
 def _allow_note_reset(session: str, invite_hash: str, now_ts: int) -> bool:
     """
@@ -177,7 +198,7 @@ def note_requested_invite(session: str, invite_hash: str, start_after_sec: int =
     Поведінка:
     - Якщо інвайт новий → ставимо першу перевірку через start_after_sec (деф. 60с).
     - Якщо інвайт повторний → не робимо "прискорення" занадто часто (anti-bounce) і
-      ГАРАНТУЄМО, що повторна перевірка не раніше, ніж через INVITE_RECHECK_MIN_SEC (деф. 6 год).
+      ГАРАНТУЄМО, що повторна перевірка не раніше, ніж через INVITE_RECHECK_MIN_SEC.
     """
     with SessionLocal() as s:
         row = s.get(InviteCheck, {"invite_hash": invite_hash, "session": session})
@@ -231,6 +252,7 @@ def note_requested_invite(session: str, invite_hash: str, start_after_sec: int =
             session, invite_hash, row.tries, row.next_check_at, INVITE_RECHECK_MIN_SEC
         )
 
+
 def get_invite_sessions(invite_hash: str) -> List[str]:
     """
     Повертає список сесій, для яких уже існує pending-запис цього інвайта.
@@ -242,6 +264,7 @@ def get_invite_sessions(invite_hash: str) -> List[str]:
         out = [r for r in rows if r]
         log.debug("[get_invite_sessions] invite=%s sessions=%s", invite_hash, out)
         return out
+
 
 def due_invites(sessions: Sequence[str], limit: int) -> List[InviteCheck]:
     """
@@ -263,6 +286,7 @@ def due_invites(sessions: Sequence[str], limit: int) -> List[InviteCheck]:
         log.debug("[due_invites] fetched=%d", len(rows))
         return rows
 
+
 def backoff_invite_miss(session: str, invite_hash: str) -> None:
     """
     Немає рішення ще — збільшити tries і зрушити next_check_at.
@@ -277,16 +301,26 @@ def backoff_invite_miss(session: str, invite_hash: str) -> None:
             return
         now = _now()
         row.tries = (row.tries or 0) + 1
-        exp_next = _calc_next(INVITE_BACKOFF_BASE, row.tries, INVITE_BACKOFF_MAX, factor=INVITE_BACKOFF_FACTOR)
-        # Підлога: не раніше ніж через INVITE_RECHECK_MIN_SEC від зараз (6 год за замовчуванням)
+
+        step = _calc_next(
+            INVITE_BACKOFF_BASE,
+            row.tries,
+            INVITE_BACKOFF_MAX,
+            factor=INVITE_BACKOFF_FACTOR,
+        )
+        exp_next = now + step
+
+        # Підлога: не раніше ніж через INVITE_RECHECK_MIN_SEC від зараз
         floor_next = now + INVITE_RECHECK_MIN_SEC
         row.next_check_at = max(exp_next, floor_next)
+
         s.add(row)
         s.commit()
         log.debug(
             "[backoff_invite_miss] sess=%s invite=%s tries=%d next=%d(>=now+%ds)",
             session, invite_hash, row.tries, row.next_check_at, INVITE_RECHECK_MIN_SEC
         )
+
 
 def defer_invite_until(session: str, invite_hash: str, next_ts_epoch: int) -> None:
     """
@@ -305,6 +339,7 @@ def defer_invite_until(session: str, invite_hash: str, next_ts_epoch: int) -> No
         log.debug("[defer_invite_until] sess=%s invite=%s set next>=%d rows=%d",
                   session, invite_hash, next_ts_epoch, res.rowcount or 0)
 
+
 def bulk_defer_session_invites(session: str, next_ts_epoch: int) -> None:
     """
     Масово зсуває next_check_at для ВСІХ інвайтів сесії до не раніше ніж next_ts_epoch. НЕ змінює tries.
@@ -321,6 +356,7 @@ def bulk_defer_session_invites(session: str, next_ts_epoch: int) -> None:
         s.commit()
         log.debug("[bulk_defer_session_invites] sess=%s set next>=%d rows=%d",
                   session, next_ts_epoch, res.rowcount or 0)
+
 
 def clear_invite(session: str, invite_hash: str) -> None:
     with SessionLocal() as s:
@@ -361,6 +397,7 @@ def note_requested(session: str, channel_id: int, start_after_sec: int = 60) -> 
                       session, channel_id, row.tries, row.next_check_at)
         s.commit()
 
+
 def due_requested(sessions: Sequence[str], per_account: int, limit: int) -> List[RequestedCheck]:
     """
     Вибрати due requested для набору сесій.
@@ -383,10 +420,11 @@ def due_requested(sessions: Sequence[str], per_account: int, limit: int) -> List
                   len(rows), len(rows), len(sessions), per_account, limit)
         return rows
 
+
 def backoff_miss(session: str, channel_id: int) -> None:
     """
     Немає рішення ще — збільшуємо tries і пересуваємо next_check_at.
-    ТЕПЕР: використовуємо більший крок (factor=REQ_BACKOFF_FACTOR, за замовчуванням ×3).
+    Використовуємо більший крок (factor=REQ_BACKOFF_FACTOR).
     """
     with SessionLocal() as s:
         pk = {"session": session, "channel_id": int(channel_id)}
@@ -395,12 +433,21 @@ def backoff_miss(session: str, channel_id: int) -> None:
             # дефенсивно
             note_requested(session, int(channel_id), start_after_sec=REQ_BACKOFF_BASE)
             return
+
         row.tries = (row.tries or 0) + 1
-        row.next_check_at = _calc_next(REQ_BACKOFF_BASE, row.tries, REQ_BACKOFF_MAX, factor=REQ_BACKOFF_FACTOR)
+        step = _calc_next(
+            REQ_BACKOFF_BASE,
+            row.tries,
+            REQ_BACKOFF_MAX,
+            factor=REQ_BACKOFF_FACTOR,
+        )
+        row.next_check_at = _now() + step
+
         s.add(row)
         s.commit()
         log.debug("[backoff_miss] sess=%s cid=%s tries=%d next=%d (factor=%.2f)",
                   session, channel_id, row.tries, row.next_check_at, REQ_BACKOFF_FACTOR)
+
 
 def bulk_defer_session_requested(session: str, next_ts_epoch: int) -> None:
     """
@@ -419,6 +466,7 @@ def bulk_defer_session_requested(session: str, next_ts_epoch: int) -> None:
         log.debug("[bulk_defer_session_requested] sess=%s set next>=%d rows=%d",
                   session, next_ts_epoch, res.rowcount or 0)
 
+
 def clear(session: str, channel_id: int) -> None:
     with SessionLocal() as s:
         pk = {"session": session, "channel_id": int(channel_id)}
@@ -427,6 +475,7 @@ def clear(session: str, channel_id: int) -> None:
             s.delete(row)
             s.commit()
             log.debug("[clear] removed sess=%s cid=%s", session, channel_id)
+
 
 def is_requested(session: str, channel_id: int) -> bool:
     with SessionLocal() as s:
