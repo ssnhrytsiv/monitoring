@@ -15,13 +15,10 @@ from app.services import requested_reconciler_db as reqdb
 from app.services.models import init_db as orm_init_db
 from app.services.owner_conflict_guard import init as owner_guard_init
 from app.services.posts_watch_result_db import init as posts_result_init
-from app.settings import MONITOR_LINKS_V2
 from dotenv import load_dotenv
 
 load_dotenv()
 
-if MONITOR_LINKS_V2:
-    import app.plugins.monitor_links
 
 from app.services.googlesheets.channels_export_service import (
     start_channels_exporter,
