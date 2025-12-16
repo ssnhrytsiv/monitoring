@@ -338,6 +338,7 @@ def _build_full_footer(items: List[dict]) -> str:
 
     return "\n".join(out)
 
+
 async def _short_pause():
     try:
         await asyncio.sleep(0.08)
@@ -505,6 +506,7 @@ def _resolve_title_for_url(url: str, channel_id: Optional[int]) -> Optional[str]
             return ch["title"]
 
     return None
+
 
 async def process_links(message, text: str, owner_display: Optional[str] = None, owner_username: Optional[str] = None):
     bot_user_id: Optional[int] = None
@@ -846,7 +848,7 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 ):
                     upsert_membership(who_sess, cid_eff, status)
 
-                # ГОЛОВНА ЗМІНА: кеш по URL пишемо завжди, якщо статус фінальний.
+                # Кеш по URL: записуємо будь-який фінальний статус
                 if status in ("joined", "already", "requested", "invalid", "private"):
                     url_put(url, status)
 
@@ -884,11 +886,16 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     except Exception:
                         pass
 
+                # --- ГОЛОВНА ЗМІНА СТАТУСУ ЗАЯВКИ ---
                 if status == "already":
+                    # фінальний статус: затираємо можливий старий "requested" у кеші по URL
+                    url_put(url, "already")
                     line = fmt_result_line(idx, url, "already", who_display)
                     progress.add_status("already")
                     break
                 elif status == "joined":
+                    # фінальний статус: затираємо можливий старий "requested" у кеші по URL
+                    url_put(url, "joined")
                     line = fmt_result_line(idx, url, "joined", who_display)
                     progress.add_status("joined")
                     bump_cooldown(client, 8 if kind == "invite" else 3)
@@ -925,6 +932,14 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     progress.add_status("flood_wait")
                     try:
                         mark_flood(client, int(sec))
+                    except Exception:
+                        pass
+                    continue
+                elif isinstance(status, str) and status.startswith("link_limit"):
+                    line = fmt_result_line(idx, url, "too_many", who_display)
+                    progress.add_status("flood_wait")
+                    try:
+                        mark_limit(slot, days=2)
                     except Exception:
                         pass
                     continue
