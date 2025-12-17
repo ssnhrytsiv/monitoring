@@ -30,6 +30,7 @@ from aiogram.client.default import DefaultBotProperties
 from app.bot.processing_guard import get_processing, set_processing
 from app.bot.keyboards import main_menu_kb
 from app.bot.keyboards import back_to_menu_kb
+from app.bot import pagination as pager
 
 from app.services.membership_db import (
     upsert_membership, get_membership, any_final_for_channel, url_get, url_put,
@@ -135,16 +136,11 @@ def _split_text_for_telegram(text: str, max_len: int = 4000) -> List[str]:
     return [p for p in parts if p]
 
 
-def _build_full_footer(items: List[dict]) -> str:
+def _build_full_footer(items: List[dict]) -> tuple[str, List[tuple[str, str]]]:
     """
-    Порядок секций:
-    1) Чистые (без конфликтов и без дубликатов)
-    2) Конфликты (сгруппированы по админу)
-    3) Другие без конфликтов, но с дубликатами (по одному "оригиналу" на channel_id)
-    4) Приватные
-    5) Неправильные ссылки / ошибки
-    6) Дубликаты (все «повторы» channel_id) — внизу
-    7) Заявки отправлены — отдельным блоком в самом низу
+    Формує секції підсумку:
+      - головна: лише «чисті» пункти з ренумерацією 1..N
+      - додаткові: конфлікти, заявки, помилки, дублікати (для окремих кнопок)
     """
     import re
     from html import escape as _escape
@@ -261,20 +257,11 @@ def _build_full_footer(items: List[dict]) -> str:
         cid_to_items.setdefault(cid, []).append(it)
     dup_cids = {cid for cid, lst in cid_to_items.items() if len(lst) > 1}
 
-    rep_idx_by_cid: Dict[Any, int] = {}
-    for cid in dup_cids:
-        lst = cid_to_items[cid]
-        conflict_items = [it for it in lst if _conflict_name(it.get("status") or "") is not None]
-        rep = min(conflict_items or lst, key=lambda x: (x.get("idx") or 10**9))
-        rep_idx_by_cid[cid] = rep.get("idx")  # type: ignore[arg-type]
-
-    clean_unique: List[str] = []
-    conflicts_by_admin: Dict[str, List[str]] = {}
-    other_clean_dup_reps: List[str] = []
-    privates: List[str] = []
-    invalids: List[str] = []
-    requested_items: List[str] = []          # окремий блок
-    dup_lines_by_cid: Dict[Any, List[str]] = {}
+    clean_items_raw: List[tuple[str, Optional[str], str]] = []
+    conflicts_by_admin: Dict[str, List[tuple[int, str, Optional[str], str]]] = {}
+    requested_raw: List[tuple[int, str, Optional[str], str]] = []
+    invalid_raw: List[tuple[str, Optional[str], str]] = []
+    dup_lines_by_cid: Dict[Any, List[tuple[int, str, Optional[str], str]]] = {}
     title_by_cid: Dict[Any, Optional[str]] = {}
 
     for it in (items or []):
@@ -285,68 +272,62 @@ def _build_full_footer(items: List[dict]) -> str:
         cid = it.get("channel_id")
         admin = _conflict_name(status)
 
-        # дублікат, не представник
-        if cid is not None and cid in dup_cids and rep_idx_by_cid.get(cid) != idx:
-            line = _link_line(idx, url, title, status, tag="[дубликат]")
-            dup_lines_by_cid.setdefault(cid, []).append(line)
-            if cid not in title_by_cid:
-                title_by_cid[cid] = title
+        # Будь-який дублікат іде в окрему секцію (не показуємо в основному списку)
+        if cid is not None and cid in dup_cids:
+            dup_lines_by_cid.setdefault(cid, []).append((idx, url, title, status))
+            title_by_cid.setdefault(cid, title)
             continue
 
         if admin:
-            line = _link_line(idx, url, title, status)
-            conflicts_by_admin.setdefault(admin, []).append(line)
+            conflicts_by_admin.setdefault(admin, []).append((idx, url, title, status))
         elif _looks_requested(status):
-            # заявки: ссылка текстом + статус окремим рядком
-            human_status = _status_human(status)
-            if title:
-                title_part = f"{idx}. {_esc(title)}"
-            else:
-                title_part = f"{idx}."
-            requested_items.append(
-                f"{title_part}\n"
-                f"   Ссылка: {_esc(url)}\n"
-                f"   {human_status}"
-            )
+            requested_raw.append((idx, url, title, status))
         elif _is_private(status):
-            privates.append(_link_line(idx, url, title, status))
+            invalid_raw.append((url, title, status))
         elif _is_invalid_or_error(status):
-            invalids.append(_link_line(idx, url, title, status))
+            invalid_raw.append((url, title, status))
         else:
-            if cid is not None and cid in dup_cids:
-                other_clean_dup_reps.append(_link_line(idx, url, title, status))
-            else:
-                clean_unique.append(_link_line(idx, url, title, status))
+            clean_items_raw.append((url, title, status))
 
-    out: List[str] = []
-    out.append("📋 <b>Список (все):</b>")
+    # ---------- Основний чистий список (ренумерація 1..N) ----------
+    out: List[str] = ["📋 <b>Список:</b>"]
+    if clean_items_raw:
+        for new_idx, (url, title, status) in enumerate(clean_items_raw, start=1):
+            out.append(_link_line(new_idx, url, title, status))
+    else:
+        out.append("— Немає чистих посилань.")
 
-    if clean_unique:
-        out.extend(clean_unique)
+    # ---------- Додаткові секції ----------
+    sections: List[tuple[str, str]] = []
 
-    for admin, lines in conflicts_by_admin.items():
-        out.append("")
-        out.append(f"⚠️ Админ уже есть для этих каналов: {admin}")
-        out.extend(lines)
+    # Конфлікти по адмінах
+    if conflicts_by_admin:
+        lines: List[str] = []
+        for admin, lst in conflicts_by_admin.items():
+            prefix = f'⚠️ Админ уже есть для этого канала: "{admin}"'
+            lines.append(prefix)
+            for orig_idx, url, title, status in lst:
+                lines.append("  " + _link_line(orig_idx, url, title, status))
+            lines.append("")  # візуальний відступ між групами
+        sections.append(("⚠️ Конфлікти", "\n".join(line for line in lines if line != "")))
 
-    if other_clean_dup_reps:
-        out.append("")
-        out.append("ℹ️ Каналы, которые имеют дубликаты:")
-        out.extend(other_clean_dup_reps)
+    # Заявки, які ще не прийняті
+    if requested_raw:
+        lines: List[str] = ["✉️ Заявки отправлены, ожидаем:"]
+        for orig_idx, url, title, status in requested_raw:
+            lines.append(_link_line(orig_idx, url, title, status))
+        sections.append(("✉️ Заявки", "\n".join(lines)))
 
-    if privates:
-        out.append("")
-        out.append("🔒 Приватные:")
-        out.extend(privates)
+    # Невалідні/приватні/помилки
+    if invalid_raw:
+        lines: List[str] = ["❌ Невалідні/приватні/помилки:"]
+        for new_idx, (url, title, status) in enumerate(invalid_raw, start=1):
+            lines.append(_link_line(new_idx, url, title, status))
+        sections.append(("❌ Помилки", "\n".join(lines)))
 
-    if invalids:
-        out.append("")
-        out.append("❌ Неправильные ссылки:")
-        out.extend(invalids)
-
+    # Дублікати
     if dup_lines_by_cid:
-        out.append("")
-        out.append("🔁 Дубликаты каналов")
+        lines: List[str] = ["🔁 Дублікати каналів:"]
         for cid in sorted(dup_lines_by_cid.keys()):
             title = title_by_cid.get(cid)
             if not title:
@@ -354,18 +335,13 @@ def _build_full_footer(items: List[dict]) -> str:
                     if it.get("title"):
                         title = it.get("title")
                         break
-            header = f"• {title or 'Без названия'} (ID: {cid})"
-            out.append(header)
-            for line in dup_lines_by_cid[cid]:
-                out.append("  " + line)
+            header = f"• {title or 'Без назви'} (ID: {cid})"
+            lines.append(header)
+            for orig_idx, url, title, status in dup_lines_by_cid[cid]:
+                lines.append("  " + _link_line(orig_idx, url, title, status, tag="[дубликат]"))
+        sections.append(("🔁 Дублікати", "\n".join(lines)))
 
-    # окремий блок заявок в самому низу
-    if requested_items:
-        out.append("")
-        out.append("✉️ Заявки отправлены:")
-        out.extend(requested_items)
-
-    return "\n".join(out)
+    return "\n".join(out), sections
 
 async def _short_pause():
     try:
@@ -1006,24 +982,15 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 await _short_pause()
 
         try:
-            footer_full = _build_full_footer(result_items)
+            footer_full_main, footer_full_sections = _build_full_footer(result_items)
         except Exception:
-            footer_full = "📊 Підсумок (всі):\n(помилка формування футера)"
+            footer_full_main, footer_full_sections = ("📊 Підсумок (всі):\n(помилка формування футера)", [])
 
-        footer_parts = _split_text_for_telegram(footer_full, max_len=3500)
-        footer_main = footer_parts[0] if footer_parts else ""
+        # Головний футер на екран (чистий список)
+        footer_parts_main = _split_text_for_telegram(footer_full_main, max_len=3500)
+        footer_main = footer_parts_main[0] if footer_parts_main else ""
 
         await progress.finish(footer=footer_main)
-
-        # Додаткові шматки відправляємо окремими повідомленнями, щоб не впертися в ліміт 4096.
-        for idx, part in enumerate(footer_parts[1:], start=2):
-            try:
-                await message.reply(
-                    f"📋 Продовження списку ({idx}/{len(footer_parts)}):\n{part}",
-                    link_preview=False,
-                )
-            except Exception:
-                pass
 
         log.info("batch done: total=%d uniq=%d", len(links), len(set(links)))
 
@@ -1031,10 +998,32 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
             try:
                 token = os.getenv("BOT_TOKEN")
                 if token:
-                    summary_text_full = progress._last_render or progress._render(
-                        header_suffix="— готово ✅", final=True
-                    )
-                    summary_parts = _split_text_for_telegram(summary_text_full, max_len=4000)
+                    # Рендеримо підсумок сторінками (інлайн пагінація)
+                    summary_pages: List[str] = []
+                    page_labels: List[str] = []
+
+                    def _add_pages(text: str, label: str):
+                        parts = _split_text_for_telegram(text, max_len=3500) or [text or ""]
+                        total_local = len(parts)
+                        for i, part in enumerate(parts, start=1):
+                            progress.footer = part
+                            summary_pages.append(
+                                progress._render(header_suffix="— готово ✅", final=True)
+                            )
+                            suffix = "" if total_local == 1 else f" ({i}/{total_local})"
+                            page_labels.append(f"{label}{suffix}")
+
+                    _add_pages(footer_full_main, "Список")
+                    for label, text in footer_full_sections:
+                        _add_pages(text, label)
+
+                    if not summary_pages:
+                        summary_pages = [
+                            progress._render(header_suffix="— готово ✅", final=True)
+                        ]
+                        page_labels = ["Список"]
+
+                    session_id = pager.create_session(summary_pages, bot_user_id, labels=page_labels)
 
                     async with Bot(
                         token=token,
@@ -1048,13 +1037,15 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                             extra={"user_id": bot_user_id, "msg_id": msg_id},
                         )
 
+                        kb = pager.build_keyboard(session_id, 0, len(summary_pages))
+
                         if msg_id:
                             try:
                                 await bot.edit_message_text(
                                     chat_id=bot_user_id,
                                     message_id=msg_id,
-                                    text=summary_parts[0],
-                                    reply_markup=back_to_menu_kb(),
+                                    text=summary_pages[0],
+                                    reply_markup=kb or back_to_menu_kb(),
                                     disable_web_page_preview=True,
                                 )
                                 log.info(
@@ -1072,36 +1063,17 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                                 )
                                 await bot.send_message(
                                     bot_user_id,
-                                    summary_parts[0],
-                                    reply_markup=back_to_menu_kb(),
+                                    summary_pages[0],
+                                    reply_markup=kb or back_to_menu_kb(),
                                     disable_web_page_preview=True,
                                 )
                         else:
                             await bot.send_message(
                                 bot_user_id,
-                                summary_parts[0],
-                                reply_markup=back_to_menu_kb(),
+                                summary_pages[0],
+                                reply_markup=kb or back_to_menu_kb(),
                                 disable_web_page_preview=True,
                             )
-
-                        # Якщо є продовження — шлемо окремо без клавіатури.
-                        extra_parts = summary_parts[1:]
-                        # Додаємо також «довгий» футер, який не помістився у progress.finish.
-                        if len(footer_parts) > 1:
-                            extra_parts.extend(footer_parts[1:])
-
-                        for idx, part in enumerate(extra_parts, start=2):
-                            try:
-                                await bot.send_message(
-                                    bot_user_id,
-                                    f"📋 Продовження ({idx}):\n{part}",
-                                    disable_web_page_preview=True,
-                                )
-                            except Exception:
-                                log.exception(
-                                    "bot_notify_extra_failed",
-                                    extra={"user_id": bot_user_id, "part_idx": idx},
-                                )
                 set_processing(bot_user_id, False)
             except Exception as e:
                 log.exception(
