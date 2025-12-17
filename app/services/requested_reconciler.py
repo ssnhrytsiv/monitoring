@@ -290,9 +290,21 @@ async def run_requested_reconciler() -> None:
     rdb.init()
     log.debug("[reconciler.init] DB init done")
 
+    last_reset_day = None
+
     log.info("requested_reconciler started (tick=%ds, batch=%d)", TICK_SEC, BATCH_LIMIT)
     while True:
         try:
+            # Щоденний скидання лічильників requested (раз на зміну дня)
+            current_day = int(time.time() // 86400)
+            if last_reset_day != current_day:
+                try:
+                    rows = rdb.reset_requested_daily()
+                    log.debug("[reconciler.daily_reset] day=%s rows=%d", current_day, rows)
+                except Exception as e:
+                    log.debug("[reconciler.daily_reset] failed: %s", e)
+                last_reset_day = current_day
+
             sessions = _pool_sessions()
             log.debug("[reconciler] active sessions: %s", sessions)
             if not sessions:
@@ -365,6 +377,11 @@ async def run_requested_reconciler() -> None:
                             pass
                         try:
                             membership_db.upsert_membership(sess, cid, "already")
+                        except Exception:
+                            pass
+                        # Знімаємо статус "requested" для інвайта, якщо він уже видимий
+                        try:
+                            membership_db.invite_status_put(invite_hash, "already")
                         except Exception:
                             pass
 
@@ -442,6 +459,10 @@ async def run_requested_reconciler() -> None:
                     if mstat is MemberStatus.MEMBER:
                         try:
                             membership_db.upsert_membership(sess, cid, "already")
+                        except Exception:
+                            pass
+                        try:
+                            membership_db.invite_status_put_for_channel(cid, "already")
                         except Exception:
                             pass
                         rdb.clear(sess, cid)

@@ -467,6 +467,25 @@ def bulk_defer_session_requested(session: str, next_ts_epoch: int) -> None:
                   session, next_ts_epoch, res.rowcount or 0)
 
 
+def reset_requested_daily(now_ts: Optional[int] = None) -> int:
+    """
+    Щоденний скидання лічильника/бекафу для requested:
+      - tries -> 0
+      - next_check_at -> мінімум з поточного та now_ts (щоб спробувати сьогодні)
+    Повертає кількість оновлених рядків.
+    """
+    ts = int(now_ts or _now())
+    with SessionLocal() as s:
+        stmt = update(RequestedCheck).values(
+            tries=0,
+            next_check_at=func.min(RequestedCheck.next_check_at, ts),
+        )
+        res = s.execute(stmt)
+        s.commit()
+        log.info("[requested.reset_daily] rows=%d ts=%d", res.rowcount or 0, ts)
+        return res.rowcount or 0
+
+
 def clear(session: str, channel_id: int) -> None:
     with SessionLocal() as s:
         pk = {"session": session, "channel_id": int(channel_id)}

@@ -160,6 +160,26 @@ async def _ensure_connected(slot: ClientSlot) -> None:
                 await asyncio.sleep(wait); continue
             raise
 
+    # Спробуємо один раз підтягнути людське ім'я акаунта (first/last/username)
+    try:
+        me = await slot.client.get_me()
+        if me:
+            first = getattr(me, "first_name", None) or ""
+            last = getattr(me, "last_name", None) or ""
+            username = getattr(me, "username", None) or ""
+            parts = [p for p in (first, last) if p]
+            disp = " ".join(parts).strip()
+            if not disp and username:
+                disp = f"@{username}"
+            if disp:
+                slot.human_display = disp
+                try:
+                    setattr(slot.client, "_human_display", disp)
+                except Exception:
+                    pass
+    except Exception as e:
+        log.debug("get_me failed for %s: %s", slot.name, e)
+
 async def start_pool() -> None:
     """
     Створює та піднімає клієнти для ACCOUNTS.

@@ -267,6 +267,30 @@ def invite_status_get(invite_or_hash: str) -> Optional[str]:
         return row[0] if row else None
 
 
+def invite_status_put_for_channel(channel_id: int, status: str) -> int:
+    """
+    Масово оновлює invite_status для всіх інвайтів, що мапляться на channel_id.
+    Повертає кількість оновлених інвайтів.
+    """
+    if channel_id is None:
+        return 0
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT invite_hash FROM invite_map WHERE channel_id=?",
+            (int(channel_id),)
+        )
+        hashes = [row[0] for row in cur.fetchall() if row and row[0]]
+        updated = 0
+        now_ts = int(time.time())
+        for h in hashes:
+            c.execute(
+                "INSERT OR REPLACE INTO invite_status(invite_hash,status,ts) VALUES (?,?,?)",
+                (h, status, now_ts)
+            )
+            updated += 1
+        return updated
+
+
 # ---------- url_cache (коли немає channel_id, але вже є фінальний статус по URL) ----------
 
 def url_put(url: str, status: str):

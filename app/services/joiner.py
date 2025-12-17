@@ -155,6 +155,32 @@ async def ensure_join(client, url: str):
             if st in ("invalid", "private", "requested", "already", "joined", "blocked", "too_many"):
                 cid_known, title_known = map_invite_get(invite_hash)
                 log.debug("ensure_join(invite): cached status=%s invite=%s cid=%s", st, invite_hash, cid_known)
+
+                # Якщо в кеші "requested", спробуємо перепитати CheckChatInvite на випадок,
+                # коли канал вже прийняв, щоб прибрати "заявку".
+                if st == "requested":
+                    try:
+                        await throttle_invite()
+                        inv = await client(CheckChatInviteRequest(invite_hash))
+                        chat = getattr(inv, "chat", None)
+                        cid_new = int(getattr(chat, "id", 0) or 0) if chat else None
+                        title_new = getattr(chat, "title", None)
+                        if cid_new:
+                            try:
+                                map_invite_set(invite_hash, cid_new, title_new or None)
+                                invite_status_put(invite_hash, "already")
+                            except Exception:
+                                pass
+                            log.info("ensure_join(invite): requested->already via recheck invite=%s cid=%s", invite_hash, cid_new)
+                            return "already", (title_new or title_known or None), "invite", cid_new, invite_hash
+                    except InviteRequestSentError:
+                        # все ще заявка, залишаємо requested
+                        pass
+                    except FloodWaitError as e:
+                        log.warning("ensure_join(invite): recheck FloodWait %ss", e.seconds)
+                    except Exception as e:
+                        log.debug("ensure_join(invite): recheck failed invite=%s: %s", invite_hash, e)
+
                 return st, (title_known or None), "invite", (int(cid_known) if cid_known else None), invite_hash
 
             # --- КРОК 1: реальна спроба приєднатися
