@@ -24,6 +24,8 @@ from app.services.joiner import probe_channel_id, ensure_join
 from app.services.account_pool import (
     iter_ready_pool_clients, bump_cooldown, mark_flood, mark_limit, session_name as _session_name
 )
+from telethon.tl.functions.channels import GetParticipantRequest
+from telethon.tl import types as tltypes
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -134,6 +136,31 @@ def _split_text_for_telegram(text: str, max_len: int = 4000) -> List[str]:
         parts.append("\n".join(current).strip())
 
     return [p for p in parts if p]
+
+
+async def _recheck_requested_with_client(client, channel_id: int, who_sess: str) -> bool:
+    """
+    Коли в кеші 'requested', швидко перевіряємо, чи вже прийняли.
+    Якщо так — ставимо membership=already і чистимо запис у requested_reconciler.
+    Повертає True, якщо підтвердили (already), False інакше.
+    """
+    try:
+        ent = await client.get_entity(channel_id)
+        res = await client(GetParticipantRequest(ent, "me"))
+        part = getattr(res, "participant", None)
+        if isinstance(part, tltypes.ChannelParticipant):
+            try:
+                membership_db.upsert_membership(who_sess, channel_id, "already")
+            except Exception:
+                pass
+            try:
+                reqdb.clear(who_sess, channel_id)
+            except Exception:
+                pass
+            return True
+    except Exception as e:
+        log.debug("[PL] requested fast-check failed sess=%s cid=%s: %s", who_sess, channel_id, e)
+    return False
 
 
 def _build_full_footer(items: List[dict]) -> tuple[str, List[tuple[str, str]]]:
@@ -810,12 +837,18 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 if cid_eff is not None:
                     try:
                         if reqdb.is_requested(who_sess, cid_eff):
-                            log.debug(
-                                "[PL] #%d session=%s has pending requested for cid=%s -> skip ensure_join",
-                                idx, who_sess, cid_eff
-                            )
-                            line = fmt_result_line(idx, url, "requested", who_display)
-                            progress.add_status("requested")
+                            # Якщо в БД є "заявка відправлена", перевіримо, чи вже прийняли.
+                            accepted = await _recheck_requested_with_client(client, cid_eff, who_sess)
+                            if accepted:
+                                line = fmt_result_line(idx, url, "already", who_display)
+                                progress.add_status("already")
+                            else:
+                                log.debug(
+                                    "[PL] #%d session=%s has pending requested for cid=%s -> skip ensure_join",
+                                    idx, who_sess, cid_eff
+                                )
+                                line = fmt_result_line(idx, url, "requested", who_display)
+                                progress.add_status("requested")
                             break
                     except Exception:
                         pass
