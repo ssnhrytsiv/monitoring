@@ -163,11 +163,12 @@ async def _recheck_requested_with_client(client, channel_id: int, who_sess: str)
     return False
 
 
-def _build_full_footer(items: List[dict]) -> tuple[str, List[tuple[str, str]]]:
+def _build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) -> tuple[str, List[tuple[str, str]]]:
     """
     Формує секції підсумку:
       - головна: лише «чисті» пункти з ренумерацією 1..N
       - додаткові: конфлікти, заявки, помилки, дублікати (для окремих кнопок)
+      - опційно: сирий список рядків, як прийшли в бот (raw_lines), з позначками проблемних статусів
     """
     import re
     from html import escape as _escape
@@ -287,9 +288,10 @@ def _build_full_footer(items: List[dict]) -> tuple[str, List[tuple[str, str]]]:
     clean_items_raw: List[tuple[str, Optional[str], str]] = []
     conflicts_by_admin: Dict[str, List[tuple[int, str, Optional[str], str]]] = {}
     requested_raw: List[tuple[int, str, Optional[str], str]] = []
-    invalid_raw: List[tuple[str, Optional[str], str]] = []
+    invalid_raw: List[tuple[int, str, Optional[str], str]] = []
     dup_lines_by_cid: Dict[Any, List[tuple[int, str, Optional[str], str]]] = {}
     title_by_cid: Dict[Any, Optional[str]] = {}
+    url_tags: Dict[str, tuple[str, str]] = {}
 
     for it in (items or []):
         idx: int = it.get("idx") or 0
@@ -298,6 +300,30 @@ def _build_full_footer(items: List[dict]) -> tuple[str, List[tuple[str, str]]]:
         status: str = it.get("status") or ""
         cid = it.get("channel_id")
         admin = _conflict_name(status)
+
+        # Теги для raw-списку (щоб показати оригінальні рядки з позначками)
+        tag_label = ""
+        tag_emoji = ""
+        if cid is not None and cid in dup_cids:
+            tag_label = "Дубликат"
+            cadmin = _conflict_name(status)
+            if cadmin:
+                tag_label = f"Дубликат ({cadmin})"
+            tag_emoji = "🔁"
+        elif _looks_requested(status):
+            tag_label = "Заявка отправлена"
+            tag_emoji = "✉️"
+        elif _is_invalid_or_error(status) or _is_private(status):
+            tag_label = "Невалид"
+            tag_emoji = "❌"
+        if tag_label and url:
+            # нормалізуємо URL для ключа
+            try:
+                nu = sanitize_link(url) or url
+            except Exception:
+                nu = url
+            if nu not in url_tags:
+                url_tags[nu] = (tag_emoji, tag_label)
 
         # Будь-який дублікат іде в окрему секцію (не показуємо в основному списку)
         if cid is not None and cid in dup_cids:
@@ -310,9 +336,9 @@ def _build_full_footer(items: List[dict]) -> tuple[str, List[tuple[str, str]]]:
         elif _looks_requested(status):
             requested_raw.append((idx, url, title, status))
         elif _is_private(status):
-            invalid_raw.append((url, title, status))
+            invalid_raw.append((idx, url, title, status))
         elif _is_invalid_or_error(status):
-            invalid_raw.append((url, title, status))
+            invalid_raw.append((idx, url, title, status))
         else:
             clean_items_raw.append((url, title, status))
 
@@ -322,7 +348,7 @@ def _build_full_footer(items: List[dict]) -> tuple[str, List[tuple[str, str]]]:
         for new_idx, (url, title, status) in enumerate(clean_items_raw, start=1):
             out.append(_link_line(new_idx, url, title, status))
     else:
-        out.append("— Немає чистих посилань.")
+        out.append("— Нет чистых ссылок.")
 
     # ---------- Додаткові секції ----------
     sections: List[tuple[str, str]] = []
@@ -336,7 +362,7 @@ def _build_full_footer(items: List[dict]) -> tuple[str, List[tuple[str, str]]]:
             for orig_idx, url, title, status in lst:
                 lines.append("  " + _link_line(orig_idx, url, title, status))
             lines.append("")  # візуальний відступ між групами
-        sections.append(("⚠️ Конфлікти", "\n".join(line for line in lines if line != "")))
+        sections.append(("⚠️ Конфликты", "\n".join(line for line in lines if line != "")))
 
     # Заявки, які ще не прийняті
     if requested_raw:
@@ -347,14 +373,14 @@ def _build_full_footer(items: List[dict]) -> tuple[str, List[tuple[str, str]]]:
 
     # Невалідні/приватні/помилки
     if invalid_raw:
-        lines: List[str] = ["❌ Невалідні/приватні/помилки:"]
-        for new_idx, (url, title, status) in enumerate(invalid_raw, start=1):
-            lines.append(_link_line(new_idx, url, title, status))
-        sections.append(("❌ Помилки", "\n".join(lines)))
+        lines: List[str] = ["❌ Невалидные/приватные/ошибки:"]
+        for orig_idx, url, title, status in invalid_raw:
+            lines.append(_link_line(orig_idx, url, title, status))
+        sections.append(("❌ Ошибки", "\n".join(lines)))
 
     # Дублікати
     if dup_lines_by_cid:
-        lines: List[str] = ["🔁 Дублікати каналів:"]
+        lines: List[str] = ["🔁 Дубликаты каналов:"]
         for cid in sorted(dup_lines_by_cid.keys()):
             title = title_by_cid.get(cid)
             if not title:
@@ -366,7 +392,45 @@ def _build_full_footer(items: List[dict]) -> tuple[str, List[tuple[str, str]]]:
             lines.append(header)
             for orig_idx, url, title, status in dup_lines_by_cid[cid]:
                 lines.append("  " + _link_line(orig_idx, url, title, status, tag="[дубликат]"))
-        sections.append(("🔁 Дублікати", "\n".join(lines)))
+        sections.append(("🔁 Дубликаты", "\n".join(lines)))
+
+    # Список у вихідному порядку: показуємо лише проблемні стани біля оригінальної URL
+    if items:
+        raw_lines_out: List[str] = []
+        if raw_lines:
+            URL_RE = re.compile(r"https?://\S+|t\.me/\S+|\+\S+")
+            for line in raw_lines:
+                tags: List[str] = []
+                for m in URL_RE.findall(line):
+                    try:
+                        nu = sanitize_link(m) or m
+                    except Exception:
+                        nu = m
+                    if nu in url_tags:
+                        emo, lbl = url_tags[nu]
+                        tags.append(f"{emo} {lbl}".strip())
+                if tags:
+                    raw_lines_out.append(f"{line} — {', '.join(tags)}")
+                else:
+                    raw_lines_out.append(line)
+        else:
+            # fallback: будуємо список з URL, якщо немає сирих рядків
+            for it in items:
+                url = it.get("url") or ""
+                tag = ""
+                emoji = ""
+                try:
+                    nu = sanitize_link(url) or url
+                except Exception:
+                    nu = url
+                if nu in url_tags:
+                    emoji, tag = url_tags[nu]
+                if tag:
+                    raw_lines_out.append(f"{url} — {emoji} {tag}")
+                else:
+                    raw_lines_out.append(url)
+
+        sections.append(("Список", "\n".join(raw_lines_out)))
 
     return "\n".join(out), sections
 
@@ -378,6 +442,10 @@ async def _short_pause():
 
 
 def _extract_hidden_links_from_message(msg) -> List[str]:
+    """
+    Тягнемо приховані URL з entities, але залишаємо лише tg-посилання.
+    (раніше могли потрапляти будь-які https://..., що збивало лічильник)
+    """
     urls: List[str] = []
     try:
         entities = getattr(msg, "entities", None)
@@ -400,7 +468,22 @@ def _extract_hidden_links_from_message(msg) -> List[str]:
                     pass
     except Exception:
         pass
-    return urls
+    # Фільтруємо й нормалізуємо тільки телеграмні посилання
+    filtered: List[str] = []
+    seen: set[str] = set()
+    for raw in urls:
+        try:
+            nu = sanitize_link(raw) or raw
+        except Exception:
+            nu = raw
+        low = (nu or "").lower()
+        if ("t.me/" not in low) and ("tg://resolve" not in low) and (not nu.startswith("@")):
+            continue
+        if nu in seen:
+            continue
+        seen.add(nu)
+        filtered.append(nu)
+    return filtered
 
 
 def _norm_user(u: Optional[str]) -> Optional[str]:
@@ -541,6 +624,7 @@ def _resolve_title_for_url(url: str, channel_id: Optional[int]) -> Optional[str]
 async def process_links(message, text: str, owner_display: Optional[str] = None, owner_username: Optional[str] = None):
     bot_user_id: Optional[int] = None
     raw_text = text or ""
+    raw_text_full = getattr(message, "raw_text", None) or raw_text
     first_line, _, rest_text = raw_text.partition("\n")
     m_uid = re.match(r"\[BOT_UID:(\d+)\]", first_line.strip())
     if m_uid:
@@ -549,8 +633,10 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
         except Exception:
             bot_user_id = None
         text = rest_text
+        raw_lines_original = (rest_text or raw_text_full or "").splitlines()
     else:
         text = raw_text
+        raw_lines_original = (raw_text_full or "").splitlines()
 
     od = owner_display
     ou = owner_username
@@ -1015,9 +1101,9 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                 await _short_pause()
 
         try:
-            footer_full_main, footer_full_sections = _build_full_footer(result_items)
+            footer_full_main, footer_full_sections = _build_full_footer(result_items, raw_lines=raw_lines_original)
         except Exception:
-            footer_full_main, footer_full_sections = ("📊 Підсумок (всі):\n(помилка формування футера)", [])
+            footer_full_main, footer_full_sections = ("📊 Итог (все):\n(ошибка формирования футера)", [])
 
         # Головний футер на екран (чистий список)
         footer_parts_main = _split_text_for_telegram(footer_full_main, max_len=3500)
@@ -1039,14 +1125,16 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                         parts = _split_text_for_telegram(text, max_len=3500) or [text or ""]
                         total_local = len(parts)
                         for i, part in enumerate(parts, start=1):
-                            progress.footer = part
-                            summary_pages.append(
-                                progress._render(header_suffix="— готово ✅", final=True)
-                            )
+                            if label == "Список":
+                                page_text = part  # без шапки й прогресу
+                            else:
+                                progress.footer = part
+                                page_text = progress._render(header_suffix="— готово ✅", final=True)
+                            summary_pages.append(page_text)
                             suffix = "" if total_local == 1 else f" ({i}/{total_local})"
                             page_labels.append(f"{label}{suffix}")
 
-                    _add_pages(footer_full_main, "Список")
+                    _add_pages(footer_full_main, "Итог")
                     for label, text in footer_full_sections:
                         _add_pages(text, label)
 
@@ -1054,7 +1142,7 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                         summary_pages = [
                             progress._render(header_suffix="— готово ✅", final=True)
                         ]
-                        page_labels = ["Список"]
+                        page_labels = ["Итог"]
 
                     session_id = pager.create_session(summary_pages, bot_user_id, labels=page_labels)
 

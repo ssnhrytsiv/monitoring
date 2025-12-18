@@ -469,7 +469,9 @@ async def watch_links(cb: CallbackQuery):
 async def watch_cancel(cb: CallbackQuery):
     leader_wid = None
     try:
-        leader_wid = int(cb.data.split(":")[-1])
+        parts = cb.data.split(":")
+        if len(parts) >= 3:
+            leader_wid = int(parts[2])
     except Exception:
         leader_wid = None
     if not leader_wid:

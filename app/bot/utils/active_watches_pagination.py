@@ -1,4 +1,4 @@
-from typing import List, Tuple, Callable
+from typing import List, Tuple, Callable, Optional
 
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardButton
@@ -37,6 +37,7 @@ def build_group_keyboard(
     total_pages: int,
     status_to_emoji: Callable[[str], str],
     get_title_for_tpl: Callable[[int], str],
+    status_key: Optional[str] = None,
 ) -> InlineKeyboardBuilder:
     """
     Будує InlineKeyboardBuilder для поточної сторінки групи:
@@ -44,6 +45,13 @@ def build_group_keyboard(
       + навігація Prev/Page/Next
     """
     kb = InlineKeyboardBuilder()
+
+    def _group_cb(target_page: int) -> str:
+        parts = ["watch", "group", str(leader_wid)]
+        if status_key:
+            parts.append(status_key)
+        parts.append(str(target_page))
+        return ":".join(parts)
 
     for wid_i, cid_i, status_s_raw, source_link, tpl_id_i in page_items:
         status_emoji = status_to_emoji(status_s_raw)
@@ -68,7 +76,7 @@ def build_group_keyboard(
         nav_row.append(
             InlineKeyboardButton(
                 text="⬅️ Prev",
-                callback_data=f"watch:group:{leader_wid}:{page-1}",
+                callback_data=_group_cb(page - 1),
             )
         )
     else:
@@ -85,7 +93,7 @@ def build_group_keyboard(
         nav_row.append(
             InlineKeyboardButton(
                 text="Next ➡️",
-                callback_data=f"watch:group:{leader_wid}:{page+1}",
+                callback_data=_group_cb(page + 1),
             )
         )
     else:

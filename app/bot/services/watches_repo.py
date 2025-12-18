@@ -3,20 +3,43 @@ from datetime import datetime
 
 from app.services.posts_watch_result_db import raw_connection
 
+# Ключі станів для фільтра: pending, matched, expired.
+# Зроблено окремо, щоб уникнути SQL-ін'єкцій і контролювати дозволені значення.
+ALLOWED_STATUSES = {
+    "pending": "pending",
+    "matched": "matched",
+    "expired": "expired",
+}
 
-def list_active_watches(user_id: int) -> List[Tuple[Any, Any, Any, Any, Any, Any]]:
+
+def list_active_watches(
+    user_id: int,
+    statuses: Optional[List[str]] = None,
+) -> List[Tuple[Any, Any, Any, Any, Any, Any]]:
     conn = raw_connection()
     cur = conn.cursor()
+
+    # fallback — показуємо активні (pending+matched)
+    if not statuses:
+        statuses = ["pending", "matched"]
+    # залишаємо тільки дозволені статуси
+    filtered = [ALLOWED_STATUSES[s] for s in statuses if s in ALLOWED_STATUSES]
+    if not filtered:
+        filtered = ["pending", "matched"]
+
+    placeholders = ",".join("?" for _ in filtered)
+    status_condition = f"status IN ({placeholders})"
+
     cur.execute(
         """
         SELECT id, template_id, status, time_window_end, created_by, channel_id
         FROM watch_posts
         WHERE (created_by=? OR created_by IS NULL)
-          AND status IN ('pending','matched', 'expired')
+          AND """ + status_condition + """
         ORDER BY id DESC
         LIMIT 200
         """,
-        (user_id,),
+        (user_id, *filtered),
     )
     return cur.fetchall()
 

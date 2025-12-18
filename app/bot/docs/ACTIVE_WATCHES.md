@@ -36,21 +36,25 @@ router.include_router(join_channels_router)
 
 ## 1. handlers/active_watches_menu.py
 
-**Призначення:** показати список всіх активних груп вотчів користувача.
+**Призначення:** показати список груп вотчів користувача з вибором типу статусу.
 
 ### Основний хендлер
 
 ```python
-@router.callback_query(F.data == "menu:list_active")
+@router.callback_query(F.data.startswith("menu:list_active"))
 async def menu_list_active(cb: CallbackQuery):
     ...
 ```
 
 Логіка:
 
-1. `rows = list_active_watches(cb.from_user.id)` – бере сирі вотчі користувача.
-2. `groups = group_active(rows)` – групує їх за (template_id, time_window_end, created_by).
-3. Для кожної групи:
+1. Якщо статус не передано, показує меню вибору з трьох кнопок:
+   - `Активні` (`pending`);
+   - `Відслідковуються перегляди` (`matched`);
+   - `Вийшли з терміну` (`expired`).
+2. `rows = list_active_watches(cb.from_user.id, statuses=...)` – бере сирі вотчі користувача відповідного статусу.
+3. `groups = group_active(rows)` – групує їх за (template_id, time_window_end, created_by).
+4. Для кожної групи:
    - обирає `leader_wid` (максимальний id у групі);
    - рахує кількість каналів;
    - визначає owner’ів каналів (`get_owners_by_channel_ids`);
@@ -67,8 +71,8 @@ async def menu_list_active(cb: CallbackQuery):
 Кнопки на рядок:
 
 - `[leader_wid]` — `callback_data="watch:noop"` (просто id).
-- `[owner_txt]` — `callback_data="watch:group:<leader_wid>"` (перейти в деталі групи).
-- `[❌ Cancel]` — `callback_data="watch:cancel:<leader_wid>"` (скасувати групу).
+- `[owner_txt]` — `callback_data="watch:group:<leader_wid>:<status_key>"` (перейти в деталі групи з тим самим фільтром).
+- `[❌ Cancel]` — `callback_data="watch:cancel:<leader_wid>:<status_key>"` (скасувати групу, залишаючись у тому ж фільтрі).
 
 Допоміжні функції:
 
@@ -135,9 +139,10 @@ async def watch_group_details(cb: CallbackQuery):
 
 Головний хендлер деталізації групи.
 
-1. Розбирає `leader_wid` та `page` з `cb.data`:
-   - `watch:group:<leader_wid>`
-   - `watch:group:<leader_wid>:<page>`
+1. Розбирає `leader_wid`, `status_key` та `page` з `cb.data`:
+   - `watch:group:<leader_wid>:<status_key>`
+   - `watch:group:<leader_wid>:<status_key>:<page>`
+   (`status_key` може бути відсутнім, тоді дефолт pending+matched)
 
 2. Отримує ключ групи:
 
@@ -148,7 +153,7 @@ async def watch_group_details(cb: CallbackQuery):
 3. Завантажує всі елементи групи:
 
    ```python
-   all_items = load_group_items(tid_i, tw_key, cby)
+   all_items = load_group_items(tid_i, tw_key, cby, statuses=STATUS_PRESETS.get(status_key))
    # all_items: List[(wid, channel_id, status, source_url, template_id)]
    ```
 
@@ -194,6 +199,7 @@ async def watch_group_details(cb: CallbackQuery):
            templates_map.get(tpl_id, {}).get("title"),
            tpl_id,
        ),
+       status_key=status_key,
    )
    kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data="menu:list_active"))
    ```
@@ -246,7 +252,7 @@ GroupItem = Tuple[int, int, str, str, int]
      ```sql
      SELECT id, template_id, status, time_window_end, created_by, channel_id, source_url
      FROM watch_posts
-     WHERE status IN ('pending','matched','expired')
+     WHERE status IN ('pending','matched')
        AND template_id IS ?
        AND (created_by IS ? OR created_by IS NULL)
      ORDER BY id DESC
@@ -266,7 +272,7 @@ GroupItem = Tuple[int, int, str, str, int]
      WHERE template_id IS ?
        AND time_window_end IS ?
        AND created_by IS ?
-       AND status IN ('pending','matched','expired')
+       AND status IN ('pending','matched')
      ```
 
    - Повертає список `channel_id` для групи.
@@ -313,7 +319,7 @@ GroupItem = Tuple[int, int, str, str, int]
   - `pending` → ⏳
   - `matched` → ✔️
   - `done` → ✅
-  - `expired` → 🚫
+  - `expired` → 🚫 (зараз не показуємо в списку, але мапінг лишається)
   - `cancelled` → ❌
   - інше → ❔
 

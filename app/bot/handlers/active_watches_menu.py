@@ -1,4 +1,4 @@
-from typing import List, Any, Dict
+from typing import List, Any, Dict, Optional, Tuple
 import logging
 
 from aiogram import Router, F
@@ -13,6 +13,23 @@ from app.bot.services.watches_repo import list_active_watches, group_active
 
 router = Router()
 log = logging.getLogger("bot_active_watches.menu")
+
+STATUS_PRESETS = {
+    "pending": {
+        "title": "Активні",
+        "statuses": ["pending"],
+    },
+    "matched": {
+        "title": "Відслідковуються перегляди",
+        "statuses": ["matched"],
+    },
+    "expired": {
+        "title": "Вийшли з терміну",
+        "statuses": ["expired"],
+    },
+}
+
+LIST_PAGE_SIZE = 12
 
 
 def _short_title(title: Any, tid: int | None) -> str:
@@ -39,10 +56,42 @@ def _fmt_tw_end(s: str | None) -> str:
     return str(s)
 
 
-@router.callback_query(F.data == "menu:list_active")
-async def menu_list_active(cb: CallbackQuery):
+def _status_key_from_cb(cb: CallbackQuery) -> Optional[str]:
+    parts = cb.data.split(":") if cb.data else []
+    if len(parts) >= 3:
+        key = parts[2]
+        if key in STATUS_PRESETS:
+            return key
+    return None
+
+
+def _parse_status_and_page(cb: CallbackQuery, explicit_key: Optional[str]) -> Tuple[Optional[str], int]:
     """
-    Показує список активних watch-груп користувача.
+    Розбирає status_key і page з callback_data типу:
+      menu:list_active
+      menu:list_active:<status_key>
+      menu:list_active:<status_key>:<page>
+    """
+    if explicit_key:
+        return explicit_key, 1
+    parts = cb.data.split(":") if cb.data else []
+    status = None
+    page = 1
+    for p in parts[2:]:
+        if p in STATUS_PRESETS:
+            status = p
+        else:
+            try:
+                page = max(1, int(p))
+            except Exception:
+                continue
+    return status, page
+
+
+@router.callback_query(F.data.startswith("menu:list_active"))
+async def menu_list_active(cb: CallbackQuery, status_key: Optional[str] = None, page: Optional[int] = None):
+    """
+    Показує список активних watch-груп користувача (з фільтром за статусом).
 
     - бере сирі рядки через list_active_watches(user_id)
     - групує їх через group_active
@@ -51,10 +100,32 @@ async def menu_list_active(cb: CallbackQuery):
     - додає кнопки:
         [leader_wid] [owner_txt] [❌ Cancel]
     """
+    # якщо не передали явно — пробуємо взяти з callback_data; якщо нема, показуємо меню вибору
+    status_key, page_parsed = _parse_status_and_page(cb, status_key)
+    if page is None:
+        page = page_parsed or 1
+    preset = STATUS_PRESETS.get(status_key or "", None)
+    if not preset:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="Активні", callback_data="menu:list_active:pending")
+        kb.button(text="Відслідковуються перегляди", callback_data="menu:list_active:matched")
+        kb.button(text="Вийшли з терміну", callback_data="menu:list_active:expired")
+        kb.adjust(1)
+        kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data="menu:home"))
+        text = (
+            "Виберіть, котрий тип вотчу ви хочете бачити, "
+            "активні чи ті що вийшли з терміну"
+        )
+        try:
+            await cb.message.edit_text(text, reply_markup=kb.as_markup())
+        except TelegramBadRequest:
+            await cb.message.answer(text, reply_markup=kb.as_markup())
+        return
+
     templates_map = load_templates_map()
 
     try:
-        rows = list_active_watches(cb.from_user.id)
+        rows = list_active_watches(cb.from_user.id, statuses=preset["statuses"])
     except Exception as e:
         log.exception(f"menu_list_active failed: {e}")
         rows = []
@@ -62,12 +133,12 @@ async def menu_list_active(cb: CallbackQuery):
     if not rows:
         try:
             await cb.message.edit_text(
-                "Активних watch немає.",
+                f"{preset['title']}: записів немає.",
                 reply_markup=main_menu_kb(),
             )
         except TelegramBadRequest:
             await cb.message.answer(
-                "Активних watch немає.",
+                f"{preset['title']}: записів немає.",
                 reply_markup=main_menu_kb(),
             )
         return
@@ -98,10 +169,21 @@ async def menu_list_active(cb: CallbackQuery):
         reverse=True,
     )
 
+    total_items = len(ordered_keys)
+    total_pages = max(1, (total_items + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
+    if page < 1:
+        page = 1
+    if page > total_pages:
+        page = total_pages
+
+    start = (page - 1) * LIST_PAGE_SIZE
+    end = start + LIST_PAGE_SIZE
+    page_keys = ordered_keys[start:end]
+
     lines: List[str] = []
     kb = InlineKeyboardBuilder()
 
-    for key in ordered_keys[:50]:
+    for key in page_keys:
         tid_i, tw_end_s, cby = key
         items = groups[key]
 
@@ -137,13 +219,33 @@ async def menu_list_active(cb: CallbackQuery):
 
         # Кнопки для цієї групи:
         kb.button(text=str(leader_wid), callback_data="watch:noop")
-        kb.button(text=owner_txt, callback_data=f"watch:group:{leader_wid}")
-        kb.button(text="❌ Cancel", callback_data=f"watch:cancel:{leader_wid}")
+        kb.button(
+            text=owner_txt,
+            callback_data=f"watch:group:{leader_wid}:{status_key}",
+        )
+        kb.button(text="❌ Cancel", callback_data=f"watch:cancel:{leader_wid}:{status_key}")
 
     kb.adjust(3)
-    kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data="menu:home"))
 
-    text = "№ | Template | Channels | Owner | Window\n\n" + "\n".join(lines)
+    # навігація
+    nav_row = []
+    if page > 1:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"menu:list_active:{status_key}:{page-1}"))
+    else:
+        nav_row.append(InlineKeyboardButton(text=" ", callback_data="watch:noop"))
+    nav_row.append(InlineKeyboardButton(text=f"Page {page}/{total_pages}", callback_data="watch:noop"))
+    if page < total_pages:
+        nav_row.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"menu:list_active:{status_key}:{page+1}"))
+    else:
+        nav_row.append(InlineKeyboardButton(text=" ", callback_data="watch:noop"))
+    kb.row(*nav_row)
+
+    kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data="menu:list_active"))
+
+    text = (
+        f"{preset['title']} — № | Template | Channels | Owner | Window\n\n"
+        + "\n".join(lines)
+    )
 
     try:
         await cb.message.edit_text(text, reply_markup=kb.as_markup())

@@ -46,7 +46,11 @@ from app.bot.utils.active_watches_pagination import (
 log = logging.getLogger("bot_active_watches.group")
 router = Router()
 
-
+STATUS_PRESETS = {
+    "pending": ["pending"],
+    "matched": ["matched"],
+    "expired": ["expired"],
+}
 
 
 
@@ -112,8 +116,14 @@ async def watch_cancel(cb: CallbackQuery):
     """
     Скасовує всі watch'і групи leader_wid (pending/matched/expired -> cancelled).
     """
+    parts = cb.data.split(":")
+    leader_wid: Optional[int] = None
+    status_key: Optional[str] = None
     try:
-        leader_wid = int(cb.data.split(":")[-1])
+        if len(parts) >= 3:
+            leader_wid = int(parts[2])
+        if len(parts) >= 4:
+            status_key = parts[3] if parts[3] in STATUS_PRESETS else None
     except Exception:
         leader_wid = None
     if not leader_wid:
@@ -135,7 +145,7 @@ async def watch_cancel(cb: CallbackQuery):
     # Щоб оновити список, імпортуємо хендлер меню тут
     from app.bot.handlers.active_watches_menu import menu_list_active
 
-    await menu_list_active(cb)
+    await menu_list_active(cb, status_key=status_key)
 
 
 @router.callback_query(F.data.startswith("watch:group:"))
@@ -146,14 +156,14 @@ async def watch_group_details(cb: CallbackQuery):
     parts = cb.data.split(":")
     leader_wid: Optional[int] = None
     page = 1
+    status_key: Optional[str] = None
     try:
-        if len(parts) == 3:
-            leader_wid = int(parts[2])  # watch:group:<leader_wid>
-        elif len(parts) == 4:
-            leader_wid = int(parts[2])  # watch:group:<leader_wid>:<page>
-            page = int(parts[3]) or 1
-        else:
-            leader_wid = int(parts[-1])
+        leader_wid = int(parts[2])  # watch:group:<leader_wid>:...
+        for token in parts[3:]:
+            if token.isdigit():
+                page = int(token) or 1
+            elif token in STATUS_PRESETS:
+                status_key = token
     except Exception:
         leader_wid = None
 
@@ -179,7 +189,8 @@ async def watch_group_details(cb: CallbackQuery):
 
     # 2) Витягуємо всі watch'і групи
     try:
-        all_items = load_group_items(tid_i, tw_key, cby)
+        statuses = STATUS_PRESETS.get(status_key or "", None)
+        all_items = load_group_items(tid_i, tw_key, cby, statuses=statuses)
     except Exception as e:
         log.exception("load_group_items failed: %s", e)
         all_items = []
@@ -233,16 +244,24 @@ async def watch_group_details(cb: CallbackQuery):
             templates_map.get(tpl_id, {}).get("title"),
             tpl_id,
         ),
+        status_key=status_key,
     )
 
     # Back
-    kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data="menu:list_active"))
+    back_cb = "menu:list_active"
+    if status_key:
+        back_cb = f"menu:list_active:{status_key}"
+    kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data=back_cb))
 
     # 7) Заголовок повідомлення
     tw_txt = fmt_tw_end_human(tw_key)
-    header = (
-        f"Вотч для {owner_for_header}, час вікна до {tw_txt} — вотч активний і працює"
-    )
+    header = f"Вотч для {owner_for_header}, час вікна до {tw_txt}"
+    if status_key == "pending":
+        header += " — активний"
+    elif status_key == "matched":
+        header += " — відслідковуються перегляди"
+    elif status_key == "expired":
+        header += " — вийшов з терміну"
 
     text = header + "\n\n" + table_block
 

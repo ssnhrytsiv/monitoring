@@ -7,6 +7,8 @@ from app.services.posts_watch_result_db import insert_watch_event
 
 log = logging.getLogger("active_watches.service")
 
+ALLOWED_STATUSES = {"pending", "matched", "expired"}
+
 # Тип елемента групи:
 GroupItem = Tuple[int, int, str, str, int]
 # (wid, channel_id, status, source_url, template_id)
@@ -72,10 +74,11 @@ def load_group_items(
     template_id: Optional[int],
     tw_key: Optional[str],
     created_by: Any,
+    statuses: Optional[List[str]] = None,
 ) -> List[GroupItem]:
     """
     Завантажує всі вотчі групи за (template_id, tw_key, created_by)
-    зі статусами pending/matched/expired.
+    з обмеженням по статусах (дефолт: pending+matched).
 
     Повертає список:
       (wid, channel_id, status, source_url, template_id)
@@ -83,16 +86,22 @@ def load_group_items(
     conn = raw_connection()
     cur = conn.cursor()
 
+    st = statuses or ["pending", "matched"]
+    st = [s for s in st if s in ALLOWED_STATUSES]
+    if not st:
+        st = ["pending", "matched"]
+    placeholders = ",".join("?" for _ in st)
+
     cur.execute(
         """
         SELECT id, template_id, status, time_window_end, created_by, channel_id, source_url
         FROM watch_posts
-        WHERE status IN ('pending','matched','expired')
+        WHERE status IN (""" + placeholders + """)
           AND template_id IS ?
           AND (created_by IS ? OR created_by IS NULL)
         ORDER BY id DESC
         """,
-        (template_id, created_by),
+        (*st, template_id, created_by),
     )
     rows = cur.fetchall()
 
@@ -124,10 +133,11 @@ def load_group_items(
 
 def load_group_channels(
     leader_wid: int,
+    statuses: Optional[List[str]] = None,
 ) -> List[int]:
     """
     Повертає список channel_id для всіх watch'ів групи leader_wid
-    (статуси pending/matched/expired).
+    (статуси можна задати; дефолт: pending+matched+expired).
     """
     conn = raw_connection()
     cur = conn.cursor()
@@ -145,6 +155,12 @@ def load_group_channels(
     tid_i = int(tid) if tid is not None else None
     tw_end_s = str(tw_end) if tw_end is not None else None
 
+    st = statuses or ["pending", "matched", "expired"]
+    st = [s for s in st if s in ALLOWED_STATUSES]
+    if not st:
+        st = ["pending", "matched", "expired"]
+    placeholders = ",".join("?" for _ in st)
+
     cur.execute(
         """
         SELECT id, channel_id
@@ -152,9 +168,9 @@ def load_group_channels(
         WHERE template_id IS ?
           AND time_window_end IS ?
           AND created_by IS ?
-          AND status IN ('pending','matched','expired')
+          AND status IN (""" + placeholders + """)
         """,
-        (tid_i, tw_end_s, cby),
+        (tid_i, tw_end_s, cby, *st),
     )
     items = cur.fetchall()
 
