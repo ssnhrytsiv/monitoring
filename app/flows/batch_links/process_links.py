@@ -1160,41 +1160,14 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
 
                         kb = pager.build_keyboard(session_id, 0, len(summary_pages))
 
-                        if msg_id:
-                            try:
-                                await bot.edit_message_text(
-                                    chat_id=bot_user_id,
-                                    message_id=msg_id,
-                                    text=summary_pages[0],
-                                    reply_markup=kb or back_to_menu_kb(),
-                                    disable_web_page_preview=True,
-                                )
-                                log.info(
-                                    "bot_notify_edited",
-                                    extra={"user_id": bot_user_id, "msg_id": msg_id},
-                                )
-                            except Exception as e:
-                                log.exception(
-                                    "bot_notify_edit_failed",
-                                    extra={
-                                        "user_id": bot_user_id,
-                                        "msg_id": msg_id,
-                                        "err": str(e),
-                                    },
-                                )
-                                await bot.send_message(
-                                    bot_user_id,
-                                    summary_pages[0],
-                                    reply_markup=kb or back_to_menu_kb(),
-                                    disable_web_page_preview=True,
-                                )
-                        else:
-                            await bot.send_message(
-                                bot_user_id,
-                                summary_pages[0],
-                                reply_markup=kb or back_to_menu_kb(),
-                                disable_web_page_preview=True,
-                            )
+                        # ВАЖЛИВО: не редагуємо попереднє повідомлення з прогресом,
+                        # а шлемо нове, щоб результат залишався в чаті.
+                        await bot.send_message(
+                            bot_user_id,
+                            summary_pages[0],
+                            reply_markup=kb or back_to_menu_kb(),
+                            disable_web_page_preview=True,
+                        )
                 set_processing(bot_user_id, False)
             except Exception as e:
                 log.exception(

@@ -8,6 +8,7 @@ from telethon.errors import (
     InviteHashInvalidError, InviteHashExpiredError,
     UserAlreadyParticipantError, FloodWaitError,
     UsernameNotOccupiedError, ChannelPrivateError,
+    ChannelsTooMuchError,
 )
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest,CheckChatInviteRequest
@@ -316,6 +317,13 @@ async def ensure_join(client, url: str):
         kind = "invite" if is_invite else "public"
         log.debug("ensure_join(%s): ChannelPrivateError -> private", kind)
         return "private", None, kind, None, invite_hash
+
+    except ChannelsTooMuchError:
+        if is_invite and invite_hash:
+            invite_status_put(invite_hash, "too_many")
+        kind = "invite" if is_invite else "public"
+        log.warning("ensure_join(%s): channels too much", kind)
+        return "too_many", None, kind, None, invite_hash
 
     except FloodWaitError as e:
         kind = "invite" if is_invite else "public"
