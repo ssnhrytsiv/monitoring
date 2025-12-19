@@ -1,5 +1,4 @@
 import asyncio
-import os
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -7,10 +6,10 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from app.bot.handlers import router  # центральний router
 from app.bot.notifier import notifier_loop
-
+from app.config import BOT_TOKEN
 
 async def run_bot():
-    token = os.getenv("BOT_TOKEN")
+    token = BOT_TOKEN
     if not token:
         raise RuntimeError("BOT_TOKEN env is required")
 

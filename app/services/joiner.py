@@ -153,7 +153,10 @@ async def ensure_join(client, url: str):
 
             # --- КРОК 0b: перевірка кешу статусу по invite_hash (без API)
             st = invite_status_get(invite_hash)
-            if st in ("invalid", "private", "requested", "already", "joined", "blocked", "too_many"):
+            # Кешований too_many прив'язаний до інвайта, але це ліміт акаунта, тож його ігноруємо.
+            if st == "too_many":
+                pass
+            elif st in ("invalid", "private", "requested", "already", "joined", "blocked"):
                 cid_known, title_known = map_invite_get(invite_hash)
                 log.debug("ensure_join(invite): cached status=%s invite=%s cid=%s", st, invite_hash, cid_known)
 
@@ -319,8 +322,6 @@ async def ensure_join(client, url: str):
         return "private", None, kind, None, invite_hash
 
     except ChannelsTooMuchError:
-        if is_invite and invite_hash:
-            invite_status_put(invite_hash, "too_many")
         kind = "invite" if is_invite else "public"
         log.warning("ensure_join(%s): channels too much", kind)
         return "too_many", None, kind, None, invite_hash
@@ -334,8 +335,6 @@ async def ensure_join(client, url: str):
         msg = str(e) if e else "error"
         kind = "invite" if is_invite else "public"
         if "Too many channels" in msg or "CHANNELS_TOO_MUCH" in msg:
-            if is_invite and invite_hash:
-                invite_status_put(invite_hash, "too_many")
             log.warning("ensure_join(%s): too_many channels", kind)
             return "too_many", None, kind, None, invite_hash
         if "USER_BANNED_IN_CHANNEL" in msg or "USER_KICKED" in msg:

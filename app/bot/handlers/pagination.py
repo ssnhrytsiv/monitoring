@@ -5,6 +5,7 @@ from aiogram.types import CallbackQuery
 from aiogram.exceptions import TelegramBadRequest
 
 from app.bot import pagination as pager
+from app.bot.keyboards import main_menu_kb
 
 router = Router()
 
@@ -50,3 +51,16 @@ async def paginate(cb: CallbackQuery):
         return
 
     await cb.answer()
+
+
+@router.callback_query(F.data == "blmenu:home")
+async def paginate_menu_home(cb: CallbackQuery):
+    """
+    Повернення у меню з пагінації підсумку batch_links.
+    Не редагуємо існуюче повідомлення, шлемо нове меню.
+    """
+    await cb.message.answer("Меню:", reply_markup=main_menu_kb())
+    try:
+        await cb.answer()
+    except TelegramBadRequest:
+        pass

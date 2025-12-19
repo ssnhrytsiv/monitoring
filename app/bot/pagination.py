@@ -91,7 +91,7 @@ def build_keyboard(sid: str, idx: int, total: int) -> Optional[InlineKeyboardMar
         for start in range(0, len(cat_btns), 2):
             rows.append(cat_btns[start:start+2])
 
-    # Додаємо рядок з поверненням у меню
-    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")])
+    # Додаємо рядок з поверненням у меню (окремий callback для пагінації)
+    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="blmenu:home")])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)

@@ -25,6 +25,15 @@ API_ID   = int(_env("API_ID", "0") or "0")
 API_HASH = _env("API_HASH", "")
 PRIMARY  = _env("SESSION") or _env("SESSION_NAME") or "tg_session"
 
+# Людські імена акаунтів (для логів/діагностики)
+SESSION_DISPLAY = {
+    "tg_session": "Покупаю Рекламу (@ludoman_buying)",
+    "tg_session_2": "Владислав (@leorandor)",
+    "tg_session_3": "Дон (@doncorleon2309)",
+    "tg_session_4": "D",
+    "tg_session_5": "М М (@kurasow)",
+}
+
 def _parse_accounts_env() -> List[str]:
     """
     ACCOUNTS=tg_session_2,tg_session_3
@@ -49,10 +58,12 @@ class ClientSlot:
     next_ready: float = 0.0     # unix-ts, коли клієнт знову доступний
     busy: bool = False
     lock: asyncio.Lock = asyncio.Lock()
+    human_display: Optional[str] = None
 
 _POOL: List[ClientSlot] = []
 _POOL_LOCK = asyncio.Lock()
 _rr = 0  # round-robin індекс
+_limits_checker_task: Optional[asyncio.Task] = None
 
 # ---------- utils ----------
 def session_name(client: TelegramClient) -> str:
@@ -134,6 +145,50 @@ def mark_limit(client_or_slot: Union[TelegramClient, ClientSlot], days: int = 2)
     _set_ready_after(slot, seconds)
     log.warning("mark_limit: %s sleeps until %.0f (+%ss, ~%d days)", slot.name, slot.next_ready, seconds, days)
 
+
+async def _count_memberships(slot: ClientSlot) -> int:
+    """
+    Рахує кількість каналів/супергруп для сесії.
+    """
+    total = 0
+    try:
+        async for dlg in slot.client.iter_dialogs():
+            ent = dlg.entity
+            if isinstance(ent, types.Channel):
+                total += 1
+    except Exception as e:
+        log.warning("count_memberships failed for %s: %s", slot.name, e)
+    return total
+
+
+async def _check_pool_limits(reason: str = "periodic") -> None:
+    """
+    Якщо total > 498 — ставимо слот у sleep на добу.
+    """
+    if not _POOL:
+        return
+    for slot in _POOL:
+        try:
+            total = await _count_memberships(slot)
+            if total > 498:
+                mark_limit(slot, days=1)
+                log.warning(
+                    "limit_check: %s marked sleep (channels=%d) reason=%s",
+                    slot.name,
+                    total,
+                    reason,
+                )
+            else:
+                log.debug("limit_check: %s ok (channels=%d) reason=%s", slot.name, total, reason)
+        except Exception as e:
+            log.warning("limit_check failed for %s: %s", slot.name, e)
+
+
+async def _limits_checker_loop() -> None:
+    while True:
+        await _check_pool_limits(reason="daily")
+        await asyncio.sleep(86400)
+
 async def _ensure_connected(slot: ClientSlot) -> None:
     """
     Переконуємось, що клієнт під'єднаний та авторизований.
@@ -162,6 +217,10 @@ async def _ensure_connected(slot: ClientSlot) -> None:
 
     # Спробуємо один раз підтягнути людське ім'я акаунта (first/last/username)
     try:
+        # Спершу беремо з мапи, якщо вона є
+        disp_map = SESSION_DISPLAY.get(slot.name)
+        if disp_map:
+            slot.human_display = disp_map
         me = await slot.client.get_me()
         if me:
             first = getattr(me, "first_name", None) or ""
@@ -173,10 +232,11 @@ async def _ensure_connected(slot: ClientSlot) -> None:
                 disp = f"@{username}"
             if disp:
                 slot.human_display = disp
-                try:
-                    setattr(slot.client, "_human_display", disp)
-                except Exception:
-                    pass
+        if slot.human_display:
+            try:
+                setattr(slot.client, "_human_display", slot.human_display)
+            except Exception:
+                pass
     except Exception as e:
         log.debug("get_me failed for %s: %s", slot.name, e)
 
@@ -185,7 +245,7 @@ async def start_pool() -> None:
     Створює та піднімає клієнти для ACCOUNTS.
     PRIMARY (SESSION) не додаємо у пул.
     """
-    global _POOL
+    global _POOL, _limits_checker_task
     if not POOL_SESSIONS:
         log.info("Accounts pool is empty (ACCOUNTS not set)."); _POOL = []; return
     if not API_ID or not API_HASH:
@@ -194,14 +254,27 @@ async def start_pool() -> None:
     pool: List[ClientSlot] = []
     for sess in POOL_SESSIONS:
         client = TelegramClient(sess, API_ID, API_HASH,connection=ConnectionTcpAbridged)
-        slot = ClientSlot(name=sess, client=client)
+        slot = ClientSlot(name=sess, client=client, human_display=SESSION_DISPLAY.get(sess))
         await _ensure_connected(slot)
         pool.append(slot)
         log.info("pool client ready: %s", sess)
     _POOL = pool
     log.info("account_pool started: %d clients", len(_POOL))
+    # Перевірка лімітів на старті
+    await _check_pool_limits(reason="startup")
+    # Плановий щоденний чекер
+    if _limits_checker_task is None:
+        _limits_checker_task = asyncio.create_task(_limits_checker_loop())
 
 async def stop_pool() -> None:
+    global _limits_checker_task
+    if _limits_checker_task:
+        _limits_checker_task.cancel()
+        try:
+            await _limits_checker_task
+        except Exception:
+            pass
+        _limits_checker_task = None
     for s in _POOL:
         try: await s.client.disconnect()
         except Exception: pass

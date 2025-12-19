@@ -39,9 +39,6 @@ def setup(client, control_peer=None, monitor_buffer=None, **kwargs):
             uname = s.lstrip("@")
             return (uname, uname) if uname else (None, None)
 
-        if s.isascii() and " " not in s:
-            return (s, s)
-
         return (s, None)
 
     @client.on(events.NewMessage(pattern=r"^/owner_set(?:@\w+)?"))
@@ -61,8 +58,6 @@ def setup(client, control_peer=None, monitor_buffer=None, **kwargs):
         else:
             owner_display = raw
             owner_username = None
-            if raw.isascii() and " " not in raw:
-                owner_username = raw
 
         if monitor_buffer:
             monitor_buffer.owner_display = owner_display

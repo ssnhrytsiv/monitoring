@@ -310,6 +310,9 @@ def _build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None)
             if cadmin:
                 tag_label = f"Дубликат ({cadmin})"
             tag_emoji = "🔁"
+        elif admin:
+            tag_label = f"Конфликт (owner={admin})"
+            tag_emoji = "⚠️"
         elif _looks_requested(status):
             tag_label = "Заявка отправлена"
             tag_emoji = "✉️"
@@ -747,8 +750,33 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                         title_current = _resolve_title_for_url(url, None)
                     except Exception:
                         pass
+                # Спробуємо дізнатись channel_id для коректної перевірки owner_conflict
+                if channel_id is None:
+                    try:
+                        cid_from_inv, title_from_inv = membership_db.map_invite_get(url)
+                    except Exception:
+                        cid_from_inv, title_from_inv = (None, None)
+                    if cid_from_inv:
+                        channel_id = cid_from_inv
+                        if not title_current and title_from_inv:
+                            title_current = title_from_inv
+                if channel_id is None:
+                    try:
+                        channel_id = channel_db.get_channel_id_by_url(url)
+                    except Exception:
+                        channel_id = None
 
                 line = fmt_result_line(idx, url, "cached", extra=ust)
+                is_conflict = False
+                ex_owner = None
+                if channel_id is not None:
+                    try:
+                        is_conflict, ex_owner = _owner_conflict(channel_id, od, ou)
+                        if is_conflict:
+                            line = f"{line} | owner_conflict(existing={ex_owner})"
+                    except Exception:
+                        is_conflict = False
+                        ex_owner = None
                 results.append(line)
 
                 if ust == "joined":
@@ -759,15 +787,17 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
                     progress.add_status("invalid")
 
                 status_part = line.split(" — ", 1)[1] if " — " in line else line
+                if is_conflict and ex_owner:
+                    status_part += f" | owner_conflict(existing={ex_owner})"
                 result_items.append({
                     "idx": idx,
                     "url": url,
                     "title": title_current,
                     "status": status_part,
-                    "channel_id": None,
+                    "channel_id": channel_id,
                 })
                 try:
-                    channel_db.add_link(None, url, None, message.id, od, ou)
+                    channel_db.add_link(channel_id, url, None, message.id, od, ou)
                 except Exception:
                     pass
                 await _short_pause()
