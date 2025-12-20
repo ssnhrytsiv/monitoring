@@ -1,6 +1,12 @@
+from __future__ import annotations
+
 import os
 import asyncio
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from telethon import TelegramClient
 
 def _env(name: str, default: str = "") -> str:
     v = os.getenv(name)
@@ -12,11 +18,13 @@ class DebouncedProgress:
     Редагує службове повідомлення лише коли є зміни,
     і робить це із затримкою (debounce), щоб не ловити rate-limit.
     """
-    client: "TelegramClient"
-    peer: int
+    client: "TelegramClient" | None
+    peer: int | None
     title: str
     total: int
     debounce: float = field(default_factory=lambda: float(_env("PROGRESS_DEBOUNCE", "3")))
+    bot: object | None = None
+    chat_id: int | None = None
 
     msg_id: int | None = None
 
@@ -40,8 +48,12 @@ class DebouncedProgress:
     # ---- public API ----
     async def start(self) -> None:
         text = self._render(header_suffix="— стартую…")
-        m = await self.client.send_message(self.peer, text, link_preview=False)
-        self.msg_id = m.id
+        if self.bot and self.chat_id:
+            m = await self.bot.send_message(self.chat_id, text, link_preview=False)
+            self.msg_id = m.message_id
+        elif self.client and self.peer is not None:
+            m = await self.client.send_message(self.peer, text, link_preview=False)
+            self.msg_id = m.id
         self._last_render = text
 
     def set_current(self, url: str | None = None, actor: str | None = None) -> None:
@@ -108,7 +120,11 @@ class DebouncedProgress:
         if text == self._last_render:
             return
         try:
-            await self.client.edit_message(self.peer, self.msg_id, text, link_preview=False)
+            if self.bot and self.chat_id:
+                await self.bot.edit_message_text(text=text, chat_id=self.chat_id, message_id=self.msg_id,
+                                                 disable_web_page_preview=True)
+            elif self.client and self.peer is not None:
+                await self.client.edit_message(self.peer, self.msg_id, text, link_preview=False)
             self._last_render = text
         except Exception:
             pass  # не зупиняємо весь процес

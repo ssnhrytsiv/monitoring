@@ -265,18 +265,38 @@ async def _views_worker():
     while True:
         try:
             slots = iter_pool_clients()
+            if not slots:
+                await asyncio.sleep(COVERAGE_POLL_TICK_SEC)
+                continue
             pool_map = {session_name(s.client): s.client for s in slots}
+            any_cli = next(iter(pool_map.values()))
 
             due = list_due_coverage()
             for watch_id, channel_id, msg_id, matched_session in due:
-                cli = MAIN_CLIENT if not matched_session or matched_session == "MAIN" else pool_map.get(matched_session)
+                cli = pool_map.get(matched_session) if matched_session else None
                 if cli is None:
-                    cli = MAIN_CLIENT
+                    cli = any_cli
                 try:
                     msg: Message | None = await cli.get_messages(entity=channel_id, ids=msg_id)
                 except Exception as e:
                     _pylog.exception("views: get_messages failed (wid=%s cid=%s mid=%s): %s", watch_id, channel_id,
                                      msg_id, e)
+                    # якщо не можемо отримати entity — вважаємо покритим, щоб не зациклитись
+                    try:
+                        mark_done_views(watch_id, 0)
+                        insert_watch_event(
+                            watch_id,
+                            "views",
+                            {
+                                "watch_id": watch_id,
+                                "channel_id": channel_id,
+                                "message_id": msg_id,
+                                "views": 0,
+                                "status": "entity_miss",
+                            },
+                        )
+                    except Exception:
+                        _pylog.exception("views: mark_done_views failed (wid=%s) after entity miss", watch_id)
                     msg = None
 
                 if msg is None:

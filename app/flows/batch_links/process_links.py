@@ -624,7 +624,14 @@ def _resolve_title_for_url(url: str, channel_id: Optional[int]) -> Optional[str]
 
     return None
 
-async def process_links(message, text: str, owner_display: Optional[str] = None, owner_username: Optional[str] = None):
+async def process_links(
+    message,
+    text: str,
+    owner_display: Optional[str] = None,
+    owner_username: Optional[str] = None,
+    bot=None,
+    control_chat_id: Optional[int] = None,
+):
     bot_user_id: Optional[int] = None
     raw_text = text or ""
     raw_text_full = getattr(message, "raw_text", None) or raw_text
@@ -656,7 +663,7 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
             pass
 
     _chat = getattr(message, "chat", None)
-    _cid = getattr(_chat, "id", None)
+    _cid = getattr(_chat, "id", None) if _chat else None
     _src = str(_cid or "")
     _owner_base = (ou or od) or f"no_owner:{_src}"
     _owner_key = f"{_owner_base}#msg:{message.id}"
@@ -695,7 +702,12 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
         result_items: List[dict] = []
 
         progress = DebouncedProgress(
-            client=message.client, peer=message.chat_id, title="Пакет посилань", total=len(links)
+            client=getattr(message, "client", None),
+            peer=getattr(message, "chat_id", None),
+            title="Пакет посилань",
+            total=len(links),
+            bot=bot,
+            chat_id=control_chat_id or getattr(message, "chat_id", None),
         )
         await progress.start()
         log.info("batch start: raw=%d uniq=%d", len(links), len(set(links)))
@@ -1106,6 +1118,11 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
             elif invite_ex_owner:
                 line = f"{line} | owner_conflict(existing={invite_ex_owner})"
 
+            # Важливо: зберігаємо фактичний cid, якщо він став відомий після ensure_join,
+            # інакше далі футер буде "порожнім" (cid=None фільтруються).
+            if cid_eff is not None:
+                channel_id = cid_eff
+
             results.append(line)
             status_part = line.split(" — ", 1)[1] if " — " in line else line
             if is_conflict:
@@ -1140,6 +1157,28 @@ async def process_links(message, text: str, owner_display: Optional[str] = None,
         footer_main = footer_parts_main[0] if footer_parts_main else ""
 
         await progress.finish(footer=footer_main)
+
+        # Повний список посилань зі статусами окремими повідомленнями в control-чат
+        try:
+            control_peer = control_chat_id or getattr(message, "chat_id", None)
+            control_client = getattr(message, "client", None)
+            if control_client and control_peer:
+                status_blocks: List[str] = []
+                if footer_full_main:
+                    status_blocks.append(footer_full_main)
+                for label, text in footer_full_sections:
+                    status_blocks.append(f"{label}:\n{text}")
+
+                combined = "\n\n".join(block for block in status_blocks if block)
+                for part in _split_text_for_telegram(combined, max_len=3500):
+                    if part:
+                        await control_client.send_message(
+                            control_peer,
+                            part,
+                            link_preview=False,
+                        )
+        except Exception:
+            log.debug("Failed to send full status list to control chat", exc_info=True)
 
         log.info("batch done: total=%d uniq=%d", len(links), len(set(links)))
 

@@ -1,9 +1,13 @@
 import os
+import logging
 from dotenv import load_dotenv
 
 # Базовий .env + локальні override (.env.local) для зручності розробки
 load_dotenv()
 load_dotenv(".env.local", override=True)
+
+log = logging.getLogger("config")
+log.info("CONFIG env SESSION_NAME=%r", os.getenv("SESSION_NAME"))
 
 ENV_MODE = os.getenv("ENV", "").lower()
 
@@ -53,3 +57,17 @@ PLUGINS_PACKAGE = "app.plugins"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 WATCH_VIEWS_ENABLED = os.getenv("WATCH_VIEWS_ENABLED", "1").strip().lower() not in {"0","false","no","off"}
+
+# helpers
+def _as_bool(val: str | None, default: bool = False) -> bool:
+    if val is None:
+        return default
+    s = str(val).strip().lower()
+    if s in {"1", "true", "yes", "on"}:
+        return True
+    if s in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+# Коли true – контрольний чат обробляє Aiogram‑бот, а головна Telethon‑сесія не запускається
+CONTROL_VIA_BOT = _as_bool(_pick_env("CONTROL_VIA_BOT", "1"), default=True)

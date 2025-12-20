@@ -63,6 +63,13 @@ async def _resolve_control_peer() -> tuple[int | None, str]:
         return None, "resolve-failed"
 
 async def load_plugins():
+    # Корисна діагностика: який саме .session файл піднятий
+    try:
+        sess_file = getattr(client.session, "filename", None)
+        log.info("Main client uses session file: %s (SESSION env=%s)", sess_file, SESSION)
+    except Exception:
+        log.debug("Could not read client.session.filename during load_plugins")
+
     control_id, how = await _resolve_control_peer()
     if control_id is not None:
         log.info("CONTROL_PEER %r -> peer_id=%s (%s)", CONTROL_PEER, control_id, how)
@@ -95,7 +102,6 @@ async def load_plugins():
             continue
         filtered.append(name)
 
-    # Якщо CONTROL_PEER не доступний — не вантажимо керовані плагіни
     if control_id is None:
         filtered_strict = [n for n in filtered if n not in STRICT_CONTROLLED_PLUGINS]
         skipped = [n for n in filtered if n in STRICT_CONTROLLED_PLUGINS]
