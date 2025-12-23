@@ -99,3 +99,28 @@ class OwnerConflict(Base):
     source_ref = Column(String)
     reason = Column(String, nullable=False)
     created_at = Column(Integer, nullable=False)
+
+
+# Нові таблиці для admin-bot (не впливають на існуючі схеми)
+class Admin(Base):
+    __tablename__ = "admins"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tg_id = Column(BigInteger, unique=True, index=True, nullable=False)
+    username = Column(String)
+    display = Column(String)
+
+    channels = relationship("AdminChannel", back_populates="admin", cascade="all, delete-orphan")
+
+
+class AdminChannel(Base):
+    __tablename__ = "admin_channels"
+    __table_args__ = (
+        UniqueConstraint("admin_id", "channel_id", name="uq_admin_channel"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    admin_id = Column(Integer, nullable=False)
+    channel_id = Column(Integer, nullable=False)
+
+    admin = relationship("Admin", back_populates="channels")

@@ -7,16 +7,21 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from admin_bot.config import ADMIN_BOT_TOKEN
+from admin_bot.db.session import Base, engine
+from admin_bot.bot import router
 
 
 async def main() -> None:
     if not ADMIN_BOT_TOKEN:
         raise RuntimeError("ADMIN_BOT_TOKEN env is required for admin bot")
 
+    # Створюємо нові таблиці admin-бота, не чіпаючи існуючі
+    Base.metadata.create_all(bind=engine)
+
     bot = Bot(token=ADMIN_BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
 
-    # TODO: додати хендлери CRUD адмінів/каналів
+    dp.include_router(router)
 
     await dp.start_polling(bot)
 
