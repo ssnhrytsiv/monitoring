@@ -26,7 +26,12 @@ class Channel(Base):
     created_at = Column(String)
     updated_at = Column(String)
 
-    links = relationship("Link", back_populates="channel", lazy="selectin")
+    links = relationship(
+        "Link",
+        primaryjoin="Channel.channel_id==foreign(Link.channel_id)",
+        back_populates="channel",
+        lazy="selectin",
+    )
 
 
 class Link(Base):
@@ -41,7 +46,12 @@ class Link(Base):
     owner_username = Column(String)
     added_at = Column(String)
 
-    channel = relationship("Channel", back_populates="links", lazy="joined", foreign_keys=[channel_id])
+    channel = relationship(
+        "Channel",
+        primaryjoin="Link.channel_id==foreign(Channel.channel_id)",
+        back_populates="links",
+        lazy="joined",
+    )
 
 
 class Membership(Base):
