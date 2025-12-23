@@ -31,6 +31,7 @@ class Channel(Base):
         primaryjoin="Channel.channel_id==foreign(Link.channel_id)",
         back_populates="channel",
         lazy="selectin",
+        viewonly=True,
     )
 
 
@@ -51,6 +52,8 @@ class Link(Base):
         primaryjoin="Link.channel_id==foreign(Channel.channel_id)",
         back_populates="links",
         lazy="joined",
+        uselist=False,
+        viewonly=True,
     )
 
 
