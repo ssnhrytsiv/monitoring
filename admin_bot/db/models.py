@@ -8,7 +8,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, foreign
 
 from admin_bot.db.session import Base
 
@@ -29,7 +29,6 @@ class Channel(Base):
     links = relationship(
         "Link",
         primaryjoin="Channel.channel_id==foreign(Link.channel_id)",
-        back_populates="channel",
         lazy="selectin",
         viewonly=True,
     )
@@ -47,14 +46,7 @@ class Link(Base):
     owner_username = Column(String)
     added_at = Column(String)
 
-    channel = relationship(
-        "Channel",
-        primaryjoin="Link.channel_id==foreign(Channel.channel_id)",
-        back_populates="links",
-        lazy="joined",
-        uselist=False,
-        viewonly=True,
-    )
+    # Двосторонній зв'язок не налаштований через відсутність явних FK у схемі.
 
 
 class Membership(Base):
@@ -123,7 +115,12 @@ class Admin(Base):
     username = Column(String)
     display = Column(String)
 
-    channels = relationship("AdminChannel", back_populates="admin", cascade="all, delete-orphan")
+    channels = relationship(
+        "AdminChannel",
+        primaryjoin="Admin.id==foreign(AdminChannel.admin_id)",
+        lazy="selectin",
+        viewonly=True,
+    )
 
 
 class AdminChannel(Base):
@@ -135,5 +132,3 @@ class AdminChannel(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     admin_id = Column(Integer, nullable=False)
     channel_id = Column(Integer, nullable=False)
-
-    admin = relationship("Admin", back_populates="channels")
