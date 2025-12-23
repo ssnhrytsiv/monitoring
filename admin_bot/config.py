@@ -19,3 +19,22 @@ SQLALCHEMY_DATABASE_URL = os.getenv(
     "SQLALCHEMY_DATABASE_URL",
     f"sqlite:///{DB_PATH}",
 )
+
+
+def _parse_ids(val: str | None) -> list[int]:
+    if not val:
+        return []
+    out = []
+    for part in val.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            out.append(int(p))
+        except Exception:
+            continue
+    return out
+
+
+# Allow-list for admin bot commands (tg_id); empty -> allow all
+ADMIN_ALLOWED_IDS = _parse_ids(os.getenv("ADMIN_ALLOWED_IDS"))
