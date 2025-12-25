@@ -30,14 +30,13 @@ DELETE FROM admin_channels    WHERE channel_id IN (SELECT channel_id FROM bad_id
 DELETE FROM network_channels  WHERE channel_id IN (SELECT channel_id FROM bad_ids);
 DELETE FROM subscriptions     WHERE channel_id IN (SELECT channel_id FROM bad_ids);
 DELETE FROM owner_conflicts   WHERE channel_id IN (SELECT channel_id FROM bad_ids);
--- invite maps (for these channels the invite hashes are useless)
-DELETE FROM invite_map        WHERE channel_id IN (SELECT channel_id FROM bad_ids);
-DELETE FROM invite_status     WHERE invite_hash IN (
-    SELECT invite_hash FROM invite_map WHERE channel_id IN (SELECT channel_id FROM bad_ids)
-);
-DELETE FROM invite_owners     WHERE invite_hash IN (
-    SELECT invite_hash FROM invite_map WHERE channel_id IN (SELECT channel_id FROM bad_ids)
-);
+-- invite maps (capture hashes before deleting invite_map)
+CREATE TEMP TABLE bad_hashes AS
+    SELECT invite_hash FROM invite_map WHERE channel_id IN (SELECT channel_id FROM bad_ids);
+DELETE FROM invite_status     WHERE invite_hash IN (SELECT invite_hash FROM bad_hashes);
+DELETE FROM invite_owners     WHERE invite_hash IN (SELECT invite_hash FROM bad_hashes);
+DELETE FROM invite_map        WHERE invite_hash IN (SELECT invite_hash FROM bad_hashes);
+DROP TABLE bad_hashes;
 
 DELETE FROM channels          WHERE channel_id IN (SELECT channel_id FROM bad_ids);
 
