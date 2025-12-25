@@ -9,8 +9,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Optional, List, Union
 
-from telethon import TelegramClient
-from telethon.tl import types
+from telethon import TelegramClient, errors
+from telethon.tl import types, functions
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.network.connection import ConnectionTcpAbridged
 
@@ -362,3 +362,28 @@ async def is_already_subscribed(url: str) -> Optional[str]:
         except Exception:
             continue
     return None
+
+
+async def leave_channels(session_name: str, channel_ids: List[int]) -> dict:
+    """
+    Відписує пуловий клієнт від переданих channel_ids.
+    Повертає лічильники успішних/помилкових виходів.
+    """
+    slot = find_slot_by_session_name(session_name)
+    if not slot:
+        return {"session": session_name, "left": 0, "errors": len(channel_ids), "reason": "session_not_in_pool"}
+
+    client = slot.client
+    left, errors_cnt = 0, 0
+    for cid in channel_ids:
+        try:
+            ent = await client.get_entity(cid)
+            await client(functions.channels.LeaveChannelRequest(ent))
+            left += 1
+            bump_cooldown(client, 2)
+        except (errors.UserNotParticipantError, errors.ChannelPrivateError):
+            errors_cnt += 1
+        except Exception as e:
+            errors_cnt += 1
+            log.warning("leave_channels: %s failed for cid=%s: %s", slot.name, cid, e)
+    return {"session": session_name, "left": left, "errors": errors_cnt}
