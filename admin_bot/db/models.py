@@ -7,6 +7,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    Float,
 )
 from sqlalchemy.orm import relationship, foreign
 
@@ -111,7 +112,7 @@ class Admin(Base):
     __tablename__ = "admins"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    tg_id = Column(BigInteger, unique=True, index=True, nullable=False)
+    tg_id = Column(BigInteger, unique=True, index=True, nullable=True)
     username = Column(String)
     display = Column(String)
 
@@ -132,3 +133,36 @@ class AdminChannel(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     admin_id = Column(Integer, nullable=False)
     channel_id = Column(Integer, nullable=False)
+
+
+class Network(Base):
+    __tablename__ = "networks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    admin_id = Column(Integer, nullable=True)
+    name = Column(String, nullable=False)
+    description = Column(Text)
+    created_at = Column(Integer)
+    updated_at = Column(Integer)
+
+
+class NetworkChannel(Base):
+    __tablename__ = "network_channels"
+    __table_args__ = (
+        UniqueConstraint("network_id", "channel_id", name="uq_network_channel"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    network_id = Column(Integer, nullable=False)
+    channel_id = Column(Integer, nullable=False)
+    price = Column(Float)
+    currency = Column(String)
+    cpm = Column(Float)  # задається вручну
+    expected_views = Column(Integer)  # очікувані перегляди
+    actual_views = Column(Integer)  # фактичні середні перегляди
+    avg_views_30d = Column(Integer)  # середні перегляди за 30 днів
+    last_views = Column(Integer)  # перегляди останнього поста
+    theme = Column(String)  # тематика/теги
+    note = Column(Text)
+    created_at = Column(Integer)
+    updated_at = Column(Integer)

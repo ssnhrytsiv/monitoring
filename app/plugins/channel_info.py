@@ -1,6 +1,7 @@
 import html
 import logging
 import re
+from datetime import datetime
 from typing import Optional
 
 from telethon import events
@@ -29,6 +30,16 @@ def _parse_int(maybe: Optional[str], default: int, min_v=1, max_v=200) -> int:
         return v
     except Exception:
         return default
+
+
+def _fmt_ts(val: Optional[str]) -> str:
+    if val is None or val == "":
+        return "—"
+    try:
+        ts = int(val)
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(val)
 
 
 async def _reply(msg: Message, text: str):
@@ -65,7 +76,7 @@ async def _cmd_channels_owner(event: events.NewMessage.Event):
         un_part = f"@{_esc(username)}" if username else "(без username)"
         ttl = _esc(title) if title else "—"
         st = _esc(last_status) if last_status else "?"
-        out.append(f"• <code>{channel_id}</code> {un_part} — {ttl} — <i>{st}</i> [{_esc(updated_at)}]")
+        out.append(f"• <code>{channel_id}</code> {un_part} — {ttl} — <i>{st}</i> [{_fmt_ts(updated_at)}]")
     await _reply(event.message, "\n".join(out))
 
 
@@ -81,7 +92,7 @@ async def _cmd_recent_channels(event: events.NewMessage.Event):
         un_part = f"@{_esc(username)}" if username else "(—)"
         out.append(
             f"• <code>{channel_id}</code> {un_part} — {_esc(title) or '—'} — <i>{_esc(last_status) or '?'}"
-            f"</i> — owner: {_esc(owner_repr)} — {_esc(updated_at)}"
+            f"</i> — owner: {_esc(owner_repr)} — {_fmt_ts(updated_at)}"
         )
     await _reply(event.message, "\n".join(out))
 
@@ -97,7 +108,7 @@ async def _cmd_recent_links(event: events.NewMessage.Event):
         cid = f"<code>{channel_id}</code>" if channel_id else "—"
         kind_s = kind or "?"
         owner_repr = owner_username or owner_display or "—"
-        out.append(f"• {cid} [{_esc(kind_s)}] {_esc(raw_url)} — owner: {_esc(owner_repr)} ({_esc(added_at)})")
+        out.append(f"• {cid} [{_esc(kind_s)}] {_esc(raw_url)} — owner: {_esc(owner_repr)} ({_fmt_ts(added_at)})")
     await _reply(event.message, "\n".join(out))
 
 
@@ -118,8 +129,8 @@ async def _cmd_channel_info(event: events.NewMessage.Event):
             f"Owner(display): {_esc(ch.get('owner_display')) or '—'}",
             f"Owner(username): {_esc(ch.get('owner_username')) or '—'}",
             f"Last status: {_esc(ch.get('last_status')) or '—'}",
-            f"Created: {_esc(ch.get('created_at')) or '—'}",
-            f"Updated: {_esc(ch.get('updated_at')) or '—'}",
+            f"Created: {_fmt_ts(ch.get('created_at'))}",
+            f"Updated: {_fmt_ts(ch.get('updated_at'))}",
         ]
         return await _reply(event.message, "\n".join(text))
     username_candidate = q.lstrip("@")
@@ -131,7 +142,7 @@ async def _cmd_channel_info(event: events.NewMessage.Event):
         for (channel_id, username, title, last_status, owner_display, owner_username, updated_at) in rows:
             out.append(
                 f"• <code>{channel_id}</code> @{_esc(username) if username else '—'} — {_esc(title) or '—'} — "
-                f"<i>{_esc(last_status) or '?'}</i> owner: {_esc(owner_username or owner_display or '—')} ({_esc(updated_at)})"
+                f"<i>{_esc(last_status) or '?'}</i> owner: {_esc(owner_username or owner_display or '—')} ({_fmt_ts(updated_at)})"
             )
         return await _reply(event.message, "\n".join(out))
     return await _reply(event.message, "⚠️ Некоректний формат. Спробуй: число ID або @username / substring.")

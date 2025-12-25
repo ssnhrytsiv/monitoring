@@ -155,6 +155,27 @@ def fetch_due(limit: int = 20) -> List[Tuple[int, str, int, Optional[int], Optio
         ]
 
 
+def fetch_batch_due(batch_id: str, limit: int = 50) -> List[Tuple[int, str, int, Optional[int], Optional[int], Optional[str], Optional[str]]]:
+    """
+    Повертає чергу для конкретного batch_id, що готова до обробки.
+    (id, url, tries, origin_chat, origin_msg, owner_display, owner_username)
+    """
+    now = int(time.time())
+    with _conn() as c:
+        cur = c.execute(
+            """SELECT id,url,tries,origin_chat,origin_msg,owner_display,owner_username
+               FROM link_queue
+               WHERE state='queued' AND batch_id=? AND next_try_ts<=?
+               ORDER BY added_ts ASC
+               LIMIT ?""",
+            (batch_id, now, limit)
+        )
+        return [
+            (int(r[0]), r[1], int(r[2]), r[3], r[4], r[5], r[6])
+            for r in cur.fetchall()
+        ]
+
+
 def mark_processing(item_id: int):
     with _conn() as c:
         c.execute("UPDATE link_queue SET state='processing' WHERE id=?", (item_id,))

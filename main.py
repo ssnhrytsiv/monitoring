@@ -26,6 +26,8 @@ from app.services.googlesheets.channels_export_service import (
 )
 
 from app.bot.run import run_bot
+from admin_bot.run import run_admin_bot
+from admin_bot.config import ADMIN_BOT_TOKEN
 
 
 def setup_logging():
@@ -39,14 +41,18 @@ async def _main():
     reconciler_task = None
     exporter_task = None
     bot_task = None
+    admin_bot_task = None
 
-    def _log_task_result(t: asyncio.Task):
-        try:
-            t.result()
-        except asyncio.CancelledError:
-            log.warning("Bot UI task cancelled")
-        except Exception:
-            log.exception("Bot UI task crashed")
+    def _log_task_result(name: str):
+        def _inner(t: asyncio.Task):
+            try:
+                t.result()
+            except asyncio.CancelledError:
+                log.warning("%s task cancelled", name)
+            except Exception:
+                log.exception("%s task crashed", name)
+
+        return _inner
 
     log.info("Ініціалізую БД…")
     t0 = time.perf_counter()
@@ -153,10 +159,20 @@ async def _main():
     try:
         log.info("BOT_TOKEN present=%s", bool(os.getenv("BOT_TOKEN")))
         bot_task = asyncio.create_task(run_bot(), name="bot_api_ui")
-        bot_task.add_done_callback(_log_task_result)
+        bot_task.add_done_callback(_log_task_result("Bot UI"))
         log.info("Bot UI task created: %s", bot_task.get_name())
     except Exception:
         log.exception("Failed to start Bot UI task")
+
+    try:
+        if ADMIN_BOT_TOKEN:
+            admin_bot_task = asyncio.create_task(run_admin_bot(), name="admin_bot")
+            admin_bot_task.add_done_callback(_log_task_result("Admin bot"))
+            log.info("Admin bot task created: %s", admin_bot_task.get_name())
+        else:
+            log.info("ADMIN_BOT_TOKEN not set; admin bot is disabled")
+    except Exception:
+        log.exception("Failed to start Admin bot task")
 
     log.info("✅ Бот готовий. Чекаю подій…")
 
@@ -178,6 +194,16 @@ async def _main():
                 log.debug("Bot UI task cancelled")
             except Exception:
                 log.exception("Bot UI task finished with error")
+
+        if admin_bot_task:
+            log.info("Зупиняю admin bot…")
+            admin_bot_task.cancel()
+            try:
+                await admin_bot_task
+            except asyncio.CancelledError:
+                log.debug("Admin bot task cancelled")
+            except Exception:
+                log.exception("Admin bot task finished with error")
 
         if exporter_task:
             log.info("Зупиняю експортер каналів…")
