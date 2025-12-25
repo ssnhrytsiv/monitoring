@@ -110,6 +110,27 @@ def init() -> None:
     _conn.commit()
 
 
+def _extract_username_from_url(raw_url: str) -> Optional[str]:
+    """
+    Витягує username із t.me/@username, якщо це не інвайт (+hash).
+    """
+    if not raw_url:
+        return None
+    url = raw_url.strip()
+    if "+" in url:  # інвайт
+        return None
+    if url.startswith("@"):
+        cand = url.lstrip("@")
+    elif "t.me/" in url:
+        cand = url.split("t.me/", 1)[1]
+    else:
+        return None
+    cand = cand.split("/", 1)[0].strip()
+    if not cand:
+        return None
+    return cand
+
+
 def upsert_channel(
     channel_id: Optional[int],
     username: Optional[str],
@@ -186,6 +207,18 @@ def add_link(
             """,
             (channel_id, raw_url, kind, batch_msg_id, owner_display, owner_username, now),
         )
+        # Якщо канал уже відомий, але username відсутній — пробуємо проставити з посилання.
+        if channel_id:
+            uname = _extract_username_from_url(raw_url)
+            if uname:
+                conn.execute(
+                    """
+                    UPDATE channels
+                    SET username = COALESCE(?, username)
+                    WHERE channel_id = ? AND (username IS NULL OR username = '')
+                    """,
+                    (uname, channel_id),
+                )
         conn.commit()
 
 
