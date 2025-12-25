@@ -64,6 +64,7 @@ _POOL: List[ClientSlot] = []
 _POOL_LOCK = asyncio.Lock()
 _rr = 0  # round-robin індекс
 _limits_checker_task: Optional[asyncio.Task] = None
+_health_checker_task: Optional[asyncio.Task] = None
 
 # ---------- utils ----------
 def _normalize_session_name(name: str) -> str:
@@ -204,6 +205,35 @@ async def _limits_checker_loop() -> None:
         await _check_pool_limits(reason="daily")
         await asyncio.sleep(86400)
 
+
+async def _health_checker_loop() -> None:
+    """
+    Періодично перевіряє стан сесій у пулі:
+    - якщо next_ready в минулому і клієнт відвалився – пробуємо перепідключити
+    - якщо клієнт не авторизований – стартуємо
+    Робимо це обережно, щоб не пересікатися з робочими операціями (busy/next_ready).
+    """
+    while True:
+        now = time.time()
+        for slot in list(_POOL):
+            if slot.busy:
+                continue
+            if slot.next_ready > now:
+                continue
+            try:
+                # Коротка перевірка конекту; якщо ні – перепідключаємо
+                if not slot.client.is_connected():
+                    log.debug("health: reconnecting %s", slot.name)
+                    await _ensure_connected(slot)
+                    continue
+                # Переконуємось, що сесія авторизована
+                if not await slot.client.is_user_authorized():
+                    log.debug("health: re-auth %s", slot.name)
+                    await slot.client.start()
+            except Exception as e:
+                log.debug("health: check failed for %s: %s", slot.name, e)
+        await asyncio.sleep(60)
+
 async def _ensure_connected(slot: ClientSlot) -> None:
     """
     Переконуємось, що клієнт під'єднаний та авторизований.
@@ -288,9 +318,13 @@ async def start_pool() -> None:
     # Плановий щоденний чекер
     if _limits_checker_task is None:
         _limits_checker_task = asyncio.create_task(_limits_checker_loop())
+    # Періодичний health-check
+    global _health_checker_task
+    if _health_checker_task is None:
+        _health_checker_task = asyncio.create_task(_health_checker_loop())
 
 async def stop_pool() -> None:
-    global _limits_checker_task
+    global _limits_checker_task, _health_checker_task
     if _limits_checker_task:
         _limits_checker_task.cancel()
         try:
@@ -298,6 +332,13 @@ async def stop_pool() -> None:
         except Exception:
             pass
         _limits_checker_task = None
+    if _health_checker_task:
+        _health_checker_task.cancel()
+        try:
+            await _health_checker_task
+        except Exception:
+            pass
+        _health_checker_task = None
     for s in _POOL:
         try: await s.client.disconnect()
         except Exception: pass

@@ -78,8 +78,6 @@ def _pool_sessions() -> List[str]:
     for slot in iter_pool_clients():
         try:
             nm = getattr(slot, "name", None) or session_name(slot.client)
-            if nm.endswith(".session"):
-                nm = nm[:-8]
             if nm:
                 names.append(nm)
         except Exception:
@@ -88,12 +86,9 @@ def _pool_sessions() -> List[str]:
 
 
 def _client_by_session(sess: str):
-    target = sess[:-8] if sess.endswith(".session") else sess
     for slot in iter_pool_clients():
         nm = getattr(slot, "name", None) or session_name(slot.client)
-        if nm.endswith(".session"):
-            nm = nm[:-8]
-        if nm == target:
+        if nm == sess:
             return slot.client
     return None
 
@@ -180,7 +175,6 @@ _requested_rl = SlidingWindowRateLimiter(
 
 _flood_cooldown_until: dict[str, float] = defaultdict(float)
 _flood_defer_applied_until: dict[str, float] = defaultdict(float)
-_sess_rr: int = 0  # round-robin offset for session ordering
 
 
 def _in_flood_cooldown(sess: str) -> bool:
@@ -316,13 +310,6 @@ async def run_requested_reconciler() -> None:
             if not sessions:
                 await asyncio.sleep(TICK_SEC)
                 continue
-
-            # rotate session order to spread load more evenly
-            if len(sessions) > 1:
-                global _sess_rr
-                offset = _sess_rr % len(sessions)
-                sessions = sessions[offset:] + sessions[:offset]
-                _sess_rr = (_sess_rr + 1) % len(sessions)
 
             # --- 1) INVITES ---
             if FAIR_INVITES_FETCH:

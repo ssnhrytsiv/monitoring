@@ -4,7 +4,13 @@ import asyncio
 from typing import List, Optional, Dict
 
 from app.services import link_queue
-from app.services.account_pool import lease, session_name, mark_flood, mark_limit, bump_cooldown
+from app.services.account_pool import (
+    iter_ready_pool_clients,
+    session_name,
+    mark_flood,
+    mark_limit,
+    bump_cooldown,
+)
 from app.services.joiner import ensure_join
 from admin_bot.services.channels import upsert_channel_full
 from admin_bot.services.memberships import upsert_membership
@@ -14,6 +20,61 @@ from admin_bot.services.progress import Progress
 from admin_bot.db.session import SessionLocal
 from admin_bot.services import admins as svc_admins
 from admin_bot.services import networks as svc_networks
+
+
+class _RoundRobin:
+    """
+    Мінімальний RR для розподілу URL між готовими слотами пулу.
+    Зберігає кільце і зсуває голову на кожен виклик pick().
+    """
+
+    def __init__(self) -> None:
+        self._ring: List[str] = []
+        self._pos: int = 0
+
+    def _sid(self, slot) -> str:
+        try:
+            return getattr(slot, "name", None) or session_name(slot.client)
+        except Exception:
+            return "unknown"
+
+    def pick(self, slots: List) -> Optional:
+        if not slots:
+            return None
+
+        id_to_slot: Dict[str, any] = {}
+        avail_ids: List[str] = []
+        for s in slots:
+            sid = self._sid(s)
+            if sid not in id_to_slot:
+                id_to_slot[sid] = s
+                avail_ids.append(sid)
+
+        # перебудовуємо кільце, зберігаючи попередній порядок
+        new_ring = [sid for sid in self._ring if sid in avail_ids]
+        for sid in avail_ids:
+            if sid not in new_ring:
+                new_ring.append(sid)
+        self._ring = new_ring
+
+        if not self._ring:
+            return None
+
+        if self._pos >= len(self._ring):
+            self._pos %= len(self._ring)
+
+        head_idx = self._pos
+        ordered_ids = self._ring[head_idx:] + self._ring[:head_idx]
+        self._pos = (head_idx + 1) % len(self._ring)
+
+        for sid in ordered_ids:
+            slot = id_to_slot.get(sid)
+            if slot:
+                return slot
+        return None
+
+
+_RR = _RoundRobin()
 
 
 async def process_batch(
@@ -41,21 +102,25 @@ async def process_batch(
     await progress.start()
 
     result_items: List[Dict] = []
-    ctx = await lease()
-    if ctx is None:
-        # не можемо обробити — залишаємо в queued, повідомляємо
-        for idx, rec in enumerate(urls_rec, start=1):
-            _, url, _, _, _, _, _ = rec
-            result_items.append({"idx": idx, "url": url, "title": None, "status": "no_client", "channel_id": None})
-            await progress.update("no_client", url, None)
-        await progress.finish()
-        db.close()
-        return
+    for idx, rec in enumerate(urls_rec, start=1):
+        item_id, url, tries, origin_chat, origin_msg, od, ou = rec
+        slots = iter_ready_pool_clients()
+        slot = _RR.pick(slots)
+        if slot is None:
+            # немає готових акаунтів — залишаємо цей і решту в черзі
+            pending = urls_rec[idx - 1 :]
+            for j, pend in enumerate(pending, start=idx):
+                _, purl, *_ = pend
+                result_items.append({"idx": j, "url": purl, "title": None, "status": "no_client", "channel_id": None})
+                await progress.update("no_client", purl, None)
+            await progress.finish()
+            db.close()
+            return
 
-    async with ctx as client:
+        client = slot.client
         sess = session_name(client)
-        for idx, rec in enumerate(urls_rec, start=1):
-            item_id, url, tries, origin_chat, origin_msg, od, ou = rec
+        slot.busy = True
+        try:
             link_queue.mark_processing(item_id)
             try:
                 status, title, kind, cid, invite_hash = await ensure_join(client, url)
@@ -79,7 +144,6 @@ async def process_batch(
             status_display = f"{base_status}[{sess}]" if sess else base_status
 
             if cid is None:
-                # ставимо бекоф і залишаємо в черзі
                 link_queue.mark_failed(item_id, base_status, backoff_sec=10)
                 result_items.append({"idx": idx, "url": url, "title": title, "status": status_display, "channel_id": None})
                 await progress.update(status_display, title or url, sess)
@@ -96,7 +160,6 @@ async def process_batch(
             )
             ch = svc_admins.ensure_channel(db, channel_id=cid, username=None, title=title)
             link_res = svc_admins.attach_channel(db, admin_id=admin_id, channel_id=ch.channel_id)
-            # одразу переносимо «сиріт» у базову сітку
             svc_networks.move_orphans_to_primary(db, admin_id)
 
             status_for_report = base_status
@@ -107,7 +170,6 @@ async def process_batch(
                 status_for_report = f"owner_conflict(existing={other_name})"
                 log_conflict(db, channel_id=cid, owner=other_name or "unknown", source_ref=url)
 
-            # у БД зберігаємо статус без сесії
             upsert_membership(db, channel_id=cid, account=sess or "", status=base_status)
             link_queue.mark_done(item_id)
 
@@ -121,6 +183,8 @@ async def process_batch(
                 "channel_id": cid,
             })
             await progress.update(status_display, title or url, sess)
+        finally:
+            slot.busy = False
 
     await progress.finish()
 
