@@ -78,6 +78,8 @@ def _pool_sessions() -> List[str]:
     for slot in iter_pool_clients():
         try:
             nm = getattr(slot, "name", None) or session_name(slot.client)
+            if nm.endswith(".session"):
+                nm = nm[:-8]
             if nm:
                 names.append(nm)
         except Exception:
@@ -86,9 +88,12 @@ def _pool_sessions() -> List[str]:
 
 
 def _client_by_session(sess: str):
+    target = sess[:-8] if sess.endswith(".session") else sess
     for slot in iter_pool_clients():
         nm = getattr(slot, "name", None) or session_name(slot.client)
-        if nm == sess:
+        if nm.endswith(".session"):
+            nm = nm[:-8]
+        if nm == target:
             return slot.client
     return None
 
