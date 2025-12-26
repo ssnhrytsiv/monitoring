@@ -235,6 +235,11 @@ async def process_batch(
                 url_put(url, status_for_report)
             except Exception:
                 pass
+            try:
+                from app.services import channel_db
+                channel_db.add_link(cid, url, kind, origin_msg, owner_display, owner_username)
+            except Exception:
+                pass
 
             status_display = f"{status_for_report}[{sess}]" if sess else status_for_report
             log.info(

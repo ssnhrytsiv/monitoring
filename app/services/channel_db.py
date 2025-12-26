@@ -10,6 +10,7 @@ __all__ = [
     "init",
     "upsert_channel",
     "add_link",
+    "find_channel_by_link",
     "get_channels_by_owner",
     "find_channel",
     "recent_links",
@@ -247,6 +248,35 @@ def get_channel_id_by_url(raw_url: str) -> Optional[int]:
         return None
     try:
         return int(row[0])
+    except Exception:
+        return None
+
+
+def find_channel_by_link(raw_url: str) -> Optional[Tuple[int, Optional[str]]]:
+    """
+    Повертає (channel_id, title) за точним raw_url, якщо він уже з'являвся в links.
+    """
+    if not raw_url:
+        return None
+    conn = _ensure_conn()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT l.channel_id, ch.title
+            FROM links l
+            LEFT JOIN channels ch ON ch.channel_id = l.channel_id
+            WHERE l.raw_url = ?
+            ORDER BY l.id DESC
+            LIMIT 1
+            """,
+            (raw_url,),
+        )
+        row = cur.fetchone()
+    if not row or row[0] is None:
+        return None
+    try:
+        return (int(row[0]), row[1])
     except Exception:
         return None
 

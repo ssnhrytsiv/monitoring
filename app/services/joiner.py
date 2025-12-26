@@ -17,10 +17,11 @@ from app.services.membership_db import (
     map_invite_set, map_invite_get,
     invite_status_get, invite_status_put,
     any_final_for_channel,
-    url_get, url_put,
+    url_put,
     FINAL_GLOBAL,
 )
 from app.utils.tg_links import sanitize_link
+from app.services import channel_db
 from app.services.account_pool import is_already_subscribed
 
 log = logging.getLogger("services.joiner")
@@ -137,16 +138,34 @@ async def ensure_join(client, url: str):
     except Exception:
         cleaned_url = url
 
-    # --- Шорткат по кешу URL (будь-який фінальний статус) ---
-    try:
-        st_cached = url_get(cleaned_url)
-        if st_cached and st_cached in FINAL_GLOBAL:
-            return st_cached, None, "cached", None, None
-    except Exception:
-        pass
+    def _final_from_cache(st: str | None) -> str | None:
+        if not st:
+            return st
+        if st == "joined":
+            return "already"
+        return st
 
     invite_hash = _extract_invite_hash(url)
     is_invite = bool(invite_hash)
+
+    # --- Спроба знайти канал за raw_url у channel_db (якщо вже лінкували) ---
+    if cleaned_url:
+        try:
+            link_row = channel_db.find_channel_by_link(cleaned_url)
+            if link_row:
+                cid_link, title_link = link_row
+                final = any_final_for_channel(cid_link)
+                final_norm = _final_from_cache(final)
+                if final_norm in FINAL_GLOBAL:
+                    log.debug(
+                        "ensure_join(link_cache): final=%s cid=%s url=%s (no network)",
+                        final_norm,
+                        cid_link,
+                        cleaned_url,
+                    )
+                    return final_norm, (title_link or None), "link_cache", cid_link, invite_hash
+        except Exception:
+            pass
 
     try:
         if is_invite:
@@ -164,19 +183,27 @@ async def ensure_join(client, url: str):
                 except Exception:
                     who = None
                 if who:
-                    log.debug("ensure_join(invite): already member via %s; invite=%s, cid=%s",
-                              who, invite_hash, cid_cached)
+                    log.debug(
+                        "ensure_join(invite_cache): already via %s; invite=%s cid=%s (no network)",
+                        who,
+                        invite_hash,
+                        cid_cached,
+                    )
                     invite_status_put(invite_hash, "already")
                     return "already", (title_cached or None), "invite", int(cid_cached), invite_hash
 
                 # 🟢 Глобальна перевірка: якщо в membership_db вже є фінальний статус по цьому каналу,
                 # не робимо мережеву спробу, одразу повертаємо його.
                 try:
-                    final = any_final_for_channel(int(cid_cached))
+                    final = _final_from_cache(any_final_for_channel(int(cid_cached)))
                     if final:
                         invite_status_put(invite_hash, final)
-                        log.debug("ensure_join(invite): short-circuit by membership_db final=%s invite=%s cid=%s",
-                                  final, invite_hash, cid_cached)
+                        log.debug(
+                            "ensure_join(invite_cache): final=%s invite=%s cid=%s (no network)",
+                            final,
+                            invite_hash,
+                            cid_cached,
+                        )
                         return final, (title_cached or None), "invite", int(cid_cached), invite_hash
                 except Exception:
                     pass
@@ -188,7 +215,8 @@ async def ensure_join(client, url: str):
                 pass
             elif st in ("invalid", "private", "requested", "already", "joined", "blocked"):
                 cid_known, title_known = map_invite_get(invite_hash)
-                log.debug("ensure_join(invite): cached status=%s invite=%s cid=%s", st, invite_hash, cid_known)
+                st_norm = _final_from_cache(st)
+                log.debug("ensure_join(invite): cached status=%s(invite=%s cid=%s) -> %s", st, invite_hash, cid_known, st_norm)
 
                 # Якщо в кеші "requested", спробуємо перепитати CheckChatInvite на випадок,
                 # коли канал вже прийняв, щоб прибрати "заявку".
@@ -215,10 +243,10 @@ async def ensure_join(client, url: str):
                     except Exception as e:
                         log.debug("ensure_join(invite): recheck failed invite=%s: %s", invite_hash, e)
 
-                return st, (title_known or None), "invite", (int(cid_known) if cid_known else None), invite_hash
+                return st_norm, (title_known or None), "invite", (int(cid_known) if cid_known else None), invite_hash
 
             # --- КРОК 1: реальна спроба приєднатися
-            log.debug("ensure_join(invite): ImportChatInviteRequest invite=%s", invite_hash)
+            log.debug("ensure_join(invite): ImportChatInviteRequest invite=%s (network)", invite_hash)
             await throttle_invite()
             try:
                 updates = await client(ImportChatInviteRequest(invite_hash))

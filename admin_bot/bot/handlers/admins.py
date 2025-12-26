@@ -7,6 +7,7 @@ import logging
 import asyncio
 import time
 from aiogram.fsm.context import FSMContext
+from aiogram.exceptions import TelegramServerError
 
 from admin_bot.db.session import SessionLocal
 from admin_bot.services import admins as svc_admins
@@ -35,6 +36,21 @@ def _is_allowed(user_id: int | None) -> bool:
     if user_id is None:
         return False
     return user_id in ADMIN_ALLOWED_IDS
+
+
+async def _answer_with_retry(msg: Message, text: str, **kwargs):
+    """
+    Відправляє відповідь з одним повтором на випадок тимчасових 5xx Telegram.
+    """
+    for attempt in range(2):
+        try:
+            return await msg.answer(text, **kwargs)
+        except TelegramServerError as e:
+            if attempt == 0:
+                log.warning("answer retry after TelegramServerError: %s", e)
+                await asyncio.sleep(1)
+            else:
+                raise
 
 
 @router.message(Command("start"))
@@ -168,7 +184,7 @@ async def on_admin_name(m: Message, state: FSMContext):
     try:
         cur_state = await state.get_state()
         log.info("on_admin_name: state=%s chat_id=%s user_id=%s", cur_state, m.chat.id if m.chat else None, m.from_user.id if m.from_user else None)
-        await m.answer("Прийняв ім'я, обробляю…")
+        await _answer_with_retry(m, "Прийняв ім'я, обробляю…")
         data = await state.get_data()
         name_raw = (m.text or "").strip()
         if not name_raw:
@@ -211,7 +227,7 @@ async def on_admin_name(m: Message, state: FSMContext):
             adopt_existing=True,
             reset_next_try=True,
         )
-        await m.answer(f"Додано у чергу {added}/{len(urls)} посилань. Починаю обробку…")
+        await _answer_with_retry(m, f"Додано у чергу {added}/{len(urls)} посилань. Починаю обробку…")
 
         asyncio.create_task(
             process_batch(

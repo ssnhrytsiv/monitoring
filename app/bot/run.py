@@ -1,8 +1,10 @@
 import asyncio
+import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramNetworkError
 
 from app.bot.handlers import router  # центральний router
 from app.bot.notifier import notifier_loop
@@ -13,6 +15,7 @@ async def run_bot():
     if not token:
         raise RuntimeError("BOT_TOKEN env is required")
 
+    log = logging.getLogger("app.bot.run")
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
 
@@ -21,4 +24,15 @@ async def run_bot():
 
     asyncio.create_task(notifier_loop(bot), name="bot_notifier")
 
-    await dp.start_polling(bot)
+    while True:
+        try:
+            await dp.start_polling(bot)
+            break
+        except TelegramNetworkError as e:
+            log.warning("Bot UI polling network error: %s; retrying in 5s", e)
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Bot UI polling crashed")
+            raise
