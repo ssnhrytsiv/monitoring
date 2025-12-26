@@ -337,7 +337,11 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
     if items:
         report_lines = []
         for it in sorted(items, key=lambda t: t.get("idx") or 0):
-            url = it.get("url") or ""
+            raw_url = it.get("url") or ""
+            try:
+                url = sanitize_link(raw_url) or raw_url
+            except Exception:
+                url = raw_url
             status = it.get("status") or ""
             human = _status_human(status)
             idx_val = it.get("idx") or 0
