@@ -333,11 +333,11 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
                 lines.append("  " + _link_line(orig_idx, url, title, status, tag="[дубликат]"))
         sections.append(("🔁 Дубликаты", "\n".join(lines)))
 
-    # Отчет для кнопки: усі посилання + статуси (в порядку обробки/вхідному)
+    # Отчет для кнопки: усі посилання + статуси (в порядку вхідних idx)
     if items:
         report_lines = []
         fallback_idx = 1
-        for it in items:
+        for it in sorted(items, key=lambda t: t.get("idx") or 0):
             raw_url = it.get("url") or ""
             try:
                 url = sanitize_link(raw_url) or raw_url
