@@ -333,66 +333,12 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
                 lines.append("  " + _link_line(orig_idx, url, title, status, tag="[дубликат]"))
         sections.append(("🔁 Дубликаты", "\n".join(lines)))
 
-    # Список у вихідному порядку: показуємо лише проблемні стани біля оригінальної URL
-    if items:
-        # Кеш статусів для сирих/нормалізованих URL
-        url_human: Dict[str, str] = {}
-        for it in items:
-            u = it.get("url") or ""
-            st = it.get("status") or ""
-            human = _status_human(st)
-            if u:
-                url_human[u] = human
-                try:
-                    nu = sanitize_link(u) or u
-                except Exception:
-                    nu = u
-                url_human[nu] = human
-
-        raw_lines_out: List[str] = []
-        URL_RE = re.compile(r"https?://\S+|t\.me/\S+|\+\S+")
-        idx = 1
-        any_url_found = False
-        for line in raw_lines or []:
-            line_found = False
-            cursor = 0
-            buf: List[str] = []
-            for m in URL_RE.finditer(line):
-                if m.start() > cursor:
-                    buf.append(_esc(line[cursor:m.start()]))
-                raw_url = m.group(0)
-                try:
-                    nu = sanitize_link(raw_url) or raw_url
-                except Exception:
-                    nu = raw_url
-                human = url_human.get(nu) or url_status.get(nu)
-                anchor = f'<a href="{_esc(nu)}">{_esc(raw_url)}</a>'
-                buf.append(f"{idx}. {anchor}")
-                buf.append(f" — {human or '…'}")
-                idx += 1
-                line_found = True
-                any_url_found = True
-                cursor = m.end()
-            if cursor < len(line):
-                buf.append(_esc(line[cursor:]))
-            if line_found:
-                raw_lines_out.append("".join(buf))
-
-        # Якщо не знайшли жодного урла в сирих рядках – fallback на items
-        if not any_url_found:
-            for it in items:
-                url = it.get("url") or ""
-                st = it.get("status") or ""
-                human = _status_human(st)
-                if url:
-                    try:
-                        nu = sanitize_link(url) or url
-                    except Exception:
-                        nu = url
-                    raw_lines_out.append(f'{idx}. <a href="{_esc(nu)}">{_esc(nu)}</a> — {human}')
-                    idx += 1
-
-        if raw_lines_out:
-            sections.append(("Отчет", "\n".join(raw_lines_out)))
+    # Отчет для кнопки: лише чисті посилання + статуси
+    if clean_items_raw:
+        report_lines = []
+        for new_idx, (url, title, status) in enumerate(clean_items_raw, start=1):
+            human = _status_human(status)
+            report_lines.append(f"{new_idx}. {url} — {human}")
+        sections.append(("Отчет", "\n".join(report_lines)))
 
     return "\n".join(out), sections
