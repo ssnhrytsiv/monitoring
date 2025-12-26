@@ -32,6 +32,12 @@ from app.services import channel_db
 from app.config import API_ID, API_HASH
 from telethon import TelegramClient
 
+DEFAULT_SESSIONS = [
+    "tg_session.session",
+    "tg_session_2.session",
+    "tg_session_4.session",
+]
+
 
 def _known_channel_ids() -> Set[int]:
     conn = channel_db.raw_connection()
@@ -103,27 +109,30 @@ async def main():
     slots = iter_pool_clients()
     actual_all: Set[int] = set()
 
-    # Якщо пул порожній або потрібна конкретна сесія, яку не знайшли — використовуємо пряме підключення.
-    if (not slots) and target_session:
-        print("Pool is empty, using direct client for session:", target_session)
+    # Якщо пул порожній — спробуємо пряме підключення до вказаної сесії (якщо задана).
+    if not slots:
+        # Пул порожній: пробуємо прямі сесії.
+        direct_sessions = []
+        if target_session:
+            direct_sessions.append(target_session)
+        else:
+            direct_sessions.extend(DEFAULT_SESSIONS)
+
         if not API_ID or not API_HASH:
             print("API_ID/API_HASH not set; cannot create direct client.")
             return
-        client = TelegramClient(target_session, API_ID, API_HASH)
-        await client.connect()
-        actual = await _process_client(client, target_session, known, dry_run, use_pool_leave=False)
-        actual_all.update(actual or set())
-        await client.disconnect()
+
+        for sess_name in direct_sessions:
+            print("Pool is empty, using direct client for session:", sess_name)
+            client = TelegramClient(sess_name, API_ID, API_HASH)
+            await client.connect()
+            actual = await _process_client(client, sess_name, known, dry_run, use_pool_leave=False)
+            actual_all.update(actual or set())
+            await client.disconnect()
         _report_missing_in_sessions(known, actual_all)
         return
-
-    if target_session:
-        slots = [s for s in slots if session_name(s.client) == target_session or getattr(s, "name", None) == target_session]
-        if not slots:
-            available = [session_name(s.client) or getattr(s, "name", None) for s in iter_pool_clients()]
-            print(f"No session '{target_session}' found in pool. Available: {available}")
-            await stop_pool()
-            return
+    elif target_session:
+        print(f"SESSION '{target_session}' provided, but scanning all sessions in pool for completeness.")
 
     for slot in slots:
         actual = await _process_client(slot.client, session_name(slot.client), known, dry_run, use_pool_leave=True)
