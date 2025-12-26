@@ -291,7 +291,7 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
         for admin, lst in conflicts_by_admin.items():
             prefix = f'⚠️ Админ уже есть для этого канала: "{admin}"'
             lines.append(prefix)
-            for orig_idx, url, title, status in sorted(lst, key=lambda t: t[0] or 0):
+            for orig_idx, url, title, status in lst:
                 lines.append("  " + _link_line(orig_idx, url, title, status))
             lines.append("")
         sections.append(("⚠️ Конфликты", "\n".join(line for line in lines if line != "")))
@@ -299,28 +299,28 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
     # Заявки, які ще не прийняті
     if requested_raw:
         lines: List[str] = ["✉️ Заявки отправлены, ожидаем:"]
-        for orig_idx, url, title, status in sorted(requested_raw, key=lambda t: t[0] or 0):
+        for orig_idx, url, title, status in requested_raw:
             lines.append(_link_line(orig_idx, url, title, status))
         sections.append(("✉️ Заявки", "\n".join(lines)))
 
     # Невалідні/приватні/помилки
     if invalid_raw:
         lines: List[str] = ["❌ Невалидные/приватные/ошибки:"]
-        for orig_idx, url, title, status in sorted(invalid_raw, key=lambda t: t[0] or 0):
+        for orig_idx, url, title, status in invalid_raw:
             lines.append(_link_line(orig_idx, url, title, status))
         sections.append(("❌ Ошибки", "\n".join(lines)))
 
     # Дублікати (повтори посилань у пакеті)
     if duplicate_raw:
         lines: List[str] = ["🔁 Дубликаты ссылок (повторы в запросе):"]
-        for orig_idx, url, title, status in sorted(duplicate_raw, key=lambda t: t[0] or 0):
+        for orig_idx, url, title, status in duplicate_raw:
             lines.append(_link_line(orig_idx, url, title, status))
         sections.append(("🔁 Дубликаты ссылок", "\n".join(lines)))
 
     # Дублікати
     if dup_lines_by_cid:
         lines: List[str] = ["🔁 Дубликаты каналов:"]
-        for cid in sorted(dup_lines_by_cid.keys()):
+        for cid in dup_lines_by_cid.keys():
             title = title_by_cid.get(cid)
             if not title:
                 for it in cid_to_items.get(cid, []):
@@ -329,7 +329,7 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
                         break
             header = f"• {title or 'Без назви'} (ID: {cid})"
             lines.append(header)
-            for orig_idx, url, title, status in sorted(dup_lines_by_cid[cid], key=lambda t: t[0] or 0):
+            for orig_idx, url, title, status in dup_lines_by_cid[cid]:
                 lines.append("  " + _link_line(orig_idx, url, title, status, tag="[дубликат]"))
         sections.append(("🔁 Дубликаты", "\n".join(lines)))
 

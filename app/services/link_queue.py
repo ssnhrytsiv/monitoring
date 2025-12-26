@@ -229,7 +229,7 @@ def fetch_batch_due(batch_id: str, limit: int = 50) -> List[Tuple[int, str, int,
             """SELECT id,url,tries,origin_chat,origin_msg,owner_display,owner_username
                FROM link_queue
                WHERE state='queued' AND batch_id=? AND next_try_ts<=?
-               ORDER BY added_ts ASC
+               ORDER BY added_ts ASC, id ASC
                LIMIT ?""",
             (batch_id, now, limit)
         )
