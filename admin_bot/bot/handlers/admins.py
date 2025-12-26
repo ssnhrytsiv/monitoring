@@ -211,19 +211,17 @@ async def on_admin_name(m: Message, state: FSMContext):
             await m.answer("Немає збережених посилань. Почни спочатку.")
             return
 
-        db = next(_db())
-        adm = svc_admins.get_or_create_admin(db, tg_id=None, username=username or data.get("admin_username"), display=display)
-
+        candidate_username = username or data.get("admin_username")
         raw_text = data.get("raw_text") or ""
         batch_id = f"adminbot:{m.chat.id}:{int(time.time())}"
-        log.info("on_admin_name: enqueue batch_id=%s urls=%s admin_id=%s", batch_id, len(urls), adm.id)
+        log.info("on_admin_name: enqueue batch_id=%s urls=%s admin_display=%s username=%s", batch_id, len(urls), display, candidate_username)
         added = link_queue.enqueue(
             urls,
             batch_id=batch_id,
             origin_chat=m.chat.id if m.chat else None,
             origin_msg=m.message_id,
-            owner_display=adm.display,
-            owner_username=adm.username,
+            owner_display=display,
+            owner_username=candidate_username,
             adopt_existing=True,
             reset_next_try=True,
         )
@@ -234,9 +232,9 @@ async def on_admin_name(m: Message, state: FSMContext):
                 batch_id=batch_id,
                 chat_id=m.chat.id,
                 reply_msg=m,
-                admin_id=adm.id,
-                owner_display=adm.display,
-                owner_username=adm.username,
+                admin_display=display,
+                admin_username=candidate_username,
+                admin_tg_id=None,
                 raw_text=raw_text,
             )
         )

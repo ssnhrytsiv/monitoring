@@ -4,6 +4,7 @@ import asyncio
 import logging
 from typing import List, Optional, Dict
 
+from sqlalchemy import select
 from app.services import link_queue
 from app.services.account_pool import (
     iter_ready_pool_clients,
@@ -21,6 +22,7 @@ from admin_bot.services.progress import Progress
 from admin_bot.db.session import SessionLocal
 from admin_bot.services import admins as svc_admins
 from admin_bot.services import networks as svc_networks
+from admin_bot.db import models as m
 from app.logging_json import get_logger, configure_logging
 
 # Гарантований мінімальний логер (на випадок, якщо головний процес не налаштував logging).
@@ -106,9 +108,9 @@ async def process_batch(
     batch_id: str,
     chat_id: int,
     reply_msg,
-    admin_id: int,
-    owner_display: Optional[str],
-    owner_username: Optional[str],
+    admin_display: str,
+    admin_username: Optional[str],
+    admin_tg_id: Optional[int],
     raw_text: str,
 ):
     """
@@ -116,13 +118,7 @@ async def process_batch(
     """
     db = SessionLocal()
     urls_rec = link_queue.fetch_batch_due(batch_id, limit=200)
-    log.info(
-        "queue_worker.start batch_id=%s chat_id=%s admin_id=%s urls=%s",
-        batch_id,
-        chat_id,
-        admin_id,
-        len(urls_rec),
-    )
+    log.info("queue_worker.start batch_id=%s chat_id=%s urls=%s", batch_id, chat_id, len(urls_rec))
     if not urls_rec:
         await reply_msg.answer("Черга порожня або ще не готова.")
         db.close()
@@ -133,6 +129,9 @@ async def process_batch(
     await progress.start()
 
     result_items: List[Dict] = []
+    admin_id: Optional[int] = None
+    current_owner_display = admin_display
+    current_owner_username = admin_username
     for idx, rec in enumerate(urls_rec, start=1):
         item_id, url, tries, origin_chat, origin_msg, od, ou = rec
         slot = await _get_ready_slot()
@@ -204,29 +203,72 @@ async def process_batch(
                 channel_id=cid,
                 username=None,
                 title=title,
-                owner_display=owner_display,
-                owner_username=owner_username,
+                owner_display=current_owner_display,
+                owner_username=current_owner_username,
                 last_status=base_status,
             )
-            ch = svc_admins.ensure_channel(db, channel_id=cid, username=None, title=title)
-            link_res = svc_admins.attach_channel(db, admin_id=admin_id, channel_id=ch.channel_id)
-            svc_networks.move_orphans_to_primary(db, admin_id)
+
+            # Перевіряємо, чи канал уже закріплений за іншим адміном до створення нового
+            other_owner = None
+            other_owner_id = None
+            try:
+                row = db.execute(
+                    select(m.AdminChannel, m.Admin)
+                    .join(m.Admin, m.Admin.id == m.AdminChannel.admin_id)
+                    .where(m.AdminChannel.channel_id == cid)
+                ).first()
+                if row:
+                    _, adm_obj = row
+                    if adm_obj:
+                        other_owner_id = adm_obj.id
+                        other_owner = (adm_obj.display or f"@{adm_obj.username}") if adm_obj else None
+            except Exception:
+                other_owner = None
 
             status_for_report = base_status
-            if link_res.get("status") == "conflict":
-                other_id = link_res.get("admin_id")
-                other = svc_admins.get_admin_by_id(db, other_id) if other_id else None
-                other_name = (other.display or f"@{other.username}") if other else str(other_id)
-                status_for_report = f"owner_conflict(existing={other_name})"
-                log_conflict(db, channel_id=cid, owner=other_name or "unknown", source_ref=url)
+            # owner_conflict: канал уже у іншого адміна і ми ще не створили свого
+            if other_owner_id and (admin_id is None or admin_id != other_owner_id):
+                status_for_report = f"owner_conflict(existing={other_owner})"
+                log_conflict(db, channel_id=cid, owner=other_owner or "unknown", source_ref=url)
                 log.warning(
                     "queue_worker.owner_conflict batch_id=%s idx=%s url=%s sess=%s other=%s",
                     batch_id,
                     idx,
                     url,
                     sess,
-                    other_name,
+                    other_owner,
                 )
+            else:
+                # Створюємо адміна лише перед першою успішною прив'язкою
+                if admin_id is None:
+                    adm_obj = svc_admins.get_or_create_admin(
+                        db,
+                        tg_id=admin_tg_id,
+                        username=admin_username,
+                        display=admin_display,
+                    )
+                    admin_id = adm_obj.id
+                    current_owner_display = adm_obj.display
+                    current_owner_username = adm_obj.username
+
+                ch = svc_admins.ensure_channel(db, channel_id=cid, username=None, title=title)
+                link_res = svc_admins.attach_channel(db, admin_id=admin_id, channel_id=ch.channel_id)
+                svc_networks.move_orphans_to_primary(db, admin_id)
+
+                if link_res.get("status") == "conflict":
+                    other_id = link_res.get("admin_id")
+                    other = svc_admins.get_admin_by_id(db, other_id) if other_id else None
+                    other_name = (other.display or f"@{other.username}") if other else str(other_id)
+                    status_for_report = f"owner_conflict(existing={other_name})"
+                    log_conflict(db, channel_id=cid, owner=other_name or "unknown", source_ref=url)
+                    log.warning(
+                        "queue_worker.owner_conflict batch_id=%s idx=%s url=%s sess=%s other=%s",
+                        batch_id,
+                        idx,
+                        url,
+                        sess,
+                        other_name,
+                    )
 
             upsert_membership(db, channel_id=cid, account=sess or "", status=base_status)
             link_queue.mark_done(item_id)
@@ -237,7 +279,7 @@ async def process_batch(
                 pass
             try:
                 from app.services import channel_db
-                channel_db.add_link(cid, url, kind, origin_msg, owner_display, owner_username)
+                channel_db.add_link(cid, url, kind, origin_msg, current_owner_display, current_owner_username)
             except Exception:
                 pass
 
