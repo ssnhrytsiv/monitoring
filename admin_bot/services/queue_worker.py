@@ -230,6 +230,11 @@ async def process_batch(
 
             upsert_membership(db, channel_id=cid, account=sess or "", status=base_status)
             link_queue.mark_done(item_id)
+            try:
+                from app.services.membership_db import url_put
+                url_put(url, status_for_report)
+            except Exception:
+                pass
 
             status_display = f"{status_for_report}[{sess}]" if sess else status_for_report
             log.info(

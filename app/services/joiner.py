@@ -17,7 +17,10 @@ from app.services.membership_db import (
     map_invite_set, map_invite_get,
     invite_status_get, invite_status_put,
     any_final_for_channel,
+    url_get, url_put,
+    FINAL_GLOBAL,
 )
+from app.utils.tg_links import sanitize_link
 from app.services.account_pool import is_already_subscribed
 
 log = logging.getLogger("services.joiner")
@@ -128,6 +131,20 @@ async def ensure_join(client, url: str):
     status: joined / already / invalid / private / flood_wait_<sec> / too_many /
             blocked / requested / error
     """
+    cleaned_url = None
+    try:
+        cleaned_url = sanitize_link(url) or url
+    except Exception:
+        cleaned_url = url
+
+    # --- Шорткат по кешу URL (будь-який фінальний статус) ---
+    try:
+        st_cached = url_get(cleaned_url)
+        if st_cached and st_cached in FINAL_GLOBAL:
+            return st_cached, None, "cached", None, None
+    except Exception:
+        pass
+
     invite_hash = _extract_invite_hash(url)
     is_invite = bool(invite_hash)
 
@@ -224,12 +241,17 @@ async def ensure_join(client, url: str):
             title = getattr(ch, "title", "?") if ch else "?"
 
             if invite_hash and cid:
-                try:
-                    map_invite_set(invite_hash, cid, title or None)
-                    invite_status_put(invite_hash, "joined")
-                except Exception:
-                    pass
+                    try:
+                        map_invite_set(invite_hash, cid, title or None)
+                        invite_status_put(invite_hash, "joined")
+                    except Exception:
+                        pass
             log.info("ensure_join(invite): joined invite=%s cid=%s title=%r", invite_hash, cid, title)
+            try:
+                if cleaned_url:
+                    url_put(cleaned_url, "joined")
+            except Exception:
+                pass
             return "joined", title, "invite", cid, invite_hash
 
         # --- публічний канал/чат ---
@@ -242,11 +264,21 @@ async def ensure_join(client, url: str):
             title = getattr(ent, "title", "?")
             cid = int(getattr(ent, "id", 0) or 0) or None
             log.info("ensure_join(public): joined url=%s cid=%s title=%r", url, cid, title)
+            try:
+                if cleaned_url:
+                    url_put(cleaned_url, "joined")
+            except Exception:
+                pass
             return "joined", title, "public", cid, invite_hash
         except UserAlreadyParticipantError:
             title = getattr(ent, "title", None)
             cid = int(getattr(ent, "id", 0) or 0) or None
             log.debug("ensure_join(public): already url=%s cid=%s title=%r", url, cid, title)
+            try:
+                if cleaned_url:
+                    url_put(cleaned_url, "already")
+            except Exception:
+                pass
             return "already", title, "public", cid, invite_hash
 
     # ---- обробка винятків ----

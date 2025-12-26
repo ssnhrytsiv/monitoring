@@ -161,6 +161,8 @@ async def _main():
         bot_task = asyncio.create_task(run_bot(), name="bot_api_ui")
         bot_task.add_done_callback(_log_task_result("Bot UI"))
         log.info("Bot UI task created: %s", bot_task.get_name())
+        # Даем обработчику каналов стартовать первым, чтобы не дергать оба токена одновременно.
+        await asyncio.sleep(1.0)
     except Exception:
         log.exception("Failed to start Bot UI task")
 

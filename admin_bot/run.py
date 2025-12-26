@@ -6,6 +6,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramNetworkError
 
 from admin_bot.config import ADMIN_BOT_TOKEN
 from admin_bot.db.session import Base, engine, migrate_admins_nullable
@@ -29,4 +30,15 @@ async def run_admin_bot():
     dp.include_router(router)
 
     log.info("Admin bot starting polling…")
-    await dp.start_polling(bot)
+    while True:
+        try:
+            await dp.start_polling(bot)
+            break
+        except TelegramNetworkError as e:
+            log.warning("Admin bot polling network error: %s; retrying in 5s", e)
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Admin bot polling crashed")
+            raise
