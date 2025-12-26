@@ -87,6 +87,9 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
         tokens = ("invalid", "error", "temp", "blocked", "too_many", "waiting")
         return any(tok in s for tok in tokens)
 
+    def _is_duplicate(status: str) -> bool:
+        return "duplicate" in (status or "").lower()
+
     def _looks_requested(status: str) -> bool:
         """
         Визначаємо заявки максимально надійно:
@@ -120,6 +123,8 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
             human = f"⚠️ Конфликт владельца (закреплен за {conflict_with})".strip()
         elif _looks_requested(status):
             human = "✉️ Заявка отправлена"
+        elif _is_duplicate(status):
+            human = "🔁 Дубликат"
         elif "bot_started" in base:
             human = "🤖 /start отправлено"
         elif "bot_invalid" in base:
@@ -156,6 +161,8 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
     def _should_link_be_clickable(status: str) -> bool:
         s = _strip_conflict(status).lower()
         if _looks_requested(status):
+            return False
+        if _is_duplicate(status):
             return False
         if (
             "invalid" in s
@@ -202,6 +209,7 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
     conflicts_by_admin: Dict[str, List[tuple[int, str, Optional[str], str]]] = {}
     requested_raw: List[tuple[int, str, Optional[str], str]] = []
     invalid_raw: List[tuple[int, str, Optional[str], str]] = []
+    duplicate_raw: List[tuple[int, str, Optional[str], str]] = []
     dup_lines_by_cid: Dict[Any, List[tuple[int, str, Optional[str], str]]] = {}
     title_by_cid: Dict[Any, Optional[str]] = {}
     url_tags: Dict[str, tuple[str, str]] = {}
@@ -223,6 +231,9 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
             cadmin = _conflict_name(status)
             if cadmin:
                 tag_label = f"Дубликат ({cadmin})"
+            tag_emoji = "🔁"
+        elif _is_duplicate(status):
+            tag_label = "Дубликат"
             tag_emoji = "🔁"
         elif admin:
             tag_label = f"Конфликт (owner={admin})"
@@ -258,6 +269,8 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
             invalid_raw.append((idx, url, title, status))
         elif _is_invalid_or_error(status):
             invalid_raw.append((idx, url, title, status))
+        elif _is_duplicate(status):
+            duplicate_raw.append((idx, url, title, status))
         else:
             clean_items_raw.append((url, title, status))
 
@@ -296,6 +309,13 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
         for orig_idx, url, title, status in invalid_raw:
             lines.append(_link_line(orig_idx, url, title, status))
         sections.append(("❌ Ошибки", "\n".join(lines)))
+
+    # Дублікати (повтори посилань у пакеті)
+    if duplicate_raw:
+        lines: List[str] = ["🔁 Дубликаты ссылок (повторы в запросе):"]
+        for orig_idx, url, title, status in duplicate_raw:
+            lines.append(_link_line(orig_idx, url, title, status))
+        sections.append(("🔁 Дубликаты ссылок", "\n".join(lines)))
 
     # Дублікати
     if dup_lines_by_cid:

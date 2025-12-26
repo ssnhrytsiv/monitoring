@@ -10,12 +10,14 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
 
-from app.bot.states import CreateWatch
+from app.bot.states import CreateWatch, BotWatch
 from app.bot.keyboards import main_menu_kb, back_to_menu_kb, yes_no_kb
 from app.services.posts_watch_result_db import create_watch, insert_watch_event
 from app.services.time_utils import msk_now
 from app.bot.services.channels_repo import resolve_cid_by_target, normalize_target_link, get_links_by_channel_ids
 from app.utils.tg_links import sanitize_link
+from app.utils.tg_links import extract_bot_username
+from app.services import bot_watch_db
 
 router = Router()
 log = logging.getLogger("bot_create_watch")
@@ -329,6 +331,56 @@ async def menu_add_watch(cb: CallbackQuery, state: FSMContext):
         "Введи t.me лінк(и) / інвайти / @username каналів, які треба моніторити:",
         reply_markup=back_to_menu_kb()
     )
+
+
+@router.callback_query(F.data == "menu:add_bot_watch")
+async def menu_add_bot_watch(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(BotWatch.bot_input)
+    await cb.message.edit_text(
+        "Надішли лінк/username бота (t.me/... або @username), якого треба відстежити. "
+        "Після цього я попрошу текст очікуваної відповіді.",
+        reply_markup=back_to_menu_kb()
+    )
+
+
+# --- Bot watch flow ---
+
+
+@router.message(BotWatch.bot_input)
+async def bot_watch_bot_input(m: Message, state: FSMContext):
+    raw = (m.text or "").strip()
+    username = extract_bot_username(raw)
+    if not username:
+        await m.answer("Це не схоже на бота (username має закінчуватись на bot/_bot). Надішли інший лінк/username.")
+        return
+    await state.update_data(bot_username=username)
+    await state.set_state(BotWatch.expected_input)
+    await m.answer(
+        f"Бот: @{username}. Надішли текст/повідомлення, який очікуєш отримати від бота (буде порівнюватись дослівно після нормалізації).",
+        reply_markup=back_to_menu_kb()
+    )
+
+
+@router.message(BotWatch.expected_input)
+async def bot_watch_expected_input(m: Message, state: FSMContext):
+    text = (m.text or "").strip()
+    if not text:
+        await m.answer("Очікуваний текст не може бути порожнім. Надішли повідомлення з текстом.")
+        return
+    data = await state.get_data()
+    username = data.get("bot_username")
+    if not username:
+        await m.answer("Не зберіг бота, почни заново.", reply_markup=main_menu_kb())
+        await state.clear()
+        return
+
+    try:
+        wid = bot_watch_db.add_watch(username, text)
+        await m.answer(f"Bot-watch створено: @{username}, watch_id={wid}. Меню:", reply_markup=main_menu_kb())
+    except Exception as e:
+        log.exception("Failed to add bot_watch: %s", e)
+        await m.answer("Не зміг створити bot-watch, спробуй ще раз.", reply_markup=main_menu_kb())
+    await state.clear()
 
 
 @router.message(CreateWatch.channel_input)

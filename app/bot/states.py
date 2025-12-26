@@ -14,3 +14,8 @@ class CreateWatch(StatesGroup):
 class EditWatch(StatesGroup):
     time_window = State()
     source_input = State()
+
+
+class BotWatch(StatesGroup):
+    bot_input = State()
+    expected_input = State()

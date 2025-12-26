@@ -23,6 +23,7 @@ class Progress:
         self.requested = 0
         self.bad = 0
         self.flood = 0
+        self.duplicates = 0
         self.current = ""
         self.actor = ""
         self.footer = ""
@@ -48,7 +49,7 @@ class Progress:
             f"📦 <b>Пакет посилань</b>\n"
             f"{bar}  {self.done}/{self.total}\n"
             f"✅ <b>Подписался:</b> {self.ok}   ☑️ <b>Был подписан:</b> {self.already}\n"
-            f"✉️ <b>Заявки:</b> {self.requested}   ❌ <b>Невалидные/ошибки:</b> {self.bad}   ⏳ <b>Flood:</b> {self.flood}"
+            f"✉️ <b>Заявки:</b> {self.requested}   ❌ <b>Невалидные/ошибки:</b> {self.bad}   ⏳ <b>Flood:</b> {self.flood}   🔁 <b>Дубликаты:</b> {self.duplicates}"
             f"{line_now}{footer}"
         )
 
@@ -73,7 +74,9 @@ class Progress:
         self.done += 1
         self.current = current
         self.actor = actor or ""
-        if "joined" in s:
+        if "duplicate" in s:
+            self.duplicates += 1
+        elif "joined" in s:
             self.ok += 1
         elif "already" in s:
             self.already += 1

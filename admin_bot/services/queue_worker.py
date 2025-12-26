@@ -16,7 +16,13 @@ from app.services.account_pool import (
     bump_cooldown,
 )
 from app.services.joiner import ensure_join, _extract_invite_hash
-from app.services.membership_db import any_final_for_channel, FINAL_GLOBAL, get_any_session_for_channel, map_invite_get
+from app.services.membership_db import (
+    any_final_for_channel,
+    FINAL_GLOBAL,
+    get_any_session_for_channel,
+    map_invite_get,
+    url_get,
+)
 from app.services import channel_db
 from app.services.bot_actions import ensure_bot_started
 from app.utils.throttle import LINK_DELAY_INVITE_MAX, LINK_DELAY_PUBLIC_MAX
@@ -37,6 +43,21 @@ if not logging.getLogger().handlers:
     configure_logging()
 
 log = get_logger("admin_bot.queue_worker")
+
+
+def _norm_keys(url: str) -> List[str]:
+    keys = []
+    if url:
+        keys.append(url)
+    try:
+        from app.utils.tg_links import sanitize_link
+
+        cleaned = sanitize_link(url) or url
+        if cleaned and cleaned not in keys:
+            keys.append(cleaned)
+    except Exception:
+        pass
+    return keys
 
 
 async def _answer_with_retry(msg, text: str, attempts: int = 3, **kwargs):
@@ -183,6 +204,20 @@ async def process_batch(
 
     cnt_invite_need = 0
     cnt_public_need = 0
+    seen_urls: Dict[str, Dict[str, Optional[str]]] = {}
+
+    def _remember_seen(keys: List[str], title: Optional[str] = None, channel_id: Optional[int] = None, session: Optional[str] = None) -> None:
+        for k in keys:
+            if not k:
+                continue
+            entry = seen_urls.get(k, {})
+            if title is not None and entry.get("title") is None:
+                entry["title"] = title
+            if channel_id is not None and entry.get("channel_id") is None:
+                entry["channel_id"] = channel_id
+            if session is not None and entry.get("session") is None:
+                entry["session"] = session
+            seen_urls[k] = entry
 
     for rec in urls_rec:
         _, url, *_ = rec
@@ -244,6 +279,20 @@ async def process_batch(
         except Exception:
             pass
 
+        # 3) url_cache — фінальні стани або duplicate
+        try:
+            ust = url_get(url) or url_get(cleaned)
+        except Exception:
+            ust = None
+        if ust:
+            status_norm = "already" if ust == "joined" else ust
+            if status_norm in FINAL_GLOBAL or status_norm == "duplicate":
+                data = (status_norm, None, None, "url_cache", None)
+                _register_preknown(url, data)
+                if cleaned != url:
+                    _register_preknown(cleaned, data)
+                continue
+
         # Якщо сюди дійшли — мережа потрібна
         if inv_hash:
             cnt_invite_need += 1
@@ -279,6 +328,44 @@ async def process_batch(
         pass
     for idx, rec in enumerate(urls_rec, start=1):
         item_id, url, tries, origin_chat, origin_msg, od, ou = rec
+        norm_keys = _norm_keys(url)
+        existing_seen = None
+        for k in norm_keys:
+            if k in seen_urls:
+                existing_seen = seen_urls[k]
+                break
+        if existing_seen:
+            link_queue.mark_done(item_id)
+            title_dup = existing_seen.get("title")
+            cid_dup = existing_seen.get("channel_id")
+            sess_dup = existing_seen.get("session")
+            status_dup = "duplicate"
+            status_display = f"{status_dup}[{sess_dup}]" if sess_dup else status_dup
+            log.debug(
+                "queue_worker.duplicate batch_id=%s idx=%s url=%s title=%s cid=%s sess=%s",
+                batch_id,
+                idx,
+                url,
+                title_dup,
+                cid_dup,
+                sess_dup,
+            )
+            result_items.append({
+                "idx": idx,
+                "url": url,
+                "title": title_dup,
+                "status": status_display,
+                "channel_id": cid_dup,
+            })
+            await progress.update(status_display, title_dup or url, sess_dup)
+            try:
+                from app.services.membership_db import url_put
+                for k in norm_keys:
+                    url_put(k, status_dup)
+            except Exception:
+                pass
+            continue
+        _remember_seen(norm_keys)
 
         bot_username = extract_bot_username(url)
         if bot_username:
@@ -321,6 +408,7 @@ async def process_batch(
                 )
                 result_items.append({"idx": idx, "url": url, "title": bot_username, "status": status_display, "channel_id": None})
                 await progress.update(status_display, bot_username or url, sess)
+                _remember_seen(norm_keys, title=bot_username, channel_id=None, session=sess)
             except Exception as e:
                 link_queue.mark_failed(item_id, f"bot_error:{e}", backoff_sec=30)
                 log.exception(
@@ -342,6 +430,48 @@ async def process_batch(
         if fast:
             base_status, title, cid, kind, sess = fast
             status_for_report = base_status
+
+            if base_status == "duplicate":
+                link_queue.mark_done(item_id)
+                status_display = f"{status_for_report}[{sess}]" if sess else status_for_report
+                result_items.append({
+                    "idx": idx,
+                    "url": url,
+                    "title": title,
+                    "status": status_display,
+                    "channel_id": cid,
+                })
+                await progress.update(status_display, title or url, sess)
+                try:
+                    from app.services.membership_db import url_put
+                    url_put(url, status_for_report)
+                    for k in _norm_keys(url):
+                        url_put(k, status_for_report)
+                except Exception:
+                    pass
+                _remember_seen(_norm_keys(url), title=title, channel_id=cid, session=sess)
+                continue
+
+            if cid is None:
+                link_queue.mark_done(item_id)
+                status_display = f"{status_for_report}[{sess}]" if sess else status_for_report
+                result_items.append({
+                    "idx": idx,
+                    "url": url,
+                    "title": title,
+                    "status": status_display,
+                    "channel_id": None,
+                })
+                await progress.update(status_display, title or url, sess)
+                try:
+                    from app.services.membership_db import url_put
+                    url_put(url, status_for_report)
+                    for k in _norm_keys(url):
+                        url_put(k, status_for_report)
+                except Exception:
+                    pass
+                _remember_seen(_norm_keys(url), title=title, channel_id=None, session=sess)
+                continue
             try:
                 upsert_channel_full(
                     db,
@@ -445,6 +575,7 @@ async def process_batch(
                 "channel_id": cid,
             })
             await progress.update(status_display, title or url, sess)
+            _remember_seen(norm_keys, title=title, channel_id=cid, session=sess)
             continue
         slot = await _get_ready_slot()
         if slot is None:
@@ -614,6 +745,7 @@ async def process_batch(
                 "channel_id": cid,
             })
             await progress.update(status_display, title or url, sess)
+            _remember_seen(norm_keys, title=title, channel_id=cid, session=sess)
         finally:
             slot.busy = False
 
