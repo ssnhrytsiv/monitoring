@@ -771,7 +771,6 @@ async def process_batch(
             reply_msg,
             pages[0],
             disable_web_page_preview=True,
-            parse_mode="HTML",
             reply_markup=kb,
         )
         if sent:

@@ -73,7 +73,6 @@ async def cb_report_show_sections(cb: CallbackQuery):
         pages[report_idx],
         disable_web_page_preview=True,
         reply_markup=kb,
-        parse_mode="HTML",
     )
     await _safe_answer(cb)
 
@@ -103,6 +102,5 @@ async def cb_report_page_nav(cb: CallbackQuery):
         pages[cur],
         disable_web_page_preview=True,
         reply_markup=kb,
-        parse_mode="HTML",
     )
     await _safe_answer(cb)

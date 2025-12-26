@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from typing import List, Optional, Any, Dict, Tuple
 import re
-from html import escape as _escape
 
 from app.utils.tg_links import sanitize_link
 from app.services import account_pool
@@ -55,9 +54,6 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
       - додаткові: конфлікти, заявки, помилки, дублікати (для окремих кнопок)
       - опційно: сирий список рядків, як прийшли в бот (raw_lines), з позначками проблемних статусів
     """
-
-    def _esc(s: str) -> str:
-        return _escape(s or "")
 
     RE_CONFLICT = re.compile(r"owner_conflict\(existing=([^)]+)\)", re.IGNORECASE)
 
@@ -158,23 +154,6 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
             human = f"{human} [{account_pool.session_display(sess)}]"
         return human
 
-    def _should_link_be_clickable(status: str) -> bool:
-        s = _strip_conflict(status).lower()
-        if _looks_requested(status):
-            return False
-        if _is_duplicate(status):
-            return False
-        if (
-            "invalid" in s
-            or "private" in s
-            or "error" in s
-            or "blocked" in s
-            or "too_many" in s
-            or "flood" in s
-        ):
-            return False
-        return True
-
     def _link_line(idx: int, url: str, title: Optional[str], status: str, tag: str = "") -> str:
         """
         Рендер для всіх, крім блоку заявок (requested_items).
@@ -182,18 +161,8 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
         """
         human_status = _status_human(status)
         suffix = f" {tag}" if tag else ""
-        clickable = _should_link_be_clickable(status)
-
-        if title:
-            title_part = f"{idx}. {_esc(title)}{suffix}"
-        else:
-            title_part = f"{idx}."
-
-        if clickable:
-            link_part = f'<a href="{_esc(url)}">Ссылка</a>'
-            return f"{title_part}\n   {link_part} — {human_status}"
-
-        return f"{title_part}\n   Ссылка: {_esc(url)} — {human_status}"
+        link_part = url or ""
+        return f"{idx}. {link_part} — {human_status}{suffix}"
 
     # --- групування і дублікати ---
 
@@ -275,7 +244,7 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
             clean_items_raw.append((url, title, status))
 
     # ---------- Основний чистий список (ренумерація 1..N) ----------
-    out: List[str] = ["📋 <b>Список:</b>"]
+    out: List[str] = ["📋 Список:"]
     if clean_items_raw:
         for new_idx, (url, title, status) in enumerate(clean_items_raw, start=1):
             out.append(_link_line(new_idx, url, title, status))
@@ -359,22 +328,21 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
             buf: List[str] = []
             for m in URL_RE.finditer(line):
                 if m.start() > cursor:
-                    buf.append(_esc(line[cursor:m.start()]))
+                    buf.append(line[cursor:m.start()])
                 raw_url = m.group(0)
                 try:
                     nu = sanitize_link(raw_url) or raw_url
                 except Exception:
                     nu = raw_url
                 human = url_human.get(nu) or url_status.get(nu)
-                anchor = f'<a href="{_esc(nu)}">{_esc(raw_url)}</a>'
-                buf.append(f"{idx}. {anchor}")
+                buf.append(f"{idx}. {raw_url}")
                 buf.append(f" — {human or '…'}")
                 idx += 1
                 line_found = True
                 any_url_found = True
                 cursor = m.end()
             if cursor < len(line):
-                buf.append(_esc(line[cursor:]))
+                buf.append(line[cursor:])
             if line_found:
                 raw_lines_out.append("".join(buf))
 
@@ -389,7 +357,7 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
                         nu = sanitize_link(url) or url
                     except Exception:
                         nu = url
-                    raw_lines_out.append(f'{idx}. <a href="{_esc(nu)}">{_esc(nu)}</a> — {human}')
+                    raw_lines_out.append(f"{idx}. {nu} — {human}")
                     idx += 1
 
         if raw_lines_out:
