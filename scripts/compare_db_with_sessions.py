@@ -19,10 +19,13 @@ import sys
 from typing import Dict, Iterable, List, Set
 
 from telethon import TelegramClient, types
+from sqlalchemy import delete, select
 
 from app.config import API_HASH, API_ID
 from app.services import channel_db
 from app.services.account_pool import iter_pool_clients, session_name, start_pool, stop_pool
+from admin_bot.db.session import SessionLocal
+from admin_bot.db import models as m
 
 DEFAULT_SESSIONS = [
     "tg_session.session",
@@ -118,6 +121,61 @@ def _report(known: Set[int], per_session: Dict[str, Set[int]]) -> None:
     for cid, title, od, ou in rows:
         owner = od or (f"@{ou}" if ou else "—")
         print(f"  {cid}: {title or '—'} (owner: {owner})")
+
+    # Видалення з БД, якщо не DRY_RUN
+    dry_run = os.getenv("DRY_RUN", "1") not in ("0", "false", "False")
+    if dry_run:
+        print("DRY_RUN=1 → лише показ, без видалення.")
+        return
+
+    _purge_channels(missing)
+
+
+def _purge_channels(missing_ids: List[int]) -> None:
+    """
+    Видаляє записи про канали з усіх пов'язаних таблиць admin_bot БД.
+    """
+    if not missing_ids:
+        return
+
+    db = SessionLocal()
+    try:
+        hashes = list(
+            db.execute(
+                select(m.InviteMap.invite_hash).where(m.InviteMap.channel_id.in_(missing_ids))
+            ).scalars().all()
+        )
+
+        counts = {}
+        counts["admin_channels"] = db.execute(
+            delete(m.AdminChannel).where(m.AdminChannel.channel_id.in_(missing_ids))
+        ).rowcount or 0
+        counts["network_channels"] = db.execute(
+            delete(m.NetworkChannel).where(m.NetworkChannel.channel_id.in_(missing_ids))
+        ).rowcount or 0
+        counts["membership"] = db.execute(
+            delete(m.Membership).where(m.Membership.channel_id.in_(missing_ids))
+        ).rowcount or 0
+        counts["invite_status"] = (
+            db.execute(delete(m.InviteStatus).where(m.InviteStatus.invite_hash.in_(hashes))).rowcount or 0
+            if hashes
+            else 0
+        )
+        counts["invite_map"] = db.execute(
+            delete(m.InviteMap).where(m.InviteMap.channel_id.in_(missing_ids))
+        ).rowcount or 0
+        counts["owner_conflicts"] = db.execute(
+            delete(m.OwnerConflict).where(m.OwnerConflict.channel_id.in_(missing_ids))
+        ).rowcount or 0
+        counts["links"] = db.execute(delete(m.Link).where(m.Link.channel_id.in_(missing_ids))).rowcount or 0
+        counts["channels"] = db.execute(delete(m.Channel).where(m.Channel.channel_id.in_(missing_ids))).rowcount or 0
+        db.commit()
+
+        print("Deleted rows:")
+        for k, v in counts.items():
+            print(f"  {k}: {v}")
+    finally:
+        db.close()
 
 
 async def main():
