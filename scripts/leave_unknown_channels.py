@@ -63,12 +63,12 @@ async def _process_client(client, sess: str, known: Set[int], dry_run: bool, use
     print(f"[{sess}] unknown channels: {missing_count} (will leave={missing_count if not dry_run else 0})")
     print(f"[{sess}] list: {unknown}")
     if dry_run:
-        return
+        return actual
 
     if use_pool_leave:
         res = await leave_channels(sess, unknown)
         print(f"[{sess}] left={res['left']} errors={res['errors']}")
-        return
+        return actual
 
     left, errors_cnt = 0, 0
     for cid in unknown:
@@ -83,6 +83,7 @@ async def _process_client(client, sess: str, known: Set[int], dry_run: bool, use
             print(f"[{sess}] leave failed cid={cid}: {e}")
         await asyncio.sleep(0.5)
     print(f"[{sess}] left={left} errors={errors_cnt}")
+    return actual
 
 
 async def main():
@@ -100,6 +101,7 @@ async def main():
     # Спроба працювати через пул
     await start_pool()
     slots = iter_pool_clients()
+    actual_all: Set[int] = set()
 
     # Якщо пул порожній або потрібна конкретна сесія, яку не знайшли — використовуємо пряме підключення.
     if (not slots) and target_session:
@@ -109,8 +111,10 @@ async def main():
             return
         client = TelegramClient(target_session, API_ID, API_HASH)
         await client.connect()
-        await _process_client(client, target_session, known, dry_run, use_pool_leave=False)
+        actual = await _process_client(client, target_session, known, dry_run, use_pool_leave=False)
+        actual_all.update(actual or set())
         await client.disconnect()
+        _report_missing_in_sessions(known, actual_all)
         return
 
     if target_session:
@@ -122,9 +126,28 @@ async def main():
             return
 
     for slot in slots:
-        await _process_client(slot.client, session_name(slot.client), known, dry_run, use_pool_leave=True)
+        actual = await _process_client(slot.client, session_name(slot.client), known, dry_run, use_pool_leave=True)
+        actual_all.update(actual or set())
 
     await stop_pool()
+    _report_missing_in_sessions(known, actual_all)
+
+
+def _report_missing_in_sessions(known: Set[int], actual_all: Set[int]) -> None:
+    missing = sorted(known - actual_all)
+    if not missing:
+        print("All known channels are present in sessions.")
+        return
+    print(f"Channels present in DB but not in sessions: {len(missing)}")
+    conn = channel_db.raw_connection()
+    rows = conn.execute(
+        "SELECT channel_id, title, owner_display, owner_username FROM channels WHERE channel_id IN (%s)" %
+        ",".join("?" * len(missing)),
+        tuple(missing),
+    ).fetchall()
+    for cid, title, od, ou in rows:
+        owner = od or (f"@{ou}" if ou else "—")
+        print(f"cid={cid} title={title or '—'} owner={owner}")
 
 
 if __name__ == "__main__":
