@@ -16,12 +16,13 @@ from telethon.tl.functions.channels import GetParticipantRequest
 
 from app.services import requested_reconciler_db as rdb
 from app.services import membership_db
+from app.services import link_queue
 from app.services.account_pool import iter_pool_clients, session_name
 from app.services import channel_db  # NEW: for sticky owner from invite
 
 log = logging.getLogger("services.requested_reconciler")
 
-TICK_SEC = int(os.getenv("REQUESTED_RECONCILER_TICK", "60") or "60")
+TICK_SEC = int(os.getenv("REQUESTED_RECONCILER_TICK", str(60 * 60)) or str(60 * 60))
 BATCH_LIMIT = int(os.getenv("REQUESTED_RECONCILER_BATCH", "90") or "90")
 
 # Локальні короткі паузи між запитами
@@ -295,6 +296,16 @@ async def run_requested_reconciler() -> None:
     log.info("requested_reconciler started (tick=%ds, batch=%d)", TICK_SEC, BATCH_LIMIT)
     while True:
         try:
+            # Якщо зараз активні батчі (link_queue має processing), не заважаємо основному воркеру
+            try:
+                active_processing = link_queue.count_processing()
+                if active_processing > 0:
+                    log.debug("[reconciler] skip tick: active processing=%d", active_processing)
+                    await asyncio.sleep(TICK_SEC)
+                    continue
+            except Exception as e:
+                log.debug("[reconciler] active-processing check failed: %s", e)
+
             # Щоденний скидання лічильників requested (раз на зміну дня)
             current_day = int(time.time() // 86400)
             if last_reset_day != current_day:

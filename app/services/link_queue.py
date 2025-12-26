@@ -239,6 +239,16 @@ def fetch_batch_due(batch_id: str, limit: int = 50) -> List[Tuple[int, str, int,
         ]
 
 
+def count_processing() -> int:
+    """
+    Повертає кількість рядків у стані processing (активні батчі).
+    """
+    with _conn() as c:
+        cur = c.execute("SELECT COUNT(*) FROM link_queue WHERE state='processing'")
+        row = cur.fetchone()
+        return int(row[0] or 0) if row else 0
+
+
 def mark_processing(item_id: int):
     with _conn() as c:
         c.execute("UPDATE link_queue SET state='processing' WHERE id=?", (item_id,))

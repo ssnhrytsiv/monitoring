@@ -34,7 +34,7 @@ INVITE_BACKOFF_FACTOR = float(os.getenv("REQUESTED_INVITE_BACKOFF_FACTOR", "2.0"
 REQ_BACKOFF_FACTOR    = float(os.getenv("REQUESTED_BACKOFF_FACTOR", "5.0") or "5.0")
 
 # Мінімальний інтервал до наступної ПОВТОРНОЇ перевірки інвайта
-INVITE_RECHECK_MIN_SEC = int(os.getenv("REQUESTED_RECONCILER_INVITE_RECHECK_MIN_SEC", "200") or "200")
+INVITE_RECHECK_MIN_SEC = int(os.getenv("REQUESTED_RECONCILER_INVITE_RECHECK_MIN_SEC", str(30 * 60)) or str(30 * 60))
 
 # Анти-дребезг для повторних note_requested_invite
 INVITE_NOTE_DEBOUNCE_SEC = int(os.getenv("REQUESTED_RECONCILER_INVITE_NOTE_DEBOUNCE_SEC", "60") or "60")

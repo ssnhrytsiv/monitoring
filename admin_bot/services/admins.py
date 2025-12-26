@@ -37,6 +37,27 @@ def get_or_create_admin(
     return admin
 
 
+def find_admin(
+    db: Session,
+    *,
+    tg_id: Optional[int],
+    username: Optional[str],
+    display: Optional[str],
+) -> Optional[m.Admin]:
+    """
+    Повертає існуючого адміна за tg_id/username/display без створення нового.
+    """
+    admin = None
+
+    if tg_id is not None:
+        admin = db.execute(select(m.Admin).where(m.Admin.tg_id == tg_id)).scalar_one_or_none()
+    if admin is None and username:
+        admin = db.execute(select(m.Admin).where(m.Admin.username == username)).scalar_one_or_none()
+    if admin is None and display:
+        admin = db.execute(select(m.Admin).where(m.Admin.display == display)).scalar_one_or_none()
+    return admin
+
+
 def list_admins(db: Session) -> List[m.Admin]:
     return list(db.execute(select(m.Admin).order_by(m.Admin.id.desc())).scalars())
 

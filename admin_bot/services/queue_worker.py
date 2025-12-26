@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
+import math
 
 from sqlalchemy import select
 from app.services import link_queue
@@ -13,7 +14,11 @@ from app.services.account_pool import (
     mark_limit,
     bump_cooldown,
 )
-from app.services.joiner import ensure_join
+from app.services.joiner import ensure_join, _extract_invite_hash
+from app.services.membership_db import any_final_for_channel, FINAL_GLOBAL, get_any_session_for_channel, map_invite_get
+from app.services import channel_db
+from app.utils.throttle import LINK_DELAY_INVITE_MAX, LINK_DELAY_PUBLIC_MAX
+from app.utils.tg_links import sanitize_link
 from admin_bot.services.channels import upsert_channel_full
 from admin_bot.services.memberships import upsert_membership
 from admin_bot.services.owner_conflicts import log_conflict
@@ -132,8 +137,223 @@ async def process_batch(
     admin_id: Optional[int] = None
     current_owner_display = admin_display
     current_owner_username = admin_username
+
+    # Попередня перевірка: якщо URL уже відомий у channel_db і є фінальний статус у membership_db,
+    # одразу ставимо "already" без мережевих викликів.
+    # --- Підготовка: визначаємо, які URL потребують мережі, а які вже мають фінальний статус ---
+    preknown: Dict[str, Tuple[str, Optional[str], int, str, Optional[str]]] = {}
+    preknown_urls: set[str] = set()
+
+    def _register_preknown(key: str, data: Tuple[str, Optional[str], int, str, Optional[str]]):
+        if not key:
+            return
+        preknown[key] = data
+        preknown_urls.add(key)
+
+    cnt_invite_need = 0
+    cnt_public_need = 0
+
+    for rec in urls_rec:
+        _, url, *_ = rec
+        try:
+            cleaned = sanitize_link(url) or url
+        except Exception:
+            cleaned = url
+
+        # Визначаємо тип
+        inv_hash = _extract_invite_hash(url)
+        # 1) find_channel_by_link (raw/clean)
+        try:
+            link_row = channel_db.find_channel_by_link(url) or channel_db.find_channel_by_link(cleaned)
+            if link_row:
+                cid_link, title_link = link_row
+                final = any_final_for_channel(cid_link)
+                if final:
+                    final_norm = "already" if final == "joined" else final
+                    if final_norm in FINAL_GLOBAL:
+                        sess_known = get_any_session_for_channel(cid_link)
+                        data = (final_norm, title_link, cid_link, "link_cache", sess_known)
+                        _register_preknown(url, data)
+                        if cleaned != url:
+                            _register_preknown(cleaned, data)
+                        continue
+
+            # 1b) get_channel_id_by_url
+            cid_raw = channel_db.get_channel_id_by_url(url) or channel_db.get_channel_id_by_url(cleaned)
+            if cid_raw:
+                final = any_final_for_channel(cid_raw)
+                if final:
+                    final_norm = "already" if final == "joined" else final
+                    if final_norm in FINAL_GLOBAL:
+                        sess_known = get_any_session_for_channel(cid_raw)
+                        data = (final_norm, None, cid_raw, "link_raw", sess_known)
+                        _register_preknown(url, data)
+                        if cleaned != url:
+                            _register_preknown(cleaned, data)
+                        continue
+
+            # 2) Інвайт: якщо знаємо invite_hash -> channel_id і фінальний статус
+            if inv_hash:
+                cid_cached, title_cached = map_invite_get(inv_hash)
+                if cid_cached:
+                    final = any_final_for_channel(int(cid_cached))
+                    if final:
+                        final_norm = "already" if final == "joined" else final
+                        if final_norm in FINAL_GLOBAL:
+                            sess_known = get_any_session_for_channel(int(cid_cached))
+                            data = (final_norm, title_cached, int(cid_cached), "invite_cache", sess_known)
+                            _register_preknown(url, data)
+                            if cleaned != url:
+                                _register_preknown(cleaned, data)
+                            continue
+        except Exception:
+            pass
+
+        # Якщо сюди дійшли — мережа потрібна
+        if inv_hash:
+            cnt_invite_need += 1
+        else:
+            cnt_public_need += 1
+
+    # Якщо є існуючий адмін з такими даними — використовуємо його одразу, щоб уникнути фальшивих owner_conflict
+    db_lookup = SessionLocal()
+    try:
+        existing_admin = svc_admins.find_admin(
+            db_lookup,
+            tg_id=admin_tg_id,
+            username=admin_username,
+            display=admin_display,
+        )
+        if existing_admin:
+            admin_id = existing_admin.id
+            current_owner_display = existing_admin.display
+            current_owner_username = existing_admin.username
+    finally:
+        db_lookup.close()
+
+    # Оцінка часу: лише для тих, що потребують мережі
+    eta_sec = cnt_invite_need * LINK_DELAY_INVITE_MAX + cnt_public_need * LINK_DELAY_PUBLIC_MAX
+    eta_min = math.ceil(eta_sec / 60) if (cnt_invite_need + cnt_public_need) > 0 else 0
+    try:
+        await reply_msg.answer(
+            f"Орієнтовний час підписки: ~{eta_min} хв "
+            f"(інвайтів: {cnt_invite_need} x {LINK_DELAY_INVITE_MAX:.0f}s, "
+            f"публічних: {cnt_public_need} x {LINK_DELAY_PUBLIC_MAX:.0f}s)."
+        )
+    except Exception:
+        pass
     for idx, rec in enumerate(urls_rec, start=1):
         item_id, url, tries, origin_chat, origin_msg, od, ou = rec
+
+        # Швидкий шлях: уже знаємо фінальний статус без мережі
+        fast = preknown.get(url)
+        if fast:
+            base_status, title, cid, kind, sess = fast
+            status_for_report = base_status
+            try:
+                upsert_channel_full(
+                    db,
+                    channel_id=cid,
+                    username=None,
+                    title=title,
+                    owner_display=current_owner_display,
+                    owner_username=current_owner_username,
+                    last_status=base_status,
+                )
+            except Exception:
+                pass
+
+            # owner_conflict check і прив'язка (як звичайно)
+            other_owner = None
+            other_owner_id = None
+            try:
+                row = db.execute(
+                    select(m.AdminChannel, m.Admin)
+                    .join(m.Admin, m.Admin.id == m.AdminChannel.admin_id)
+                    .where(m.AdminChannel.channel_id == cid)
+                ).first()
+                if row:
+                    _, adm_obj = row
+                    if adm_obj:
+                        other_owner_id = adm_obj.id
+                        other_owner = (adm_obj.display or f"@{adm_obj.username}") if adm_obj else None
+            except Exception:
+                other_owner = None
+
+            if other_owner_id and (admin_id is None or admin_id != other_owner_id):
+                status_for_report = f"owner_conflict(existing={other_owner})"
+                log_conflict(db, channel_id=cid, owner=other_owner or "unknown", source_ref=url)
+                log.warning(
+                    "queue_worker.owner_conflict batch_id=%s idx=%s url=%s sess=%s other=%s",
+                    batch_id,
+                    idx,
+                    url,
+                    sess,
+                    other_owner,
+                )
+            else:
+                if admin_id is None:
+                    adm_obj = svc_admins.get_or_create_admin(
+                        db,
+                        tg_id=admin_tg_id,
+                        username=admin_username,
+                        display=admin_display,
+                    )
+                    admin_id = adm_obj.id
+                    current_owner_display = adm_obj.display
+                    current_owner_username = adm_obj.username
+
+                ch = svc_admins.ensure_channel(db, channel_id=cid, username=None, title=title)
+                link_res = svc_admins.attach_channel(db, admin_id=admin_id, channel_id=ch.channel_id)
+                svc_networks.move_orphans_to_primary(db, admin_id)
+
+                if link_res.get("status") == "conflict":
+                    other_id = link_res.get("admin_id")
+                    other = svc_admins.get_admin_by_id(db, other_id) if other_id else None
+                    other_name = (other.display or f"@{other.username}") if other else str(other_id)
+                    status_for_report = f"owner_conflict(existing={other_name})"
+                    log_conflict(db, channel_id=cid, owner=other_name or "unknown", source_ref=url)
+                    log.warning(
+                        "queue_worker.owner_conflict batch_id=%s idx=%s url=%s sess=%s other=%s",
+                        batch_id,
+                        idx,
+                        url,
+                        sess,
+                        other_name,
+                    )
+
+            upsert_membership(db, channel_id=cid, account=(sess or ""), status=base_status)
+            link_queue.mark_done(item_id)
+            try:
+                from app.services.membership_db import url_put
+                url_put(url, status_for_report)
+            except Exception:
+                pass
+            try:
+                channel_db.add_link(cid, url, kind, origin_msg, current_owner_display, current_owner_username)
+            except Exception:
+                pass
+
+            status_display = f"{status_for_report}[{sess}]" if sess else status_for_report
+            log.info(
+                "queue_worker.item_done batch_id=%s idx=%s url=%s status=%s title=%r cid=%s sess=%s (fast-path)",
+                batch_id,
+                idx,
+                url,
+                status_for_report,
+                title,
+                cid,
+                sess,
+            )
+            result_items.append({
+                "idx": idx,
+                "url": url,
+                "title": title,
+                "status": status_display,
+                "channel_id": cid,
+            })
+            await progress.update(status_display, title or url, sess)
+            continue
         slot = await _get_ready_slot()
         if slot is None:
             # немає готових акаунтів навіть після очікування — позначаємо тільки цей елемент
@@ -278,7 +498,6 @@ async def process_batch(
             except Exception:
                 pass
             try:
-                from app.services import channel_db
                 channel_db.add_link(cid, url, kind, origin_msg, current_owner_display, current_owner_username)
             except Exception:
                 pass

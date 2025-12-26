@@ -21,12 +21,12 @@ def _clamp_pair(lo: float, hi: float) -> Tuple[float, float]:
 
 # ---- налаштування затримок (ENV) ----
 # легкі "проби" (CheckChatInviteRequest / get_entity при пробі)
-PROBE_DELAY_MIN = _f("PROBE_DELAY_MIN", "0.45")
-PROBE_DELAY_MAX = _f("PROBE_DELAY_MAX", "1.10")
+PROBE_DELAY_MIN = _f("PROBE_DELAY_MIN", "2.45")
+PROBE_DELAY_MAX = _f("PROBE_DELAY_MAX", "4.10")
 
 # "важкі" дії (імпорт інвайту/джойн) — вже були у тебе як LINK_DELAY_*
-LINK_DELAY_PUBLIC_MIN = _f("LINK_DELAY_PUBLIC_MIN", "8")
-LINK_DELAY_PUBLIC_MAX = _f("LINK_DELAY_PUBLIC_MAX", "12")
+LINK_DELAY_PUBLIC_MIN = _f("LINK_DELAY_PUBLIC_MIN", "35")
+LINK_DELAY_PUBLIC_MAX = _f("LINK_DELAY_PUBLIC_MAX", "50")
 LINK_DELAY_INVITE_MIN = _f("LINK_DELAY_INVITE_MIN", "35")
 LINK_DELAY_INVITE_MAX = _f("LINK_DELAY_INVITE_MAX", "50")
 
