@@ -159,20 +159,6 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
         return human
 
     def _should_link_be_clickable(status: str) -> bool:
-        s = _strip_conflict(status).lower()
-        if _looks_requested(status):
-            return False
-        if _is_duplicate(status):
-            return False
-        if (
-            "invalid" in s
-            or "private" in s
-            or "error" in s
-            or "blocked" in s
-            or "too_many" in s
-            or "flood" in s
-        ):
-            return False
         return True
 
     def _link_line(idx: int, url: str, title: Optional[str], status: str, tag: str = "") -> str:
@@ -255,12 +241,13 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
                 if nu not in url_tags:
                     url_tags[nu] = (tag_emoji, tag_label)
 
-        # Дублікат каналу: зберігаємо у спец секції, але перший візьмемо у clean_items_raw
+        # Дублікат каналу: зберігаємо у спец секції, але перший показуємо у списку
         if cid is not None and cid in dup_cids:
             dup_lines_by_cid.setdefault(cid, []).append((idx, url, title, status))
             title_by_cid.setdefault(cid, title)
-            if len(dup_lines_by_cid[cid]) > 1:
-                continue
+            if len(dup_lines_by_cid[cid]) == 1:
+                clean_items_raw.append((url, title, status))
+            continue
 
         if admin:
             conflicts_by_admin.setdefault(admin, []).append((idx, url, title, status))
@@ -347,7 +334,8 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
             status = it.get("status") or ""
             human = _status_human(status)
             idx_val = it.get("idx") or fallback_idx
-            report_lines.append(f"{idx_val}. {url} — {human}")
+            link_part = f'<a href="{_esc(url)}">{_esc(url)}</a>'
+            report_lines.append(f"{idx_val}. {link_part} — {_esc(human)}")
             fallback_idx += 1
         sections.append(("Отчет", "\n".join(report_lines)))
 
