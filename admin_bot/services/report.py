@@ -333,10 +333,12 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
                 lines.append("  " + _link_line(orig_idx, url, title, status, tag="[дубликат]"))
         sections.append(("🔁 Дубликаты", "\n".join(lines)))
 
-    # Отчет для кнопки: лише чисті посилання + статуси
-    if clean_items_raw:
+    # Отчет для кнопки: усі посилання + статуси (ренумерація 1..N у вихідному порядку)
+    if items:
         report_lines = []
-        for new_idx, (url, title, status) in enumerate(clean_items_raw, start=1):
+        for new_idx, it in enumerate(items, start=1):
+            url = it.get("url") or ""
+            status = it.get("status") or ""
             human = _status_human(status)
             report_lines.append(f"{new_idx}. {url} — {human}")
         sections.append(("Отчет", "\n".join(report_lines)))
