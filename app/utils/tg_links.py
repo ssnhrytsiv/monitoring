@@ -2,6 +2,46 @@
 import re
 from urllib.parse import urlsplit, urlunsplit, SplitResult
 
+
+def extract_bot_username(u: str) -> str | None:
+    """
+    Витягує username бота, якщо посилання/рядок веде на бот (закінчується на bot/_bot).
+    Повертає None, якщо не схоже на бота.
+    """
+    s = (u or "").strip()
+    if not s:
+        return None
+
+    # @username або t.me/username обробляємо через sanitize_link, щоб вирівняти формат
+    try:
+        norm = sanitize_link(s)
+    except Exception:
+        norm = s
+
+    if norm.startswith("@"):
+        username = norm.lstrip("@")
+    else:
+        try:
+            p = urlsplit(norm)
+            if p.netloc.lower() in ("t.me", "telegram.me", "telegram.dog"):
+                username = p.path.lstrip("/").split("?", 1)[0]
+            else:
+                username = None
+        except Exception:
+            username = None
+
+    if not username:
+        return None
+
+    username = username.strip()
+    if not username:
+        return None
+
+    low = username.lower()
+    if low.endswith("bot") or low.endswith("_bot"):
+        return username
+    return None
+
 def sanitize_link(u: str) -> str:
     """
     Нормалізує/«лікує» URL:

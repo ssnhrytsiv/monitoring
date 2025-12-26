@@ -6,6 +6,7 @@ from typing import List, Optional, Dict, Tuple
 import math
 
 from sqlalchemy import select
+from aiogram.exceptions import TelegramRetryAfter, TelegramServerError
 from app.services import link_queue
 from app.services.account_pool import (
     iter_ready_pool_clients,
@@ -17,8 +18,9 @@ from app.services.account_pool import (
 from app.services.joiner import ensure_join, _extract_invite_hash
 from app.services.membership_db import any_final_for_channel, FINAL_GLOBAL, get_any_session_for_channel, map_invite_get
 from app.services import channel_db
+from app.services.bot_actions import ensure_bot_started
 from app.utils.throttle import LINK_DELAY_INVITE_MAX, LINK_DELAY_PUBLIC_MAX
-from app.utils.tg_links import sanitize_link
+from app.utils.tg_links import sanitize_link, extract_bot_username
 from admin_bot.services.channels import upsert_channel_full
 from admin_bot.services.memberships import upsert_membership
 from admin_bot.services.owner_conflicts import log_conflict
@@ -35,6 +37,35 @@ if not logging.getLogger().handlers:
     configure_logging()
 
 log = get_logger("admin_bot.queue_worker")
+
+
+async def _answer_with_retry(msg, text: str, attempts: int = 3, **kwargs):
+    """
+    Send a message with basic handling of Telegram flood/server errors.
+    """
+    chat_id = getattr(getattr(msg, "chat", None), "id", None)
+    for attempt in range(attempts):
+        try:
+            return await msg.answer(text, **kwargs)
+        except TelegramRetryAfter as e:
+            delay = max(1, int(getattr(e, "retry_after", 0)) or 1)
+            log.warning(
+                "queue_worker.answer flood_wait chat_id=%s delay=%ss attempt=%s/%s",
+                chat_id,
+                delay,
+                attempt + 1,
+                attempts,
+            )
+            if attempt + 1 >= attempts:
+                log.error("queue_worker.answer aborted after flood_wait chat_id=%s", chat_id)
+                return None
+            await asyncio.sleep(delay + 0.5)
+        except TelegramServerError as e:
+            if attempt + 1 >= attempts:
+                raise
+            log.warning("queue_worker.answer server_error chat_id=%s err=%s", chat_id, e)
+            await asyncio.sleep(1)
+    return None
 
 
 class _RoundRobin:
@@ -125,7 +156,7 @@ async def process_batch(
     urls_rec = link_queue.fetch_batch_due(batch_id, limit=200)
     log.info("queue_worker.start batch_id=%s chat_id=%s urls=%s", batch_id, chat_id, len(urls_rec))
     if not urls_rec:
-        await reply_msg.answer("Черга порожня або ще не готова.")
+        await _answer_with_retry(reply_msg, "Черга порожня або ще не готова.")
         db.close()
         return
 
@@ -155,6 +186,10 @@ async def process_batch(
 
     for rec in urls_rec:
         _, url, *_ = rec
+        bot_username = extract_bot_username(url)
+        if bot_username:
+            # Боти не рахуються у ETA підписки на канали
+            continue
         try:
             cleaned = sanitize_link(url) or url
         except Exception:
@@ -244,6 +279,63 @@ async def process_batch(
         pass
     for idx, rec in enumerate(urls_rec, start=1):
         item_id, url, tries, origin_chat, origin_msg, od, ou = rec
+
+        bot_username = extract_bot_username(url)
+        if bot_username:
+            slot = await _get_ready_slot()
+            if slot is None:
+                log.warning("queue_worker.no_client batch_id=%s idx=%s url=%s (bot)", batch_id, idx, url)
+                result_items.append({"idx": idx, "url": url, "title": None, "status": "no_client", "channel_id": None})
+                await progress.update("no_client", url, None)
+                continue
+
+            client = slot.client
+            sess = session_name(client)
+            slot.busy = True
+            try:
+                link_queue.mark_processing(item_id)
+                log.debug(
+                    "queue_worker.bot_start start batch_id=%s idx=%s url=%s sess=%s tries=%s",
+                    batch_id,
+                    idx,
+                    url,
+                    sess,
+                    tries,
+                )
+                status, _ = await ensure_bot_started(
+                    client,
+                    url,
+                    owner_display=current_owner_display,
+                    owner_username=current_owner_username,
+                    batch_id=batch_id,
+                )
+                status_display = f"{status}[{sess}]" if sess else status
+                link_queue.mark_done(item_id)
+                log.info(
+                    "queue_worker.bot_start_done batch_id=%s idx=%s url=%s status=%s sess=%s",
+                    batch_id,
+                    idx,
+                    url,
+                    status,
+                    sess,
+                )
+                result_items.append({"idx": idx, "url": url, "title": bot_username, "status": status_display, "channel_id": None})
+                await progress.update(status_display, bot_username or url, sess)
+            except Exception as e:
+                link_queue.mark_failed(item_id, f"bot_error:{e}", backoff_sec=30)
+                log.exception(
+                    "queue_worker.bot_start error batch_id=%s idx=%s url=%s sess=%s tries=%s",
+                    batch_id,
+                    idx,
+                    url,
+                    sess,
+                    tries,
+                )
+                result_items.append({"idx": idx, "url": url, "title": bot_username, "status": f"bot_error[{sess}]", "channel_id": None})
+                await progress.update(f"bot_error[{sess}]", bot_username or url, sess)
+            finally:
+                slot.busy = False
+            continue
 
         # Швидкий шлях: уже знаємо фінальний статус без мережі
         fast = preknown.get(url)
@@ -543,12 +635,25 @@ async def process_batch(
         from admin_bot.services import report_cache
 
         kb = make_report_kb(0, len(pages), has_report=report_idx is not None)
-        sent = await reply_msg.answer(pages[0], disable_web_page_preview=True, reply_markup=kb)
-        report_cache.register(sent.chat.id, sent.message_id, pages, report_idx)
-        log.info(
-            "queue_worker.report_sent batch_id=%s pages=%s report_idx=%s",
-            batch_id,
-            len(pages),
-            report_idx,
+        sent = await _answer_with_retry(
+            reply_msg,
+            pages[0],
+            disable_web_page_preview=True,
+            reply_markup=kb,
         )
+        if sent:
+            report_cache.register(sent.chat.id, sent.message_id, pages, report_idx)
+            log.info(
+                "queue_worker.report_sent batch_id=%s pages=%s report_idx=%s",
+                batch_id,
+                len(pages),
+                report_idx,
+            )
+        else:
+            log.warning(
+                "queue_worker.report_send_skipped batch_id=%s pages=%s chat_id=%s (flood/server error)",
+                batch_id,
+                len(pages),
+                chat_id,
+            )
     db.close()

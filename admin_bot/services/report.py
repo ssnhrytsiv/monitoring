@@ -120,6 +120,14 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
             human = f"⚠️ Конфликт владельца (закреплен за {conflict_with})".strip()
         elif _looks_requested(status):
             human = "✉️ Заявка отправлена"
+        elif "bot_started" in base:
+            human = "🤖 /start отправлено"
+        elif "bot_invalid" in base:
+            human = "❌ Бот не найден"
+        elif "bot_flood" in base:
+            human = "⏳ Flood (бот)"
+        elif "bot_error" in base:
+            human = "❌ Ошибка бота"
         elif "joined" in base:
             human = "✅ Подписался"
         elif "already" in base:

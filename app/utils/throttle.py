@@ -29,6 +29,8 @@ LINK_DELAY_PUBLIC_MIN = _f("LINK_DELAY_PUBLIC_MIN", "35")
 LINK_DELAY_PUBLIC_MAX = _f("LINK_DELAY_PUBLIC_MAX", "50")
 LINK_DELAY_INVITE_MIN = _f("LINK_DELAY_INVITE_MIN", "35")
 LINK_DELAY_INVITE_MAX = _f("LINK_DELAY_INVITE_MAX", "50")
+LINK_DELAY_BOT_MIN = _f("LINK_DELAY_BOT_MIN", "5")
+LINK_DELAY_BOT_MAX = _f("LINK_DELAY_BOT_MAX", "8")
 
 PROBE_DELAY_MIN, PROBE_DELAY_MAX = _clamp_pair(PROBE_DELAY_MIN, PROBE_DELAY_MAX)
 LINK_DELAY_PUBLIC_MIN, LINK_DELAY_PUBLIC_MAX = _clamp_pair(LINK_DELAY_PUBLIC_MIN, LINK_DELAY_PUBLIC_MAX)
@@ -62,6 +64,14 @@ async def throttle_public() -> None:
     """
     delay = random.uniform(LINK_DELAY_PUBLIC_MIN, LINK_DELAY_PUBLIC_MAX)
     log.debug("throttle(public): sleep %.2fs", delay)
+    await asyncio.sleep(delay)
+
+async def throttle_bot() -> None:
+    """
+    Пауза між /start ботам.
+    """
+    delay = random.uniform(LINK_DELAY_BOT_MIN, LINK_DELAY_BOT_MAX)
+    log.debug("throttle(bot): sleep %.2fs", delay)
     await asyncio.sleep(delay)
 
 # ---- наявна у тебе функція (залишаємо для зворотної сумісності) ----

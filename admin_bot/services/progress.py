@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import time
+
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import Message
 
 
@@ -23,6 +27,8 @@ class Progress:
         self.actor = ""
         self.footer = ""
         self.msg_id: int | None = None
+        self._last_sent_at: float | None = None
+        self._last_text: str = ""
 
     @staticmethod
     def _bar(done: int, total: int, width: int = 20) -> str:
@@ -48,8 +54,19 @@ class Progress:
 
     async def start(self) -> None:
         text = self._render(final=False)
-        sent = await self.msg.answer(text, disable_web_page_preview=True)
-        self.msg_id = sent.message_id
+        attempts = 2
+        for attempt in range(attempts):
+            try:
+                sent = await self.msg.answer(text, disable_web_page_preview=True)
+                self.msg_id = sent.message_id
+                self._last_sent_at = time.monotonic()
+                self._last_text = text
+                return
+            except TelegramRetryAfter as e:
+                delay = max(1, int(getattr(e, "retry_after", 0)) or 1)
+                if attempt + 1 >= attempts:
+                    return
+                await asyncio.sleep(delay + 0.5)
 
     async def update(self, status: str, current: str, actor: str | None) -> None:
         s = (status or "").lower()
@@ -67,26 +84,37 @@ class Progress:
         else:
             self.bad += 1
         if self.msg_id:
+            text = self._render(final=False)
+            now = time.monotonic()
+            if text == self._last_text:
+                return
+            if self._last_sent_at is not None and (now - self._last_sent_at) < 5:
+                return
             try:
                 await self.bot.edit_message_text(
                     chat_id=self.chat_id,
                     message_id=self.msg_id,
-                    text=self._render(final=False),
+                    text=text,
                     disable_web_page_preview=True,
                     parse_mode="HTML",
                 )
+                self._last_text = text
+                self._last_sent_at = now
             except Exception:
                 pass
 
     async def finish(self) -> None:
         if self.msg_id:
             try:
+                text = self._render(final=True)
                 await self.bot.edit_message_text(
                     chat_id=self.chat_id,
                     message_id=self.msg_id,
-                    text=self._render(final=True),
+                    text=text,
                     disable_web_page_preview=True,
                     parse_mode="HTML",
                 )
+                self._last_text = text
+                self._last_sent_at = time.monotonic()
             except Exception:
                 pass

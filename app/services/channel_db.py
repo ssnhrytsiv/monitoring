@@ -20,6 +20,8 @@ __all__ = [
     "raw_connection",
     "set_invite_owner",
     "get_invite_owner",
+    "upsert_bot_link",
+    "get_bot_link",
 ]
 
 _DB_PATH = (
@@ -96,6 +98,24 @@ def init() -> None:
     )
 
     _conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            raw_url TEXT,
+            status TEXT,
+            session TEXT,
+            title TEXT,
+            owner_display TEXT,
+            owner_username TEXT,
+            batch_id TEXT,
+            last_ts INTEGER,
+            last_error TEXT
+        )
+        """
+    )
+
+    _conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_channels_channel_id ON channels(channel_id)"
     )
     _conn.execute(
@@ -107,6 +127,8 @@ def init() -> None:
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_links_channel ON links(channel_id)")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_links_owner_usr ON links(owner_username)")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_links_owner_disp ON links(owner_display)")
+    _conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_bot_links_username ON bot_links(username)")
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_bot_links_status ON bot_links(status)")
 
     _conn.commit()
 
@@ -409,6 +431,84 @@ def prune_orphan_links(max_without_channel: int = 10000) -> int:
 
 def raw_connection() -> sqlite3.Connection:
     return _ensure_conn()
+
+
+def upsert_bot_link(
+    username: str,
+    raw_url: Optional[str],
+    status: str,
+    session: Optional[str] = None,
+    title: Optional[str] = None,
+    owner_display: Optional[str] = None,
+    owner_username: Optional[str] = None,
+    batch_id: Optional[str] = None,
+    error: Optional[str] = None,
+) -> None:
+    if not username:
+        return
+    conn = _ensure_conn()
+    now = _now()
+    with _lock:
+        conn.execute(
+            """
+            INSERT INTO bot_links (username, raw_url, status, session, title, owner_display, owner_username, batch_id, last_ts, last_error)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(username) DO UPDATE SET
+                raw_url=excluded.raw_url,
+                status=excluded.status,
+                session=excluded.session,
+                title=excluded.title,
+                owner_display=excluded.owner_display,
+                owner_username=excluded.owner_username,
+                batch_id=excluded.batch_id,
+                last_ts=excluded.last_ts,
+                last_error=excluded.last_error
+            """,
+            (
+                username,
+                raw_url,
+                status,
+                session,
+                title,
+                owner_display,
+                owner_username,
+                batch_id,
+                now,
+                error,
+            ),
+        )
+        conn.commit()
+
+
+def get_bot_link(username: str) -> Optional[Dict[str, Any]]:
+    if not username:
+        return None
+    conn = _ensure_conn()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT username, raw_url, status, session, title, owner_display, owner_username, batch_id, last_ts, last_error
+            FROM bot_links
+            WHERE username = ?
+            """,
+            (username,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "username": row[0],
+        "raw_url": row[1],
+        "status": row[2],
+        "session": row[3],
+        "title": row[4],
+        "owner_display": row[5],
+        "owner_username": row[6],
+        "batch_id": row[7],
+        "last_ts": row[8],
+        "last_error": row[9],
+    }
 
 
 def set_invite_owner(invite_hash: str, owner_display: Optional[str], owner_username: Optional[str]) -> None:
