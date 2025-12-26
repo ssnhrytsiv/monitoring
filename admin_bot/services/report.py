@@ -175,8 +175,8 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
         else:
             title_part = f"{idx}."
 
-        if clickable:
-            link_part = f'<a href="{_esc(url)}">Ссылка</a>'
+        if clickable and url:
+            link_part = f'<a href="{_esc(url)}">{_esc(url)}</a>'
             return f"{title_part}\n   {link_part} — {human_status}"
 
         return f"{title_part}\n   Ссылка: {_esc(url)} — {human_status}"
