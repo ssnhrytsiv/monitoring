@@ -255,11 +255,12 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
                 if nu not in url_tags:
                     url_tags[nu] = (tag_emoji, tag_label)
 
-        # Будь-який дублікат іде в окрему секцію (не показуємо в основному списку)
+        # Дублікат каналу: зберігаємо у спец секції, але перший візьмемо у clean_items_raw
         if cid is not None and cid in dup_cids:
             dup_lines_by_cid.setdefault(cid, []).append((idx, url, title, status))
             title_by_cid.setdefault(cid, title)
-            continue
+            if len(dup_lines_by_cid[cid]) > 1:
+                continue
 
         if admin:
             conflicts_by_admin.setdefault(admin, []).append((idx, url, title, status))
