@@ -64,7 +64,8 @@ async def run_link_queue_worker(client):
                 continue
 
             # fetch_due: (id, url, tries, origin_chat, origin_msg, owner_display, owner_username)
-            items = lq_fetch_due(limit=10)
+            # Ігноруємо батчі admin-бота, щоб не перехоплювати їх чергу.
+            items = lq_fetch_due(limit=10, exclude_batch_prefixes=["adminbot:%"])
             if not items:
                 await _sleep(3)
                 continue

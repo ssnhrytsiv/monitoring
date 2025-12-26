@@ -16,6 +16,7 @@ from telethon.tl.functions.messages import ImportChatInviteRequest,CheckChatInvi
 from app.services.membership_db import (
     map_invite_set, map_invite_get,
     invite_status_get, invite_status_put,
+    any_final_for_channel,
 )
 from app.services.account_pool import is_already_subscribed
 
@@ -150,6 +151,18 @@ async def ensure_join(client, url: str):
                               who, invite_hash, cid_cached)
                     invite_status_put(invite_hash, "already")
                     return "already", (title_cached or None), "invite", int(cid_cached), invite_hash
+
+                # 🟢 Глобальна перевірка: якщо в membership_db вже є фінальний статус по цьому каналу,
+                # не робимо мережеву спробу, одразу повертаємо його.
+                try:
+                    final = any_final_for_channel(int(cid_cached))
+                    if final:
+                        invite_status_put(invite_hash, final)
+                        log.debug("ensure_join(invite): short-circuit by membership_db final=%s invite=%s cid=%s",
+                                  final, invite_hash, cid_cached)
+                        return final, (title_cached or None), "invite", int(cid_cached), invite_hash
+                except Exception:
+                    pass
 
             # --- КРОК 0b: перевірка кешу статусу по invite_hash (без API)
             st = invite_status_get(invite_hash)

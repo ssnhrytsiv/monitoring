@@ -1,7 +1,10 @@
 import os
 import sqlite3
 import time
+import logging
 from typing import List, Optional, Tuple
+
+log = logging.getLogger("services.link_queue")
 
 DB_PATH = os.getenv("DB_PATH", "post_watchdog.sqlite3")
 
@@ -101,10 +104,14 @@ def enqueue(
     origin_msg: Optional[int],
     delay_sec: int = 0,
     owner_display: Optional[str] = None,
-    owner_username: Optional[str] = None
+    owner_username: Optional[str] = None,
+    *,
+    adopt_existing: bool = False,
+    reset_next_try: bool = True,
 ) -> int:
     """
     Додає у чергу нові URL (яких немає у стані queued/processing). Повертає к-сть доданих.
+    Якщо adopt_existing=True — спробує «забрати» існуючий queued-рядок під новий batch_id.
     """
     if not urls:
         return 0
@@ -129,25 +136,81 @@ def enqueue(
                 )
                 count += 1
             except sqlite3.IntegrityError:
-                # вже queued/processing — пропускаємо
-                pass
+                updated = 0
+                if adopt_existing:
+                    try:
+                        next_try = now + max(0, int(delay_sec)) if reset_next_try else None
+                        sql = """
+                            UPDATE link_queue
+                            SET batch_id=?, origin_chat=?, origin_msg=?, owner_display=?, owner_username=? {next_try_clause}
+                            WHERE url=? AND state='queued'
+                        """
+                        clause = ", next_try_ts=?" if next_try is not None else ""
+                        q = sql.format(next_try_clause=clause)
+                        params = [batch_id, origin_chat, origin_msg, owner_display, owner_username]
+                        if next_try is not None:
+                            params.append(next_try)
+                        params.append(u)
+                        cur = c.execute(q, tuple(params))
+                        updated = cur.rowcount or 0
+                    except Exception:
+                        updated = 0
+                if updated:
+                    count += 1
+                    log.info(
+                        "enqueue_adopt_existing url=%s -> batch_id=%s",
+                        u,
+                        batch_id,
+                    )
+                else:
+                    # вже queued/processing — пропускаємо, але логгуємо для діагностики
+                    try:
+                        existing = c.execute(
+                            "SELECT id,state,batch_id,next_try_ts FROM link_queue WHERE url=? AND state IN ('queued','processing')",
+                            (u,),
+                        ).fetchone()
+                        log.info(
+                            "enqueue_skip_existing url=%s state=%s batch_id=%s id=%s next_try_ts=%s",
+                            u,
+                            existing[1] if existing else None,
+                            existing[2] if existing else None,
+                            existing[0] if existing else None,
+                            existing[3] if existing else None,
+                        )
+                    except Exception:
+                        pass
     return count
 
 
-def fetch_due(limit: int = 20) -> List[Tuple[int, str, int, Optional[int], Optional[int], Optional[str], Optional[str]]]:
+def fetch_due(
+    limit: int = 20,
+    exclude_batch_prefixes: Optional[List[str]] = None,
+) -> List[Tuple[int, str, int, Optional[int], Optional[int], Optional[str], Optional[str]]]:
     """
     Повертає список записів, що час їх обробити:
     (id, url, tries, origin_chat, origin_msg, owner_display, owner_username)
     """
     now = int(time.time())
+    prefixes = exclude_batch_prefixes or []
+    conditions = ["state='queued'", "next_try_ts<=?"]
+    params: list = [now]
+    if prefixes:
+        # пропускаємо batch_id, що починаються з указаних префіксів
+        conds = ["batch_id IS NULL"]
+        for pref in prefixes:
+            conds.append("batch_id NOT LIKE ?")
+            params.append(pref)
+        conditions.append("(" + " AND ".join(conds) + ")")
     with _conn() as c:
         cur = c.execute(
             """SELECT id,url,tries,origin_chat,origin_msg,owner_display,owner_username
                FROM link_queue
-               WHERE state='queued' AND next_try_ts<=?
+               WHERE """
+               + " AND ".join(conditions)
+               + """
                ORDER BY added_ts ASC
                LIMIT ?""",
-            (now, limit)
+            (*params, limit)
         )
         return [
             (int(r[0]), r[1], int(r[2]), r[3], r[4], r[5], r[6])

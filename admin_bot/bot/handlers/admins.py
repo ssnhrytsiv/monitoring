@@ -131,7 +131,7 @@ async def on_link_message(m: Message, state: FSMContext):
         raw_text=m.text or m.caption or "",
     )
     await state.set_state(AddAdminFlow.waiting_name)
-    log.info("auto-flow: state set to waiting_name chat_id=%s", m.chat.id if m.chat else None)
+    log.info("auto-flow: state set to waiting_name chat_id=%s urls=%d", m.chat.id if m.chat else None, len(urls))
     await m.answer("Надішли ім'я адміна (обов'язково). Username опційний — вкажи через пробіл після імені.")
 
 
@@ -157,6 +157,7 @@ async def on_any_links(m: Message, state: FSMContext):
         raw_text=m.text or m.caption or "",
     )
     await state.set_state(AddAdminFlow.waiting_name)
+    log.info("auto-flow (no btn): state set to waiting_name chat_id=%s urls=%d", m.chat.id if m.chat else None, len(urls))
     await m.answer("Надішли ім'я адміна (обов'язково). Username опційний — вкажи через пробіл після імені.")
 
 
@@ -188,6 +189,7 @@ async def on_admin_name(m: Message, state: FSMContext):
 
         urls: list[str] = data.get("urls") or []
         if not urls:
+            log.warning("on_admin_name: no urls in state chat_id=%s data_keys=%s", m.chat.id if m.chat else None, list(data.keys()))
             log.warning("on_admin_name: no urls in state chat_id=%s", m.chat.id if m.chat else None)
             await state.clear()
             await m.answer("Немає збережених посилань. Почни спочатку.")
@@ -206,6 +208,8 @@ async def on_admin_name(m: Message, state: FSMContext):
             origin_msg=m.message_id,
             owner_display=adm.display,
             owner_username=adm.username,
+            adopt_existing=True,
+            reset_next_try=True,
         )
         await m.answer(f"Додано у чергу {added}/{len(urls)} посилань. Починаю обробку…")
 
@@ -226,51 +230,3 @@ async def on_admin_name(m: Message, state: FSMContext):
         log.exception("on_admin_name failed")
         await state.clear()
         await m.answer("Сталася помилка під час обробки. Спробуй ще раз.")
-    data = await state.get_data()
-    name = (m.text or "").strip()
-    if not name:
-        await m.answer("Ім'я не може бути порожнім. Надішли ім'я.")
-        return
-    parts = name.split(maxsplit=1)
-    display = parts[0].strip()
-    username = None
-    if len(parts) == 2 and parts[1].startswith("@"):
-        username = parts[1].lstrip("@")
-
-    urls: list[str] = data.get("urls") or []
-    if not urls:
-        await state.clear()
-        await m.answer("Немає збережених посилань. Почни спочатку.")
-        return
-
-    adm_tg_id = data.get("admin_tg_id")
-
-    db = next(_db())
-    adm = svc_admins.get_or_create_admin(db, tg_id=adm_tg_id, username=username or data.get("admin_username"), display=display)
-
-    raw_text = data.get("raw_text") or ""
-    batch_id = f"adminbot:{m.chat.id}:{int(time.time())}"
-    added = link_queue.enqueue(
-        urls,
-        batch_id=batch_id,
-        origin_chat=m.chat.id if m.chat else None,
-        origin_msg=m.message_id,
-        owner_display=adm.display,
-        owner_username=adm.username,
-    )
-    await m.answer(f"Додано у чергу {added}/{len(urls)} посилань. Починаю обробку…")
-
-    # Запускаємо обробку батчу у фоновому таску
-    asyncio.create_task(
-        process_batch(
-            batch_id=batch_id,
-            chat_id=m.chat.id,
-            reply_msg=m,
-            admin_id=adm.id,
-            owner_display=adm.display,
-            owner_username=adm.username,
-            raw_text=raw_text,
-        )
-    )
-
-    await state.clear()

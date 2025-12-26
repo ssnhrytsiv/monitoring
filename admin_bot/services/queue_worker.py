@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import List, Optional, Dict
 
 from app.services import link_queue
@@ -20,6 +21,13 @@ from admin_bot.services.progress import Progress
 from admin_bot.db.session import SessionLocal
 from admin_bot.services import admins as svc_admins
 from admin_bot.services import networks as svc_networks
+from app.logging_json import get_logger, configure_logging
+
+# Гарантований мінімальний логер (на випадок, якщо головний процес не налаштував logging).
+if not logging.getLogger().handlers:
+    configure_logging()
+
+log = get_logger("admin_bot.queue_worker")
 
 
 class _RoundRobin:
@@ -77,6 +85,22 @@ class _RoundRobin:
 _RR = _RoundRobin()
 
 
+async def _get_ready_slot(max_wait_sec: int = 30, step: float = 2.0):
+    """
+    Чекає появи готового клієнта з пулу (не busy, без кулдауна).
+    Повертає slot або None після таймауту.
+    """
+    waited = 0.0
+    while waited <= max_wait_sec:
+        slots = iter_ready_pool_clients()
+        slot = _RR.pick(slots)
+        if slot:
+            return slot
+        await asyncio.sleep(step)
+        waited += step
+    return None
+
+
 async def process_batch(
     *,
     batch_id: str,
@@ -92,6 +116,13 @@ async def process_batch(
     """
     db = SessionLocal()
     urls_rec = link_queue.fetch_batch_due(batch_id, limit=200)
+    log.info(
+        "queue_worker.start batch_id=%s chat_id=%s admin_id=%s urls=%s",
+        batch_id,
+        chat_id,
+        admin_id,
+        len(urls_rec),
+    )
     if not urls_rec:
         await reply_msg.answer("Черга порожня або ще не готова.")
         db.close()
@@ -104,18 +135,13 @@ async def process_batch(
     result_items: List[Dict] = []
     for idx, rec in enumerate(urls_rec, start=1):
         item_id, url, tries, origin_chat, origin_msg, od, ou = rec
-        slots = iter_ready_pool_clients()
-        slot = _RR.pick(slots)
+        slot = await _get_ready_slot()
         if slot is None:
-            # немає готових акаунтів — залишаємо цей і решту в черзі
-            pending = urls_rec[idx - 1 :]
-            for j, pend in enumerate(pending, start=idx):
-                _, purl, *_ = pend
-                result_items.append({"idx": j, "url": purl, "title": None, "status": "no_client", "channel_id": None})
-                await progress.update("no_client", purl, None)
-            await progress.finish()
-            db.close()
-            return
+            # немає готових акаунтів навіть після очікування — позначаємо тільки цей елемент
+            log.warning("queue_worker.no_client batch_id=%s idx=%s url=%s", batch_id, idx, url)
+            result_items.append({"idx": idx, "url": url, "title": None, "status": "no_client", "channel_id": None})
+            await progress.update("no_client", url, None)
+            continue
 
         client = slot.client
         sess = session_name(client)
@@ -123,8 +149,24 @@ async def process_batch(
         try:
             link_queue.mark_processing(item_id)
             try:
+                log.debug(
+                    "queue_worker.ensure_join start batch_id=%s idx=%s url=%s sess=%s tries=%s",
+                    batch_id,
+                    idx,
+                    url,
+                    sess,
+                    tries,
+                )
                 status, title, kind, cid, invite_hash = await ensure_join(client, url)
             except Exception as e:
+                log.exception(
+                    "queue_worker.ensure_join error batch_id=%s idx=%s url=%s sess=%s tries=%s",
+                    batch_id,
+                    idx,
+                    url,
+                    sess,
+                    tries,
+                )
                 status, title, cid = f"error:{e}", None, None
 
             # маркування кулдаунів/флуду
@@ -138,13 +180,21 @@ async def process_batch(
             elif status == "too_many":
                 mark_limit(client)
             else:
-                bump_cooldown(client, 2)
+                bump_cooldown(client, 1)
 
             base_status = status or "unknown"
             status_display = f"{base_status}[{sess}]" if sess else base_status
 
             if cid is None:
                 link_queue.mark_failed(item_id, base_status, backoff_sec=10)
+                log.info(
+                    "queue_worker.item_failed batch_id=%s idx=%s url=%s status=%s sess=%s",
+                    batch_id,
+                    idx,
+                    url,
+                    base_status,
+                    sess,
+                )
                 result_items.append({"idx": idx, "url": url, "title": title, "status": status_display, "channel_id": None})
                 await progress.update(status_display, title or url, sess)
                 continue
@@ -169,11 +219,29 @@ async def process_batch(
                 other_name = (other.display or f"@{other.username}") if other else str(other_id)
                 status_for_report = f"owner_conflict(existing={other_name})"
                 log_conflict(db, channel_id=cid, owner=other_name or "unknown", source_ref=url)
+                log.warning(
+                    "queue_worker.owner_conflict batch_id=%s idx=%s url=%s sess=%s other=%s",
+                    batch_id,
+                    idx,
+                    url,
+                    sess,
+                    other_name,
+                )
 
             upsert_membership(db, channel_id=cid, account=sess or "", status=base_status)
             link_queue.mark_done(item_id)
 
             status_display = f"{status_for_report}[{sess}]" if sess else status_for_report
+            log.info(
+                "queue_worker.item_done batch_id=%s idx=%s url=%s status=%s title=%r cid=%s sess=%s",
+                batch_id,
+                idx,
+                url,
+                status_for_report,
+                title,
+                cid,
+                sess,
+            )
 
             result_items.append({
                 "idx": idx,
@@ -206,4 +274,10 @@ async def process_batch(
         kb = make_report_kb(0, len(pages), has_report=report_idx is not None)
         sent = await reply_msg.answer(pages[0], disable_web_page_preview=True, reply_markup=kb)
         report_cache.register(sent.chat.id, sent.message_id, pages, report_idx)
+        log.info(
+            "queue_worker.report_sent batch_id=%s pages=%s report_idx=%s",
+            batch_id,
+            len(pages),
+            report_idx,
+        )
     db.close()

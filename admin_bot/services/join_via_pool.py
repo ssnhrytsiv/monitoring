@@ -69,7 +69,7 @@ async def ensure_join_via_pool(url: str) -> Dict[str, Any]:
     elif status == "too_many":
         mark_limit(client)
     else:
-        bump_cooldown(client, 2)
+        bump_cooldown(client, 1)
 
     return {
         "status": status,
