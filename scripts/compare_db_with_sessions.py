@@ -1,0 +1,150 @@
+"""
+Збирає підписки по кожній сесії, об'єднує їх і звіряє з БД каналів.
+
+Кроки:
+ 1) Для кожної сесії читає всі dialog'и і витягує channel_id (Channel і Chat).
+ 2) Будує union усіх channel_id по сесіях.
+ 3) Зчитує channel_id з БД (таблиця channels).
+ 4) Показує, які channel_id є в БД, але відсутні в union сесій.
+
+Запуск:
+    python -m scripts.compare_db_with_sessions
+    SESSIONS=foo.session,bar.session python -m scripts.compare_db_with_sessions   # перелік через кому для прямого підключення
+    SKIP_POOL=1 python -m scripts.compare_db_with_sessions                        # пропустити пул і піти напряму
+"""
+
+import asyncio
+import os
+import sys
+from typing import Dict, Iterable, List, Set
+
+from telethon import TelegramClient, types
+
+from app.config import API_HASH, API_ID
+from app.services import channel_db
+from app.services.account_pool import iter_pool_clients, session_name, start_pool, stop_pool
+
+DEFAULT_SESSIONS = [
+    "tg_session.session",
+    "tg_session_2.session",
+    "tg_session_4.session",
+]
+
+
+def _known_channel_ids() -> Set[int]:
+    conn = channel_db.raw_connection()
+    cur = conn.execute("SELECT channel_id FROM channels WHERE channel_id IS NOT NULL")
+    return {int(r[0]) for r in cur.fetchall() if r and r[0] is not None}
+
+
+async def _collect_session_channels(client) -> Set[int]:
+    result: Set[int] = set()
+    async for dlg in client.iter_dialogs():
+        ent = dlg.entity
+        if isinstance(ent, (types.Channel, types.Chat)):
+            try:
+                result.add(int(ent.id))
+            except Exception:
+                continue
+    return result
+
+
+async def _collect_from_pool() -> Dict[str, Set[int]]:
+    per_session: Dict[str, Set[int]] = {}
+    await start_pool()
+    try:
+        slots = list(iter_pool_clients())
+        for slot in slots:
+            sess_name = session_name(slot.client)
+            ids = await _collect_session_channels(slot.client)
+            per_session[sess_name] = ids
+            print(f"[pool] {sess_name}: collected {len(ids)} channel ids")
+    finally:
+        try:
+            await stop_pool()
+        except asyncio.CancelledError:
+            # ignore cancellation from background tasks that we explicitly stop
+            pass
+    return per_session
+
+
+async def _collect_direct(sessions: Iterable[str]) -> Dict[str, Set[int]]:
+    per_session: Dict[str, Set[int]] = {}
+    if not API_ID or not API_HASH:
+        print("API_ID/API_HASH not set; cannot collect without пул.")
+        return per_session
+
+    for sess_name in sessions:
+        sess_name = sess_name.strip()
+        if not sess_name:
+            continue
+        client = TelegramClient(sess_name, API_ID, API_HASH)
+        await client.connect()
+        ids = await _collect_session_channels(client)
+        per_session[sess_name] = ids
+        print(f"[direct] {sess_name}: collected {len(ids)} channel ids")
+        await client.disconnect()
+    return per_session
+
+
+def _union(per_session: Dict[str, Set[int]]) -> Set[int]:
+    union: Set[int] = set()
+    for ids in per_session.values():
+        union.update(ids)
+    return union
+
+
+def _report(known: Set[int], per_session: Dict[str, Set[int]]) -> None:
+    union_ids = _union(per_session)
+    missing = sorted(known - union_ids)
+    print("--- Summary ---")
+    print(f"Sessions processed: {len(per_session)}")
+    for sess, ids in per_session.items():
+        print(f"  {sess}: {len(ids)} channel ids")
+    print(f"DB channel ids: {len(known)}")
+    print(f"Union of sessions: {len(union_ids)}")
+    print(f"Missing in sessions but present in DB: {len(missing)}")
+
+    if not missing:
+        return
+
+    conn = channel_db.raw_connection()
+    placeholders = ",".join("?" for _ in missing)
+    rows = conn.execute(
+        f"SELECT channel_id, title, owner_display, owner_username FROM channels WHERE channel_id IN ({placeholders})",
+        tuple(missing),
+    ).fetchall()
+    print("Details (cid, title, owner):")
+    for cid, title, od, ou in rows:
+        owner = od or (f"@{ou}" if ou else "—")
+        print(f"  {cid}: {title or '—'} (owner: {owner})")
+
+
+async def main():
+    channel_db.init()
+    known = _known_channel_ids()
+
+    target_sessions: List[str] = []
+    env_sessions = os.getenv("SESSIONS")
+    if env_sessions:
+        target_sessions = [s.strip() for s in env_sessions.split(",") if s.strip()]
+    elif len(sys.argv) > 1:
+        target_sessions = [s.strip() for s in sys.argv[1].split(",") if s.strip()]
+
+    skip_pool = os.getenv("SKIP_POOL") in ("1", "true", "True") or os.getenv("USE_POOL") in ("0", "false", "False")
+
+    per_session: Dict[str, Set[int]] = {}
+    if not skip_pool:
+        per_session = await _collect_from_pool()
+
+    if skip_pool or not per_session:
+        print("Pool is empty, using direct sessions.")
+        if not target_sessions:
+            target_sessions = DEFAULT_SESSIONS
+        per_session = await _collect_direct(target_sessions)
+
+    _report(known, per_session)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
