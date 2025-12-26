@@ -166,6 +166,10 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
         Рендер для всіх, крім блоку заявок (requested_items).
         Для заявок використовуємо окрему гілку нижче.
         """
+        try:
+            normalized_url = sanitize_link(url) if url else url
+        except Exception:
+            normalized_url = url
         human_status = _status_human(status)
         suffix = f" {tag}" if tag else ""
         clickable = _should_link_be_clickable(status)
@@ -175,8 +179,9 @@ def build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) 
         else:
             title_part = f"{idx}."
 
-        if clickable and url:
-            link_part = f'<a href="{_esc(url)}">{_esc(url)}</a>'
+        href = normalized_url or url
+        if clickable and href:
+            link_part = f'<a href="{_esc(href)}">Ссылка</a>'
             return f"{title_part}\n   {link_part} — {human_status}"
 
         return f"{title_part}\n   Ссылка: {_esc(url)} — {human_status}"
