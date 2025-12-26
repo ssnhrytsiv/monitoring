@@ -69,7 +69,12 @@ async def cb_report_show_sections(cb: CallbackQuery):
         return
     entry["page"] = report_idx
     kb = make_report_kb(report_idx, len(pages), has_report=True)
-    await cb.message.edit_text(pages[report_idx], disable_web_page_preview=True, reply_markup=kb)
+    await cb.message.edit_text(
+        pages[report_idx],
+        disable_web_page_preview=True,
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
     await _safe_answer(cb)
 
 
@@ -94,5 +99,10 @@ async def cb_report_page_nav(cb: CallbackQuery):
         cur = (cur + 1) % total
     entry["page"] = cur
     kb = make_report_kb(cur, total, has_report=entry.get("report_idx") is not None)
-    await cb.message.edit_text(pages[cur], disable_web_page_preview=True, reply_markup=kb)
+    await cb.message.edit_text(
+        pages[cur],
+        disable_web_page_preview=True,
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
     await _safe_answer(cb)
