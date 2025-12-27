@@ -189,7 +189,6 @@ async def ensure_join(client, url: str):
                         invite_hash,
                         cid_cached,
                     )
-                    invite_status_put(invite_hash, "already")
                     return "already", (title_cached or None), "invite", int(cid_cached), invite_hash
 
                 # 🟢 Глобальна перевірка: якщо в membership_db вже є фінальний статус по цьому каналу,
@@ -197,7 +196,9 @@ async def ensure_join(client, url: str):
                 try:
                     final = _final_from_cache(any_final_for_channel(int(cid_cached)))
                     if final:
-                        invite_status_put(invite_hash, final)
+                        # кешуємо лише негативні/нейтральні стани, "already/joined" залишаємо для membership
+                        if final not in ("joined", "already"):
+                            invite_status_put(invite_hash, final)
                         log.debug(
                             "ensure_join(invite_cache): final=%s invite=%s cid=%s (no network)",
                             final,
@@ -213,7 +214,7 @@ async def ensure_join(client, url: str):
             # Кешований too_many прив'язаний до інвайта, але це ліміт акаунта, тож його ігноруємо.
             if st == "too_many":
                 pass
-            elif st in ("invalid", "private", "requested", "already", "joined", "blocked"):
+            elif st in ("invalid", "private", "requested", "blocked"):
                 cid_known, title_known = map_invite_get(invite_hash)
                 st_norm = _final_from_cache(st)
                 log.debug("ensure_join(invite): cached status=%s(invite=%s cid=%s) -> %s", st, invite_hash, cid_known, st_norm)
@@ -230,7 +231,6 @@ async def ensure_join(client, url: str):
                         if cid_new:
                             try:
                                 map_invite_set(invite_hash, cid_new, title_new or None)
-                                invite_status_put(invite_hash, "already")
                             except Exception:
                                 pass
                             log.info("ensure_join(invite): requested->already via recheck invite=%s cid=%s", invite_hash, cid_new)
@@ -271,7 +271,6 @@ async def ensure_join(client, url: str):
             if invite_hash and cid:
                     try:
                         map_invite_set(invite_hash, cid, title or None)
-                        invite_status_put(invite_hash, "joined")
                     except Exception:
                         pass
             log.info("ensure_join(invite): joined invite=%s cid=%s title=%r", invite_hash, cid, title)

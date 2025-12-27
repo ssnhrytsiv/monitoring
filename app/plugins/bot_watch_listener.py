@@ -10,7 +10,7 @@ from telethon.tl.types import Message
 from app.services.account_pool import iter_pool_clients, session_name
 from app.utils.tg_links import extract_bot_username
 from app.services import channel_db
-from app.services import bot_watch_db
+from app.services import bot_watch_db, bot_template_db
 from app.utils.html_normalize import normalize_html_full
 
 log = logging.getLogger("plugin.bot_watch_listener")
@@ -61,6 +61,14 @@ def _attach_listener_for_client(cli):
                 expected_norm = row.get("expected_norm") or ""
                 if not expected_norm:
                     continue
+                log.debug(
+                    "bot_watch_listener: try match wid=%s bot=%s session=%s expected=%.120s got=%.120s",
+                    wid,
+                    bot_user,
+                    sess,
+                    expected_norm,
+                    msg_norm,
+                )
                 if msg_norm == expected_norm:
                     bot_watch_db.mark_matched(wid, msg.id, sess)
                     log.info("bot_watch_listener: matched wid=%s bot=%s session=%s", wid, bot_user, sess)
@@ -86,6 +94,7 @@ def _attach_listener_for_client(cli):
 
 def setup(**_):
     bot_watch_db.init()
+    bot_template_db.init()
     for slot in iter_pool_clients():
         try:
             _attach_listener_for_client(slot.client)

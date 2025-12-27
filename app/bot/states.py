@@ -19,3 +19,5 @@ class EditWatch(StatesGroup):
 class BotWatch(StatesGroup):
     bot_input = State()
     expected_input = State()
+    time_window = State()
+    confirm = State()

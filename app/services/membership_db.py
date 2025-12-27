@@ -267,6 +267,36 @@ def invite_status_get(invite_or_hash: str) -> Optional[str]:
         return row[0] if row else None
 
 
+def invite_status_delete(invite_hashes: list[str], statuses: Optional[list[str]] = None) -> int:
+    """
+    Видаляє записи з invite_status для переданих хешів.
+    Якщо вказані statuses — обмежуємося цими статусами.
+    Повертає кількість видалених.
+    """
+    hashes = [h for h in (invite_hashes or []) if h]
+    if not hashes:
+        return 0
+    with _conn() as c:
+        h_placeholders = ",".join("?" for _ in hashes)
+        params: list = list(hashes)
+        if statuses:
+            st = [s for s in statuses if s]
+            if not st:
+                return 0
+            st_placeholders = ",".join("?" for _ in st)
+            params.extend(st)
+            cur = c.execute(
+                f"DELETE FROM invite_status WHERE invite_hash IN ({h_placeholders}) AND status IN ({st_placeholders})",
+                tuple(params),
+            )
+        else:
+            cur = c.execute(
+                f"DELETE FROM invite_status WHERE invite_hash IN ({h_placeholders})",
+                tuple(params),
+            )
+        return cur.rowcount or 0
+
+
 def invite_status_put_for_channel(channel_id: int, status: str) -> int:
     """
     Масово оновлює invite_status для всіх інвайтів, що мапляться на channel_id.
@@ -306,3 +336,25 @@ def url_get(url: str) -> Optional[str]:
         cur = c.execute("SELECT status FROM url_cache WHERE url=? LIMIT 1", (url,))
         row = cur.fetchone()
         return row[0] if row else None
+
+
+def url_delete(urls: list[str], statuses: Optional[list[str]] = None) -> int:
+    """
+    Видаляє записи з url_cache для переданих URL.
+    Якщо передано statuses — видаляємо лише рядки з цими статусами.
+    Повертає кількість видалених.
+    """
+    if not urls:
+        return 0
+    with _conn() as c:
+        placeholders = ",".join("?" for _ in urls)
+        params = list(urls)
+        if statuses:
+            st_placeholders = ",".join("?" for _ in statuses)
+            cur = c.execute(
+                f"DELETE FROM url_cache WHERE url IN ({placeholders}) AND status IN ({st_placeholders})",
+                tuple(params + list(statuses)),
+            )
+        else:
+            cur = c.execute(f"DELETE FROM url_cache WHERE url IN ({placeholders})", tuple(params))
+        return cur.rowcount or 0

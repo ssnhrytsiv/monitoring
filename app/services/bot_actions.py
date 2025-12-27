@@ -6,6 +6,7 @@ from telethon import errors
 from app.utils.throttle import throttle_bot
 from app.utils.tg_links import extract_bot_username
 from app.services import channel_db
+from app.services.account_pool import session_name
 
 log = logging.getLogger("services.bot_actions")
 
@@ -23,13 +24,19 @@ async def ensure_bot_started(client, url: str, *, owner_display: Optional[str] =
         return "bot_invalid", None
 
     await throttle_bot()
+    sess = None
     try:
+        sess = session_name(client)
+    except Exception:
+        sess = None
+    try:
+        log.info("bot_actions: sending /start to %s (session=%s, batch=%s)", username, sess or "-", batch_id)
         await client.send_message(username, "/start")
         channel_db.upsert_bot_link(
             username=username,
             raw_url=url,
             status="bot_started",
-            session=None,
+            session=sess,
             owner_display=owner_display,
             owner_username=owner_username,
             batch_id=batch_id,

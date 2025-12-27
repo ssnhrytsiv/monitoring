@@ -31,17 +31,24 @@ def init(db_path: Optional[str] = None):
                 session TEXT,
                 message_id INTEGER,
                 matched_session TEXT,
+                time_window_end TEXT,
                 created_at INTEGER,
                 updated_at INTEGER
             )
             """
         )
+        # Міграція: додаємо time_window_end, якщо немає
+        cur = c.execute("PRAGMA table_info(bot_watch)")
+        cols = {r[1] for r in cur.fetchall()}
+        if "time_window_end" not in cols:
+            c.execute("ALTER TABLE bot_watch ADD COLUMN time_window_end TEXT")
+
         c.execute("CREATE INDEX IF NOT EXISTS idx_bot_watch_user ON bot_watch(username)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_bot_watch_status ON bot_watch(status)")
         c.commit()
 
 
-def add_watch(username: str, expected_html: str, session: Optional[str] = None) -> int:
+def add_watch(username: str, expected_html: str, session: Optional[str] = None, time_window_end: Optional[str] = None) -> int:
     now = int(time.time())
     # нормалізуємо і одразу кладемо normalized у expected_norm
     try:
@@ -52,10 +59,10 @@ def add_watch(username: str, expected_html: str, session: Optional[str] = None) 
     with _conn() as c:
         cur = c.execute(
             """
-            INSERT INTO bot_watch (username, expected_html, expected_norm, status, session, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,?)
+            INSERT INTO bot_watch (username, expected_html, expected_norm, status, session, time_window_end, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?)
             """,
-            (username, expected_html, expected_norm, "pending", session, now, now),
+            (username, expected_html, expected_norm, "pending", session, time_window_end, now, now),
         )
         c.commit()
         return int(cur.lastrowid)
@@ -65,9 +72,11 @@ def list_pending_for_username(username: str) -> List[Dict]:
     with _conn() as c:
         cur = c.execute(
             """
-            SELECT id, username, expected_html, expected_norm, session
+            SELECT id, username, expected_html, expected_norm, session, time_window_end
             FROM bot_watch
-            WHERE username = ? AND status = 'pending'
+            WHERE username = ?
+              AND status = 'pending'
+              AND (time_window_end IS NULL OR time_window_end = '' OR time_window_end >= datetime('now'))
             """,
             (username,),
         )
@@ -79,6 +88,7 @@ def list_pending_for_username(username: str) -> List[Dict]:
             "expected_html": r[2],
             "expected_norm": r[3],
             "session": r[4],
+            "time_window_end": r[5],
         }
         for r in rows
     ]
