@@ -27,7 +27,16 @@ def extract_links_from_message(m: Message) -> List[str]:
             piece = txt[off:off + ln].strip()
             if piece:
                 urls.append(piece)
+        elif et == "mention":  # @username
+            off = int(getattr(ent, "offset", 0))
+            ln = int(getattr(ent, "length", 0))
+            piece = txt[off:off + ln].strip()
+            if piece:
+                urls.append(piece)
     for m_ in LINK_RE.finditer(txt):
         urls.append(m_.group(1))
+    # додатково ловимо «голі» @username, якщо не було ентіті
+    for m_ in re.finditer(r"@[\w\d_]{4,}", txt):
+        urls.append(m_.group(0))
     # унікальні з порядком
     return list(dict.fromkeys(urls))

@@ -549,3 +549,59 @@ def get_invite_owner(invite_hash: str) -> Optional[Dict[str, Any]]:
         "owner_username": row[2],
         "created_at": row[3],
     }
+
+
+def list_bot_links(owner_display: Optional[str] = None, owner_username: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Повертає ботів (username + статус), опційно відфільтрованих по власнику.
+    """
+    conn = _ensure_conn()
+    params: List[Any] = []
+    where: List[str] = []
+    if owner_display:
+        where.append("owner_display = ?")
+        params.append(owner_display)
+    if owner_username:
+        where.append("owner_username = ?")
+        params.append(owner_username)
+    where_sql = ""
+    if where:
+        where_sql = "WHERE " + " OR ".join(where)
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT username, status, session, title, owner_display, owner_username, last_ts, last_error
+            FROM bot_links
+            {where_sql}
+            ORDER BY username
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "username": r[0],
+                "status": r[1],
+                "session": r[2],
+                "title": r[3],
+                "owner_display": r[4],
+                "owner_username": r[5],
+                "last_ts": r[6],
+                "last_error": r[7],
+            }
+        )
+    return out
+
+
+def delete_bot_link(username: str) -> bool:
+    if not username:
+        return False
+    conn = _ensure_conn()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM bot_links WHERE username = ?", (username,))
+        conn.commit()
+        return cur.rowcount > 0

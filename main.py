@@ -28,6 +28,7 @@ from app.services.googlesheets.channels_export_service import (
 from app.bot.run import run_bot
 from admin_bot.run import run_admin_bot
 from admin_bot.config import ADMIN_BOT_TOKEN
+from scripts.forward_bot import start_forward_bot
 
 
 def setup_logging():
@@ -42,6 +43,7 @@ async def _main():
     exporter_task = None
     bot_task = None
     admin_bot_task = None
+    forward_bot_task = None
 
     def _log_task_result(name: str):
         def _inner(t: asyncio.Task):
@@ -167,6 +169,14 @@ async def _main():
         log.exception("Failed to start Bot UI task")
 
     try:
+        forward_bot_task = asyncio.create_task(start_forward_bot(), name="forward_bot")
+        forward_bot_task.add_done_callback(_log_task_result("Forward bot"))
+        log.info("Forward bot task created: %s", forward_bot_task.get_name())
+        await asyncio.sleep(0.5)
+    except Exception:
+        log.exception("Failed to start Forward bot task")
+
+    try:
         if ADMIN_BOT_TOKEN:
             admin_bot_task = asyncio.create_task(run_admin_bot(), name="admin_bot")
             admin_bot_task.add_done_callback(_log_task_result("Admin bot"))
@@ -196,6 +206,16 @@ async def _main():
                 log.debug("Bot UI task cancelled")
             except Exception:
                 log.exception("Bot UI task finished with error")
+
+        if forward_bot_task:
+            log.info("Зупиняю Forward bot…")
+            forward_bot_task.cancel()
+            try:
+                await forward_bot_task
+            except asyncio.CancelledError:
+                log.debug("Forward bot task cancelled")
+            except Exception:
+                log.exception("Forward bot task finished with error")
 
         if admin_bot_task:
             log.info("Зупиняю admin bot…")

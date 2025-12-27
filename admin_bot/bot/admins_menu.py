@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import List, Dict, Any
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
@@ -16,6 +17,11 @@ from admin_bot.bot.states import NetworkFlow
 from admin_bot.utils.messages import extract_links_from_message
 from admin_bot.services.networks import channel_hyperlink
 from app.services import account_pool
+from app.services import channel_db
+from telethon.tl.functions.contacts import BlockRequest
+from telethon.tl.functions.messages import DeleteHistoryRequest
+from admin_bot.bot.keyboards import main_menu_kb
+from app.services import channel_db
 
 router = Router()
 
@@ -51,25 +57,48 @@ def _admin_label(a) -> str:
 
 
 def _render_admin_view(msg, admin, nets, stats):
+    bots = channel_db.list_bot_links(owner_display=admin.display, owner_username=admin.username)
+    bots_count = len(bots)
+    # підрахунок каналів по сітках
+    net_lines = []
+    total_channels = 0
+    if nets:
+        db = next(_db())
+        counts = {}
+        for n in nets:
+            cnt = db.execute(
+                select(func.count(m.NetworkChannel.id)).where(m.NetworkChannel.network_id == n.id)
+            ).scalar() or 0
+            counts[n.id] = cnt
+            total_channels += cnt
+            net_lines.append(f"• {n.name} ({cnt})")
+        if len(nets) > 1:
+            net_lines.append(f"Сумарно: {total_channels}")
+
     lines = [
         f"Адмін: {_admin_label(admin)}",
         f"Сіток: {len(nets)}",
+        f"Боти: {bots_count}",
         f"Сумарна ціна: {stats['price_sum']:.2f}" if stats["price_sum"] is not None else "Сумарна ціна: —",
         f"Середні перегляди (сума 30д): {stats['avg_views_30d_sum'] or 0}",
     ]
     if nets:
         lines.append("Сітки:")
-        for n in nets:
-            lines.append(f"• {n.name}")
+        if net_lines:
+            lines.extend(net_lines)
+        else:
+            for n in nets:
+                lines.append(f"• {n.name}")
     else:
         lines.append("Сіток поки немає.")
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Оновити сітку", callback_data=f"admin_net_edit:{admin.id}")],
+            [InlineKeyboardButton(text="Посмотреть каналы", callback_data=f"admin_net_edit:{admin.id}")],
+            [InlineKeyboardButton(text="Посмотреть ботов", callback_data=f"admin_bots:{admin.id}")],
+            [InlineKeyboardButton(text="⬅️ До списку", callback_data="show_admins"),
+             InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
             [InlineKeyboardButton(text="🗑 Видалити адміна", callback_data=f"admin_delete_confirm:{admin.id}")],
-            [InlineKeyboardButton(text="⬅️ До списку", callback_data="show_admins")],
-            [InlineKeyboardButton(text="В меню", callback_data="report_back_to_menu")],
         ]
     )
     return msg.edit_text("\n".join(lines), reply_markup=kb)
@@ -78,6 +107,7 @@ def _render_admin_view(msg, admin, nets, stats):
 ADMINS_PER_PAGE = 30
 ADMINS_PER_ROW = 2
 NETS_PER_ROW = 4
+BOTS_PER_PAGE = 30
 
 
 def _current_page_from_markup(msg) -> int:
@@ -106,7 +136,7 @@ def _build_admins_kb(admins, page: int = 0, per_page: int = 10):
             row = []
     if row:
         buttons.append(row)
-    nav = page_kb(page, total_pages, prefix="admins_page")
+    nav = page_kb(page, total_pages, prefix="admins_page", menu_cb="admins_back_to_menu")
     return InlineKeyboardMarkup(inline_keyboard=buttons + nav.inline_keyboard)
 
 
@@ -117,13 +147,33 @@ async def cb_show_admins(cb: CallbackQuery, state: FSMContext):
         await cb.message.answer(
             "Список адмінів порожній.",
             reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="В меню", callback_data="report_back_to_menu")]]
+                inline_keyboard=[[InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")]]
             ),
         )
         await cb.answer()
         return
     kb = _build_admins_kb(admins, page=0, per_page=ADMINS_PER_PAGE)
     await cb.message.edit_text("Адміни:", reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "admins_back_to_menu")
+async def cb_admins_back_to_menu(cb: CallbackQuery):
+    try:
+        await cb.message.edit_text(
+            "Адмін-бот:\n"
+            "• /add_admin — додати себе (або tg_id аргументом)\n"
+            "• /admins — список адмінів",
+            reply_markup=main_menu_kb(),
+        )
+    except TelegramBadRequest:
+        # якщо не вдалося відредагувати, надсилаємо нове повідомлення
+        await cb.message.answer(
+            "Адмін-бот:\n"
+            "• /add_admin — додати себе (або tg_id аргументом)\n"
+            "• /admins — список адмінів",
+            reply_markup=main_menu_kb(),
+        )
     await cb.answer()
 
 
@@ -187,7 +237,7 @@ def _render_net_page(net: m.Network, pages: list[str], page_idx: int):
         buttons += nav
     buttons.append([
         InlineKeyboardButton(text="⬅️ До сіток", callback_data=f"admin_net_edit:{net.admin_id}"),
-        InlineKeyboardButton(text="В меню", callback_data="report_back_to_menu"),
+        InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu"),
     ])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     return text, kb
@@ -229,7 +279,7 @@ async def cb_admin_net_delete(cb: CallbackQuery):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ До сіток", callback_data=f"admin_net_edit:{admin_id}")],
-            [InlineKeyboardButton(text="В меню", callback_data="report_back_to_menu")],
+            [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
         ]
     )
     await cb.message.edit_text(
@@ -263,7 +313,7 @@ async def cb_admin_net_refresh(cb: CallbackQuery, state: FSMContext):
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ До сіток", callback_data=f"admin_net_edit:{net.admin_id}")],
-                [InlineKeyboardButton(text="В меню", callback_data="report_back_to_menu")],
+                [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
             ]
         ),
         disable_web_page_preview=True,
@@ -349,6 +399,36 @@ def _build_networks_keyboard(db, nets, admin_id: int):
     return rows
 
 
+def _build_bots_view(admin, bots: List[Dict[str, Any]], page: int = 0, per_page: int = BOTS_PER_PAGE):
+    total_pages = max(1, math.ceil(len(bots) / per_page))
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    chunk = bots[start:start + per_page]
+    lines = [f"Боти для {_admin_label(admin)} (всього {len(bots)}):"]
+    if chunk:
+        for idx, b in enumerate(chunk, start + 1):
+            lines.append(_format_bot_line(idx, b))
+    else:
+        lines.append("Ботів не знайдено.")
+    nav = page_kb(page, total_pages, prefix="admin_bots_page")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin.id}")],
+            [InlineKeyboardButton(text="🚫 Отписаться от ботов", callback_data=f"admin_unsub_bots:{admin.id}")],
+        ] + nav.inline_keyboard
+    )
+    return "\n".join(lines), kb
+
+
+def _format_bot_line(idx: int, bot: Dict[str, Any]) -> str:
+    parts = [f"{idx}. @{bot['username']} — {bot.get('status') or '—'}"]
+    if bot.get("session"):
+        parts.append(f"    сесія: {bot['session']}")
+    if bot.get("last_error"):
+        parts.append(f"    помилка: {bot['last_error']}")
+    return "\n".join(parts)
+
+
 @router.callback_query(F.data.startswith("admin_net_edit"))
 async def cb_admin_net_edit(cb: CallbackQuery):
     try:
@@ -365,7 +445,7 @@ async def cb_admin_net_edit(cb: CallbackQuery):
                 [InlineKeyboardButton(text="Додати сітку", callback_data=f"admin_net_add:{admin_id}")],
                 [
                     InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin_id}"),
-                    InlineKeyboardButton(text="В меню", callback_data="report_back_to_menu"),
+                    InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu"),
                 ],
             ]
         )
@@ -376,7 +456,7 @@ async def cb_admin_net_edit(cb: CallbackQuery):
     rows.append([InlineKeyboardButton(text="Додати сітку", callback_data=f"admin_net_add:{admin_id}")])
     rows.append([
         InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin_id}"),
-        InlineKeyboardButton(text="В меню", callback_data="report_back_to_menu"),
+        InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu"),
     ])
     kb = InlineKeyboardMarkup(inline_keyboard=rows)
     await cb.message.edit_text("Сітки адміна (обери сітку):", reply_markup=kb, disable_web_page_preview=True)
@@ -502,8 +582,139 @@ async def cb_admin_delete_yes(cb: CallbackQuery):
     )
     admins = _load_admins()
     kb = _build_admins_kb(admins, page=0, per_page=ADMINS_PER_PAGE) if admins else InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="В меню", callback_data="report_back_to_menu")]]
+        inline_keyboard=[[InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")]]
     )
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("admin_bots:"))
+async def cb_admin_bots(cb: CallbackQuery):
+    try:
+        admin_id = int(cb.data.split(":", 1)[1])
+    except Exception:
+        await cb.answer()
+        return
+    db = next(_db())
+    admin = svc_admins.get_admin_by_id(db, admin_id)
+    if not admin:
+        await cb.answer("Адміна не знайдено", show_alert=True)
+        return
+    bots = channel_db.list_bot_links(owner_display=admin.display, owner_username=admin.username)
+    text, kb = _build_bots_view(admin, bots, page=0)
+    await cb.message.edit_text(text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("admin_unsub_bots:"))
+async def cb_admin_unsub_bots(cb: CallbackQuery, state: FSMContext):
+    try:
+        admin_id = int(cb.data.split(":", 1)[1])
+    except Exception:
+        await cb.answer()
+        return
+    db = next(_db())
+    admin = svc_admins.get_admin_by_id(db, admin_id)
+    if not admin:
+        await cb.answer("Адміна не знайдено", show_alert=True)
+        return
+    bots = channel_db.list_bot_links(owner_display=admin.display, owner_username=admin.username)
+    if not bots:
+        await cb.answer("Немає ботів для відписки", show_alert=True)
+        return
+    # готуємо список username з індексами
+    lines = ["Обери бота для відписки:"]
+    kb_rows = []
+    for idx, b in enumerate(bots, 1):
+        uname = b.get("username") or ""
+        lines.append(f"{idx}. @{uname} — {b.get('status') or '—'}")
+        kb_rows.append([InlineKeyboardButton(text=f"🚫 @{uname}", callback_data=f"admin_unsub_bot:{admin_id}:{uname}")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin_id}")])
+    kb_rows.append([InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("admin_unsub_bot:"))
+async def cb_admin_unsub_bot(cb: CallbackQuery):
+    try:
+        _, admin_id_str, uname = cb.data.split(":", 2)
+        admin_id = int(admin_id_str)
+    except Exception:
+        await cb.answer()
+        return
+    username = uname.strip()
+    if not username:
+        await cb.answer()
+        return
+    bots = channel_db.list_bot_links()
+    bot_row = next((b for b in bots if b.get("username") == username), None)
+    sess_name = bot_row.get("session") if bot_row else None
+    if not sess_name:
+        await cb.answer("Не знаю з якої сесії підписувались", show_alert=True)
+        return
+    client = account_pool.get_client_by_session_name(sess_name)
+    if not client:
+        await cb.answer(f"Сесія {sess_name} недоступна", show_alert=True)
+        return
+    errors = []
+    try:
+        await client(BlockRequest(username))
+    except Exception as e:
+        errors.append(str(e))
+    try:
+        await client(DeleteHistoryRequest(peer=username, revoke=True, max_id=0))
+    except Exception as e:
+        errors.append(f"del_history:{e}")
+    removed = channel_db.delete_bot_link(username)
+    msg = f"Бот @{username} заблокований на сесії {sess_name}."
+    if errors:
+        msg += " Помилки: " + "; ".join(errors)
+    if removed:
+        msg += " Запис у БД видалено."
+    else:
+        msg += " Запис у БД не знайдено."
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin_id}")],
+            [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
+        ]
+    )
+    await cb.message.edit_text(msg, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.in_(["admin_bots_page_prev", "admin_bots_page_next"]))
+async def cb_admin_bots_page(cb: CallbackQuery):
+    # визначаємо admin_id з кнопки "⬅️ До адміна" у поточній клавіатурі
+    admin_id = None
+    if cb.message and cb.message.reply_markup:
+        for row in cb.message.reply_markup.inline_keyboard:
+            for btn in row:
+                if btn.callback_data and btn.callback_data.startswith("admin_back:"):
+                    try:
+                        admin_id = int(btn.callback_data.split(":", 1)[1])
+                    except Exception:
+                        admin_id = None
+                    break
+    if not admin_id:
+        await cb.answer()
+        return
+    db = next(_db())
+    admin = svc_admins.get_admin_by_id(db, admin_id)
+    if not admin:
+        await cb.answer("Адміна не знайдено", show_alert=True)
+        return
+    bots = channel_db.list_bot_links(owner_display=admin.display, owner_username=admin.username)
+    total_pages = max(1, math.ceil(len(bots) / BOTS_PER_PAGE))
+    # поточну сторінку беремо з кнопки пагінації (текст типу 1/3)
+    cur_page = _current_page_from_markup(cb.message)
+    if cb.data == "admin_bots_page_prev":
+        cur_page = (cur_page - 1) % total_pages
+    else:
+        cur_page = (cur_page + 1) % total_pages
+    text, kb = _build_bots_view(admin, bots, page=cur_page)
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
 
@@ -520,7 +731,7 @@ async def cb_admin_net_add(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("Вкажи назву сітки.", reply_markup=InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin_id}")],
-            [InlineKeyboardButton(text="В меню", callback_data="report_back_to_menu")],
+            [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
         ]
     ))
     await cb.answer()
@@ -547,7 +758,7 @@ async def on_network_name(m, state: FSMContext):
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin_id}")],
-                [InlineKeyboardButton(text="В меню", callback_data="report_back_to_menu")],
+                [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
             ]
         ),
     )
@@ -584,7 +795,7 @@ async def on_network_links(m, state: FSMContext):
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{data.get('net_admin_id')}")],
-                [InlineKeyboardButton(text="В меню", callback_data="report_back_to_menu")],
+                [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
             ]
         ),
     )

@@ -10,11 +10,11 @@ def chunk_items(items: List[str], per_page: int) -> List[List[str]]:
     return [items[i:i + per_page] for i in range(0, len(items), per_page)]
 
 
-def page_kb(page: int, total: int, prefix: str) -> InlineKeyboardMarkup:
+def page_kb(page: int, total: int, prefix: str, menu_cb: str = "report_back_to_menu") -> InlineKeyboardMarkup:
     prev_cb = f"{prefix}_prev"
     next_cb = f"{prefix}_next"
     noop_cb = f"{prefix}_noop"
-    to_menu = InlineKeyboardButton(text="В меню", callback_data="report_back_to_menu")
+    to_menu = InlineKeyboardButton(text="В меню", callback_data=menu_cb)
     rows = [
         [
             InlineKeyboardButton(text="⬅️", callback_data=prev_cb),

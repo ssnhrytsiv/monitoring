@@ -2,6 +2,7 @@ import logging
 from typing import Tuple, Optional
 
 from telethon import errors
+from telethon.tl.functions.contacts import UnblockRequest
 
 from app.utils.throttle import throttle_bot
 from app.utils.tg_links import extract_bot_username
@@ -30,6 +31,11 @@ async def ensure_bot_started(client, url: str, *, owner_display: Optional[str] =
     except Exception:
         sess = None
     try:
+        # на всякий випадок розблокуємо, якщо бот був у блок-листі
+        try:
+            await client(UnblockRequest(username))
+        except Exception as e:
+            log.debug("bot_actions: unblock failed for %s (session=%s): %s", username, sess or "-", e)
         log.info("bot_actions: sending /start to %s (session=%s, batch=%s)", username, sess or "-", batch_id)
         await client.send_message(username, "/start")
         channel_db.upsert_bot_link(

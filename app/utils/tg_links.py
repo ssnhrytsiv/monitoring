@@ -33,7 +33,7 @@ def extract_bot_username(u: str) -> str | None:
     if not username:
         return None
 
-    username = username.strip()
+    username = username.strip().strip(".,;:)]}>\"'")
     if not username:
         return None
 
