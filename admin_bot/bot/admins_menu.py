@@ -4,6 +4,7 @@ import math
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
+from aiogram.exceptions import TelegramBadRequest
 from sqlalchemy import select, func
 
 from admin_bot.db import models as m
@@ -17,6 +18,16 @@ from admin_bot.services.networks import channel_hyperlink
 from app.services import account_pool
 
 router = Router()
+
+
+async def _edit_text_safe(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup):
+    try:
+        await cb.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return False
+        raise
+    return True
 
 
 def _db():
@@ -130,7 +141,7 @@ async def cb_admin_net_show(cb: CallbackQuery):
         return
     pages, total = _net_channel_pages(db, net.id, net.name)
     text, kb = _render_net_page(net, pages, 0)
-    await cb.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    await _edit_text_safe(cb, text, kb)
     await cb.answer()
 
 
@@ -198,7 +209,7 @@ async def cb_admin_net_show_page(cb: CallbackQuery):
         return
     pages, total = _net_channel_pages(db, net.id, net.name)
     text, kb = _render_net_page(net, pages, page)
-    await cb.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    await _edit_text_safe(cb, text, kb)
     await cb.answer()
 
 
