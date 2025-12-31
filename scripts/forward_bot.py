@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("forward_bot")
 
 # Хардеcoded токен і цільовий чат
-BOT_TOKEN = "8010925391:AAHAI5fJ_2wDfUgtViCanM2zVbaBsv12Aro"
+BOT_TOKEN = "8114797098:AAG70WNzH53iehySeDLWygQvuS_D5kjoTqY"
 TARGET_CHAT_ID = 8497144108
 
 

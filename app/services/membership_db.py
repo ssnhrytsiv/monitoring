@@ -267,6 +267,22 @@ def invite_status_get(invite_or_hash: str) -> Optional[str]:
         return row[0] if row else None
 
 
+def invite_check_last_session(invite_or_hash: str) -> Optional[str]:
+    """
+    Повертає останню сесію, яка фіксувала цей інвайт у invite_check (для повторних заявок).
+    """
+    h = _extract_invite_hash(invite_or_hash)
+    if not h:
+        return None
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT session FROM invite_check WHERE invite_hash=? ORDER BY noted_at DESC LIMIT 1",
+            (h,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
 def invite_status_delete(invite_hashes: list[str], statuses: Optional[list[str]] = None) -> int:
     """
     Видаляє записи з invite_status для переданих хешів.

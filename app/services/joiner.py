@@ -329,22 +329,14 @@ async def ensure_join(client, url: str):
             # 1) Позначаємо статус
 
             try:
-
                 invite_status_put(invite_hash, "already")
-
-
             except Exception:
-
                 pass
 
             # 2) Прагнемо отримати channel_id без join – одним легким викликом
 
             try:
-
-                from telethon.tl.functions.messages import CheckChatInviteRequest
-
                 await throttle_invite()  # поважаємо троттл
-
                 inv = await client(CheckChatInviteRequest(invite_hash))
 
                 chat = getattr(inv, "chat", None)

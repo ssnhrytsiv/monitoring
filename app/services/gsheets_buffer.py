@@ -7,6 +7,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from app.services.posts_watch_result_db import raw_connection
+from app.services import channel_db
+from app.utils.tg_links import extract_bot_username
 from app.services import gsheets_writer as gw
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -122,6 +124,24 @@ def _db_get_channel_title_and_owner(channel_id: int):
         return None, None
 
 
+def _resolve_title_and_owner(channel_id: int, source_url: str | None):
+    """
+    Повертаємо title/owner з таблиці channels або, якщо це бот, з bot_links.
+    """
+    ch_title, owner_display = _db_get_channel_title_and_owner(channel_id)
+    if ch_title or owner_display:
+        return ch_title, owner_display
+
+    username = extract_bot_username(source_url or "")
+    if username:
+        bot = channel_db.get_bot_link_by_username(username)
+        if bot:
+            title = bot.get("title") or username
+            owner = bot.get("owner_display") or bot.get("owner_username")
+            return title, owner
+    return ch_title, owner_display
+
+
 def _db_get_template_title(tid: int | None):
     if not tid:
         return None
@@ -161,7 +181,7 @@ def _build_row_for_matched(wid: int) -> Tuple[str, List[str]]:
         date_str = gw.sheet_title_from_time_window_start(None)
         return date_str, [""] * 9
     date_str = gw.sheet_title_from_time_window_start(wc.get("time_window_start"))
-    ch_title, owner_display = _db_get_channel_title_and_owner(wc["channel_id"])
+    ch_title, owner_display = _resolve_title_and_owner(wc["channel_id"], wc.get("source_url"))
     t_title = _db_get_template_title(wc.get("template_id"))
     links_text = _links_text_from_json(wc.get("expected_links_json"))
     posted_at = wc.get("matched_at") or _human(datetime.now(MOSCOW_TZ))
@@ -187,7 +207,7 @@ def _build_row_for_expired(wid: int) -> Tuple[str, List[str]]:
         date_str = gw.sheet_title_from_time_window_start(None)
         return date_str, [""] * 9
     date_str = gw.sheet_title_from_time_window_start(wc.get("time_window_start"))
-    ch_title, owner_display = _db_get_channel_title_and_owner(wc["channel_id"])
+    ch_title, owner_display = _resolve_title_and_owner(wc["channel_id"], wc.get("source_url"))
     t_title = _db_get_template_title(wc.get("template_id"))
     links_text = _links_text_from_json(wc.get("expected_links_json"))
     source_url = wc.get("source_url") or ""
@@ -211,7 +231,7 @@ def _build_row_for_edited_other(wid: int, when_str: str | None) -> Tuple[str, Li
         date_str = gw.sheet_title_from_time_window_start(None)
         return date_str, [""] * 9
     date_str = gw.sheet_title_from_time_window_start(wc.get("time_window_start"))
-    ch_title, owner_display = _db_get_channel_title_and_owner(wc["channel_id"])
+    ch_title, owner_display = _resolve_title_and_owner(wc["channel_id"], wc.get("source_url"))
     t_title = _db_get_template_title(wc.get("template_id"))
     links_text = _links_text_from_json(wc.get("expected_links_json"))
     source_url = wc.get("source_url") or ""

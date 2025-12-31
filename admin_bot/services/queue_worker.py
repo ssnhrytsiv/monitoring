@@ -22,6 +22,7 @@ from app.services.membership_db import (
     get_any_session_for_channel,
     map_invite_get,
     url_get,
+    invite_check_last_session,
 )
 from app.services import channel_db
 from app.services.bot_actions import ensure_bot_started
@@ -144,7 +145,7 @@ class _RoundRobin:
 _RR = _RoundRobin()
 
 
-async def _get_ready_slot(max_wait_sec: int = 30, step: float = 2.0):
+async def _get_ready_slot(max_wait_sec: int = 30, step: float = 2.0, preferred_session: Optional[str] = None):
     """
     Чекає появи готового клієнта з пулу (не busy, без кулдауна).
     Повертає slot або None після таймауту.
@@ -152,6 +153,14 @@ async def _get_ready_slot(max_wait_sec: int = 30, step: float = 2.0):
     waited = 0.0
     while waited <= max_wait_sec:
         slots = iter_ready_pool_clients()
+        if preferred_session:
+            pref_norm = preferred_session[:-8] if preferred_session.endswith(".session") else preferred_session
+            for s in slots:
+                s_norm = s.name[:-8] if s.name.endswith(".session") else s.name
+                if s_norm == pref_norm:
+                    return s
+            # якщо preferred не знайдений або не готовий, падаємо в RR
+            slots = iter_ready_pool_clients()
         slot = _RR.pick(slots)
         if slot:
             return slot
@@ -232,6 +241,12 @@ async def process_batch(
 
         # Визначаємо тип
         inv_hash = _extract_invite_hash(url)
+        preferred_session: Optional[str] = None
+        if inv_hash:
+            try:
+                preferred_session = invite_check_last_session(inv_hash)
+            except Exception:
+                preferred_session = None
         # 1) find_channel_by_link (raw/clean)
         try:
             link_row = channel_db.find_channel_by_link(url) or channel_db.find_channel_by_link(cleaned)
@@ -240,7 +255,7 @@ async def process_batch(
                 final = any_final_for_channel(cid_link)
                 if final:
                     final_norm = "already" if final == "joined" else final
-                    if final_norm in FINAL_GLOBAL:
+                    if final_norm in FINAL_GLOBAL and final_norm != "requested":
                         sess_known = get_any_session_for_channel(cid_link)
                         data = (final_norm, title_link, cid_link, "link_cache", sess_known)
                         _register_preknown(url, data)
@@ -254,7 +269,7 @@ async def process_batch(
                 final = any_final_for_channel(cid_raw)
                 if final:
                     final_norm = "already" if final == "joined" else final
-                    if final_norm in FINAL_GLOBAL:
+                    if final_norm in FINAL_GLOBAL and final_norm != "requested":
                         sess_known = get_any_session_for_channel(cid_raw)
                         data = (final_norm, None, cid_raw, "link_raw", sess_known)
                         _register_preknown(url, data)
@@ -269,7 +284,7 @@ async def process_batch(
                     final = any_final_for_channel(int(cid_cached))
                     if final:
                         final_norm = "already" if final == "joined" else final
-                        if final_norm in FINAL_GLOBAL:
+                        if final_norm in FINAL_GLOBAL and final_norm != "requested":
                             sess_known = get_any_session_for_channel(int(cid_cached))
                             data = (final_norm, title_cached, int(cid_cached), "invite_cache", sess_known)
                             _register_preknown(url, data)
@@ -286,7 +301,7 @@ async def process_batch(
             ust = None
         if ust:
             status_norm = "already" if ust == "joined" else ust
-            if status_norm in FINAL_GLOBAL or status_norm == "duplicate":
+            if status_norm in FINAL_GLOBAL and status_norm != "requested" or status_norm == "duplicate":
                 data = (status_norm, None, None, "url_cache", None)
                 _register_preknown(url, data)
                 if cleaned != url:
@@ -577,7 +592,7 @@ async def process_batch(
             await progress.update(status_display, title or url, sess)
             _remember_seen(norm_keys, title=title, channel_id=cid, session=sess)
             continue
-        slot = await _get_ready_slot()
+        slot = await _get_ready_slot(preferred_session=preferred_session)
         if slot is None:
             # немає готових акаунтів навіть після очікування — позначаємо тільки цей елемент
             log.warning("queue_worker.no_client batch_id=%s idx=%s url=%s", batch_id, idx, url)

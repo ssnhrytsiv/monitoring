@@ -596,6 +596,41 @@ def list_bot_links(owner_display: Optional[str] = None, owner_username: Optional
     return out
 
 
+def get_bot_link_by_username(username: str) -> Optional[Dict[str, Any]]:
+    """
+    Повертає один запис про бота за username.
+    """
+    if not username:
+        return None
+    conn = _ensure_conn()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT username, status, session, title, owner_display, owner_username, batch_id, last_ts, last_error, raw_url
+            FROM bot_links
+            WHERE username = ?
+            LIMIT 1
+            """,
+            (username,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "username": row[0],
+        "status": row[1],
+        "session": row[2],
+        "title": row[3],
+        "owner_display": row[4],
+        "owner_username": row[5],
+        "batch_id": row[6],
+        "last_ts": row[7],
+        "last_error": row[8],
+        "raw_url": row[9],
+    }
+
+
 def delete_bot_link(username: str) -> bool:
     if not username:
         return False
