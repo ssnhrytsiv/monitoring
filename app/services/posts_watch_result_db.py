@@ -99,7 +99,8 @@ def init() -> None:
             matched_session TEXT,
             source_url TEXT,
             created_by BIGINT,
-            created_via TEXT
+            created_via TEXT,
+            project TEXT
         )
         """
     )
@@ -112,6 +113,9 @@ def init() -> None:
 
     if not _has_column(_conn, "watch_posts", "created_via"):
         _conn.execute("ALTER TABLE watch_posts ADD COLUMN created_via TEXT")
+
+    if not _has_column(_conn, "watch_posts", "project"):
+        _conn.execute("ALTER TABLE watch_posts ADD COLUMN project TEXT")
 
     _conn.execute(
         """
@@ -164,6 +168,7 @@ def create_watch(
     source_url: Optional[str] = None,
     created_by: Optional[int] = None,
     created_via: Optional[str] = None,
+    project: Optional[str] = None,
 ) -> int:
     conn = _ensure_conn()
     now = _now()
@@ -181,8 +186,9 @@ def create_watch(
                     created_at, updated_at,
                     source_url,
                     created_by,
-                    created_via
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    created_via,
+                    project
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     channel_id, template_id,
@@ -193,6 +199,7 @@ def create_watch(
                     source_url,
                     created_by,
                     created_via,
+                    project,
                 ),
             )
             conn.commit()

@@ -256,7 +256,7 @@ async def _create_template_from_source(src: Message) -> Optional[int]:
     log.warning("create_template add_template did not return id")
     return None
 
-async def _send_watch_from_links_batch_bot(bot, targets: List[str], mins: int, template_id: int, created_by: int) -> bool:
+async def _send_watch_from_links_batch_bot(bot, targets: List[str], mins: int, template_id: int, created_by: int, project: Optional[str]) -> bool:
     try:
         control_id = _control_chat_id()
         log.info(f"send_batch_bot control_id={control_id} template_id={template_id} mins={mins} targets_count={len(targets)} created_by={created_by}")
@@ -264,6 +264,8 @@ async def _send_watch_from_links_batch_bot(bot, targets: List[str], mins: int, t
             log.warning("send_batch_bot no control_id")
             return False
         header = f"/watch_from_links {int(template_id)} --window-min {int(mins)} --created-by {int(created_by)}"
+        if project:
+            header += f" --project {project}"
         body = "\n".join(targets)
         cmd = header + "\n" + body if body else header
         log.info(f"send_batch_bot cmd={cmd!r}")
@@ -397,7 +399,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
 
     sent_ok = False
     if control_id and tid:
-        sent_ok = await _send_watch_from_links_batch_bot(cb.bot, targets, mins, int(tid), cb.from_user.id)
+        sent_ok = await _send_watch_from_links_batch_bot(cb.bot, targets, mins, int(tid), cb.from_user.id, data.get("project"))
         log.info(f"confirm_yes sent_ok={sent_ok}")
         if sent_ok:
             created.extend(targets)
@@ -426,6 +428,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                     time_window_end=data.get("time_window_end"),
                     source_url=None,
                     created_by=cb.from_user.id,
+                    project=data.get("project"),
                 )
                 log.info(f"confirm_yes fallback created wid={wid} cid={cid} tid={tid}")
                 try:

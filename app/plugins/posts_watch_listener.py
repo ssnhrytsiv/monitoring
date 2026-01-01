@@ -38,7 +38,7 @@ except Exception:
 
 SHEETS_OK = False
 try:
-    from app.services import gsheets_buffer
+    from app.sheet_bot.services import gsheets_buffer
 
     SHEETS_OK = True
 except Exception:

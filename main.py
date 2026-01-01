@@ -172,7 +172,6 @@ async def _main():
         forward_bot_task = asyncio.create_task(start_forward_bot(), name="forward_bot")
         forward_bot_task.add_done_callback(_log_task_result("Forward bot"))
         log.info("Forward bot task created: %s", forward_bot_task.get_name())
-        await asyncio.sleep(0.5)
     except Exception:
         log.exception("Failed to start Forward bot task")
 

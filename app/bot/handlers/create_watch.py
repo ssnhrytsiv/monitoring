@@ -5,11 +5,14 @@ import logging
 import json
 
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
 
 from app.bot.states import CreateWatch
+from app.services import channel_db
+from app.sheet_bot.services import gsheets_writer as gsw
+from app.sheet_bot.services import gsheets_buffer as gsb
 from app.bot.keyboards import main_menu_kb, back_to_menu_kb, yes_no_kb
 from app.services.posts_watch_result_db import create_watch, insert_watch_event
 from app.services.time_utils import msk_now
@@ -37,6 +40,18 @@ def _control_chat_id() -> Optional[int]:
         return int(str(raw).strip())
     except Exception:
         return None
+
+
+def _project_kb(prefix: str):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="ALI", callback_data=f"{prefix}:ALI"),
+                InlineKeyboardButton(text="PATRON", callback_data=f"{prefix}:PATRON"),
+                InlineKeyboardButton(text="EXPRESS", callback_data=f"{prefix}:EXPRESS"),
+            ]
+        ]
+    )
 
 
 def _extract_urls(text: str) -> List[str]:
@@ -291,12 +306,14 @@ async def _create_template_from_source(src: Message) -> Optional[int]:
     return None
 
 
-async def _send_watch_from_links_batch_bot(bot, targets: List[str], mins: int, template_id: int) -> bool:
+async def _send_watch_from_links_batch_bot(bot, targets: List[str], mins: int, template_id: int, project: Optional[str]) -> bool:
     try:
         control_id = _control_chat_id()
         if not control_id:
             return False
         header = f"/watch_from_links {int(template_id)} --window-min {int(mins)}"
+        if project:
+            header += f" --project {project}"
         body = "\n".join(targets)
         cmd = header + "\n" + body if body else header
         await bot.send_message(control_id, cmd)
@@ -319,6 +336,150 @@ async def menu_home(cb: CallbackQuery, state: FSMContext):
         await cb.message.edit_text("Меню:", reply_markup=main_menu_kb())
     except TelegramBadRequest:
         await cb.message.answer("Меню:", reply_markup=main_menu_kb())
+
+
+@router.callback_query(F.data == "menu:sheet_mgmt")
+async def menu_sheet_mgmt(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🆕 Створити таблицю для цього місяця", callback_data="sheet:create")],
+            [InlineKeyboardButton(text="📂 Архівні таблиці", callback_data="sheet:archive")],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")],
+        ]
+    )
+    await cb.message.edit_text("Управління таблицями:", reply_markup=kb)
+
+
+@router.callback_query(F.data == "sheet:create")
+async def sheet_create_pick(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text("Обери проєкт для створення таблиці цього місяця:", reply_markup=_project_kb("sheet:create_proj"))
+
+
+def _sheet_title(project: str) -> str:
+    now = msk_now()
+    months = {
+        1: "Январь",
+        2: "Февраль",
+        3: "Март",
+        4: "Апрель",
+        5: "Май",
+        6: "Июнь",
+        7: "Июль",
+        8: "Август",
+        9: "Сентябрь",
+        10: "Октябрь",
+        11: "Ноябрь",
+        12: "Декабрь",
+    }
+    month_name = months.get(now.month, now.strftime("%m"))
+    return f"Планувальщик для {project} [{month_name} {now.year}]"
+
+
+@router.callback_query(F.data.startswith("sheet:create_proj:"))
+async def sheet_create_project(cb: CallbackQuery, state: FSMContext):
+    proj = cb.data.split("sheet:create_proj:", 1)[1]
+    title = _sheet_title(proj)
+    # Якщо вже є активна таблиця з цим самим місяцем/назвою — просто показуємо її
+    existing = channel_db.get_active_sheet(proj)
+    if existing and (existing.get("title") == title):
+        ssid = existing.get("spreadsheet_id")
+        url = f"https://docs.google.com/spreadsheets/d/{ssid}"
+        await cb.message.edit_text(
+            f"Для {proj} вже є активна таблиця цього місяця:\n{title}\n{url}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")]]),
+            disable_web_page_preview=True,
+        )
+        return
+
+    try:
+        res = gsw.create_spreadsheet(title)
+        if not res or not res.get("spreadsheet_id"):
+            raise RuntimeError("create_spreadsheet returned no id")
+        ssid = res["spreadsheet_id"]
+        channel_db.set_active_sheet(proj, ssid, title)
+        url = f"https://docs.google.com/spreadsheets/d/{ssid}"
+        await cb.message.edit_text(
+            f"Таблиця створена і встановлена як активна для {proj}:\n{title}\n{url}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")]]),
+        )
+    except Exception as e:
+        log.exception("sheet create failed: %s", e)
+        await cb.message.edit_text(
+            f"Не вдалося створити таблицю: {e}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")]]),
+        )
+
+
+@router.callback_query(F.data == "sheet:archive")
+async def sheet_archive(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    projects = channel_db.list_sheet_projects()
+    if not projects:
+        await cb.message.edit_text(
+            "Архів порожній.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")]]),
+        )
+        return
+    row = [InlineKeyboardButton(text=p, callback_data=f"sheet:archive_proj:{p}") for p in projects]
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            row,
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")],
+        ]
+    )
+    await cb.message.edit_text("Оберіть проєкт для перегляду архіву:", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("sheet:archive_proj:"))
+async def sheet_archive_project(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    proj = cb.data.split("sheet:archive_proj:", 1)[1]
+    rows = channel_db.list_archived_sheets(project=proj)
+    if not rows:
+        txt = f"Архів порожній для проєкту {proj}."
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ До проєктів", callback_data="sheet:archive")],
+                [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")],
+            ]
+        )
+        await cb.message.edit_text(txt, reply_markup=kb, disable_web_page_preview=True)
+        return
+
+    # Сортуємо за датою архівації (новіші зверху), далі за назвою
+    rows_sorted = sorted(
+        rows,
+        key=lambda r: (r.get("archived_at") or "", r.get("title") or ""),
+        reverse=True,
+    )
+
+    def _btn_label(title: str) -> str:
+        parts = title.strip().split()
+        if len(parts) >= 2:
+            # беремо останні два слова як "місяць рік"
+            return " ".join(parts[-2:])
+        return title[:32]
+
+    buttons = []
+    for r in rows_sorted[:30]:  # максимум 15 рядків по 2 кнопки
+        title = r.get("title") or ""
+        url = f"https://docs.google.com/spreadsheets/d/{r.get('spreadsheet_id')}"
+        buttons.append(InlineKeyboardButton(text=_btn_label(title), url=url))
+
+    kb_rows = []
+    for i in range(0, len(buttons), 2):
+        kb_rows.append(buttons[i:i + 2])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ До проєктів", callback_data="sheet:archive")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    await cb.message.edit_text(
+        f"Архівні таблиці для {proj}:\n(кнопки відкривають таблицю)",
+        reply_markup=kb,
+        disable_web_page_preview=True,
+    )
 
 
 @router.callback_query(F.data == "menu:add_watch")
@@ -427,8 +588,44 @@ async def step_time_window(m: Message, state: FSMContext):
         f"вікно: {mins} хв\n"
         f"до: {tw_end}\n"
     )
-    await state.set_state(CreateWatch.confirm)
+    await state.set_state(CreateWatch.project_pick)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="ALI", callback_data="watch_proj:ALI"),
+                InlineKeyboardButton(text="PATRON", callback_data="watch_proj:PATRON"),
+                InlineKeyboardButton(text="EXPRESS", callback_data="watch_proj:EXPRESS"),
+            ]
+        ]
+    )
     await m.answer(
+        txt + "\nОбери проєкт:",
+        reply_markup=kb,
+        parse_mode=None
+    )
+
+
+@router.callback_query(CreateWatch.project_pick, F.data.startswith("watch_proj:"))
+async def pick_project(cb: CallbackQuery, state: FSMContext):
+    proj = cb.data.split("watch_proj:", 1)[1]
+    await state.update_data(project=proj)
+    data = await state.get_data()
+    mins = int(data["mins"])
+    tid = data.get("template_id")
+    targets: List[str] = data.get("targets") or []
+    tw_end = data.get("time_window_end")
+    proj_txt = proj
+    targets_txt = "\n".join(f"• {t}" for t in targets)
+    txt = (
+        f"Підтверди створення watch:\n\n"
+        f"targets:\n{targets_txt}\n\n"
+        f"template_id: {tid or '—'}\n"
+        f"вікно: {mins} хв\n"
+        f"до: {tw_end}\n"
+        f"проєкт: {proj_txt}\n"
+    )
+    await state.set_state(CreateWatch.confirm)
+    await cb.message.edit_text(
         txt,
         reply_markup=yes_no_kb("watch:confirm_yes", "watch:confirm_no"),
         parse_mode=None
@@ -447,6 +644,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
     mins = int(data["mins"])
     tid = data.get("template_id")
     targets: List[str] = data.get("targets") or []
+    project = data.get("project")
 
     created: List[str] = []
     failed: List[str] = []
@@ -455,7 +653,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
 
     sent_ok = False
     if control_id and tid:
-        sent_ok = await _send_watch_from_links_batch_bot(cb.bot, targets, mins, int(tid))
+        sent_ok = await _send_watch_from_links_batch_bot(cb.bot, targets, mins, int(tid), project)
         if sent_ok:
             created.extend(targets)
         else:
@@ -495,11 +693,19 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                     time_window_end=data.get("time_window_end"),
                     source_url=links_map.get(int(cid)),
                     created_by=None,
+                    project=project,
                 )
                 try:
                     insert_watch_event(wid, "created", {"via": "bot_fallback"})
                 except Exception:
                     pass
+                if project:
+                    try:
+                        sheet = channel_db.get_active_sheet(project)
+                        if sheet and sheet.get("spreadsheet_id"):
+                            log.info("watch %s bound to project %s sheet=%s", wid, project, sheet.get("spreadsheet_id"))
+                    except Exception:
+                        log.exception("bind watch to project failed")
                 created.append(f"{t} (fallback wid={wid})")
             except Exception:
                 failed.append(t)

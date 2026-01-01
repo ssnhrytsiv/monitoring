@@ -4,7 +4,7 @@ import os
 import time
 import json
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -14,10 +14,14 @@ log = logging.getLogger("services.gsheets_writer_transport")
 
 try:
     import gspread  # type: ignore
-    from google.oauth2.service_account import Credentials  # type: ignore
+    from google.oauth2.service_account import Credentials as SACredentials  # type: ignore
+    from google.oauth2.credentials import Credentials as UserCredentials  # type: ignore
+    from google.auth.transport.requests import Request  # type: ignore
 except Exception as e:
     gspread = None  # type: ignore
-    Credentials = None  # type: ignore
+    SACredentials = None  # type: ignore
+    UserCredentials = None  # type: ignore
+    Request = None  # type: ignore
     print("gsheets_writer: Google SDK not available:", repr(e))
     if log:
         log.error("Google SDK not available: %s", e)
@@ -36,9 +40,9 @@ HEADER = [
 ROW_RANGE = ("A", "I")
 
 _GC = None
-_SH = None
-_WS_CACHE: Dict[str, Any] = {}
-_SHEETS_WITH_HEADER: set[str] = set()
+_SH_CACHE: Dict[str, Any] = {}
+_WS_CACHE: Dict[str, Dict[str, Any]] = {}
+_SHEETS_WITH_HEADER: set[Tuple[str, str]] = set()
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
@@ -54,11 +58,32 @@ def _print_err(msg: str, exc: Exception | None = None):
 
 def _client():
     global _GC
-    if gspread is None or Credentials is None:
+    if gspread is None or SACredentials is None:
         _print_err("Google SDK is not installed (gspread / google-auth). pip install gspread google-auth")
         return None
     if _GC is not None:
         return _GC
+
+    # 1) Пробуємо OAuth token.json (user credentials)
+    token_path = os.getenv("GSHEET_OAUTH_TOKEN_FILE", "token.json")
+    if UserCredentials is not None and os.path.exists(token_path):
+        try:
+            creds = UserCredentials.from_authorized_user_file(token_path, scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive.file",
+                "https://www.googleapis.com/auth/drive",
+            ])
+            if creds and creds.expired and creds.refresh_token and Request is not None:
+                creds.refresh(Request())
+                with open(token_path, "w", encoding="utf-8") as f:
+                    f.write(creds.to_json())
+            _GC = gspread.authorize(creds)
+            log.info("gsheets: using OAuth token credentials from %s (client_id=%s)", token_path, creds.client_id)
+            return _GC
+        except Exception as e:
+            _print_err(f"Failed to load OAuth token from {token_path}", e)
+
+    # 2) Fallback: service account
     try:
         if not GSHEET_CREDS_FILE or not os.path.exists(GSHEET_CREDS_FILE):
             _print_err(f"Credentials file not found: {GSHEET_CREDS_FILE!r}")
@@ -71,8 +96,9 @@ def _client():
             "https://www.googleapis.com/auth/drive.file",
             "https://www.googleapis.com/auth/drive",
         ]
-        creds = Credentials.from_service_account_info(data, scopes=scopes)
+        creds = SACredentials.from_service_account_info(data, scopes=scopes)
         _GC = gspread.authorize(creds)
+        log.info("gsheets: using service account credentials (client_email=%s)", data.get("client_email"))
         return _GC
     except Exception as e:
         _print_err("Failed to authorize Google client", e)
@@ -80,22 +106,45 @@ def _client():
         return None
 
 
-def _open_spreadsheet():
-    global _SH
+def create_spreadsheet(title: str) -> Optional[Dict[str, str]]:
+    """
+    Створює новий Spreadsheet і повертає {"spreadsheet_id": ..., "title": ...}.
+    """
+    gc = _client()
+    if not gc:
+        return None
     try:
-        if _SH is not None:
-            return _SH
+        sh = gc.create(title)
+        # спробуємо зробити перегляд за лінком (reader)
+        try:
+            sh.share(None, perm_type="anyone", role="reader", notify=False)  # type: ignore
+        except Exception as e:
+            log.debug("gsheets: share skipped: %s", e)
+        return {"spreadsheet_id": sh.id, "title": sh.title}
+    except Exception as e:
+        _print_err("Failed to create spreadsheet", e)
+        return None
+
+
+def _open_spreadsheet(spreadsheet_id: Optional[str] = None):
+    try:
+        key = spreadsheet_id or GSHEET_SPREADSHEET_ID
+        if not key:
+            _print_err("GSHEET_SPREADSHEET_ID is empty")
+            return None
+        if key in _SH_CACHE:
+            return _SH_CACHE[key]
         gc = _client()
         if not gc:
             return None
-        if not GSHEET_SPREADSHEET_ID:
-            _print_err("GSHEET_SPREADSHEET_ID is empty")
-            return None
-        _SH = gc.open_by_key(GSHEET_SPREADSHEET_ID)
-        return _SH
+        sh = gc.open_by_key(key)
+        log.info("gsheets: opened spreadsheet key=%s title=%s", key, getattr(sh, 'title', None))
+        _SH_CACHE[key] = sh
+        return sh
     except Exception as e:
-        _print_err(f"Failed to open spreadsheet by key {GSHEET_SPREADSHEET_ID}", e)
-        _SH = None
+        _print_err(f"Failed to open spreadsheet by key {spreadsheet_id or GSHEET_SPREADSHEET_ID}", e)
+        if spreadsheet_id and spreadsheet_id in _SH_CACHE:
+            _SH_CACHE.pop(spreadsheet_id, None)
         return None
 
 
@@ -245,10 +294,13 @@ def _apply_default_sheet_formatting(ws) -> None:
         _print_err("Failed to apply default sheet formatting", e)
 
 
-def _get_or_create_worksheet(sh, title: str):
+def _get_or_create_worksheet(sh, title: str, spreadsheet_id: Optional[str]):
     global _WS_CACHE, _SHEETS_WITH_HEADER
+    ssid = spreadsheet_id or getattr(sh, "id", None) or GSHEET_SPREADSHEET_ID or ""
+    cache = _WS_CACHE.setdefault(ssid, {})
+    header_key = (ssid, title)
     try:
-        ws = _WS_CACHE.get(title)
+        ws = cache.get(title)
         created_now = False
 
         if ws is None:
@@ -257,9 +309,9 @@ def _get_or_create_worksheet(sh, title: str):
             except Exception:
                 ws = sh.add_worksheet(title=title, rows=1000, cols=len(HEADER))
                 created_now = True
-            _WS_CACHE[title] = ws
+            cache[title] = ws
 
-        if title in _SHEETS_WITH_HEADER:
+        if header_key in _SHEETS_WITH_HEADER:
             return ws
 
         if created_now:
@@ -274,7 +326,7 @@ def _get_or_create_worksheet(sh, title: str):
             except Exception as e:
                 _print_err(f"Failed to apply formatting on new sheet '{title}'", e)
 
-            _SHEETS_WITH_HEADER.add(title)
+            _SHEETS_WITH_HEADER.add(header_key)
             return ws
 
         try:
@@ -293,31 +345,31 @@ def _get_or_create_worksheet(sh, title: str):
         except Exception as e:
             _print_err(f"Failed to apply formatting on existing sheet '{title}'", e)
 
-        _SHEETS_WITH_HEADER.add(title)
+        _SHEETS_WITH_HEADER.add(header_key)
         return ws
 
     except Exception as e:
         _print_err(f"Failed to get/create worksheet '{title}'", e)
-        if title in _WS_CACHE:
-            _WS_CACHE.pop(title, None)
+        if title in cache:
+            cache.pop(title, None)
         return None
 
 
-def ensure_daily_sheet(sheet_title: str) -> bool:
-    sh = _open_spreadsheet()
+def ensure_daily_sheet(sheet_title: str, spreadsheet_id: Optional[str] = None) -> bool:
+    sh = _open_spreadsheet(spreadsheet_id)
     if not sh:
         return False
-    ws = _get_or_create_worksheet(sh, sheet_title)
+    ws = _get_or_create_worksheet(sh, sheet_title, spreadsheet_id)
     return ws is not None
 
 
-def append_rows(sheet_title: str, rows: List[List[str]]) -> None:
+def append_rows(sheet_title: str, rows: List[List[str]], spreadsheet_id: Optional[str] = None) -> None:
     if not rows:
         return
-    sh = _open_spreadsheet()
+    sh = _open_spreadsheet(spreadsheet_id)
     if not sh:
         return
-    ws = _get_or_create_worksheet(sh, sheet_title)
+    ws = _get_or_create_worksheet(sh, sheet_title, spreadsheet_id)
     if not ws:
         return
     try:
@@ -336,11 +388,11 @@ def append_rows(sheet_title: str, rows: List[List[str]]) -> None:
         _print_err(f"append_rows failed for sheet '{sheet_title}'", e)
 
 
-def read_col_I(sheet_title: str) -> List[str]:
-    sh = _open_spreadsheet()
+def read_col_I(sheet_title: str, spreadsheet_id: Optional[str] = None) -> List[str]:
+    sh = _open_spreadsheet(spreadsheet_id)
     if not sh:
         return []
-    ws = _get_or_create_worksheet(sh, sheet_title)
+    ws = _get_or_create_worksheet(sh, sheet_title, spreadsheet_id)
     if not ws:
         return []
     try:
@@ -350,10 +402,10 @@ def read_col_I(sheet_title: str) -> List[str]:
         return []
 
 
-def batch_update_values(sheet_title: str, data: List[Dict[str, Any]]) -> None:
+def batch_update_values(sheet_title: str, data: List[Dict[str, Any]], spreadsheet_id: Optional[str] = None) -> None:
     if not data:
         return
-    sh = _open_spreadsheet()
+    sh = _open_spreadsheet(spreadsheet_id)
     if not sh:
         return
     try:

@@ -10,8 +10,8 @@ class CreateWatch(StatesGroup):
     template_pick = State()
     time_window = State()
     confirm = State()
+    project_pick = State()
 
 class EditWatch(StatesGroup):
     time_window = State()
     source_input = State()
-

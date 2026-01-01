@@ -252,13 +252,15 @@ async def _create_template_from_source(src: Message) -> Optional[int]:
 
     return None
 
-async def _send_watch_from_links_batch_bot(bot, targets: List[str], mins: int, template_id: int) -> bool:
+async def _send_watch_from_links_batch_bot(bot, targets: List[str], mins: int, template_id: int, project: Optional[str]) -> bool:
     try:
         control_id = _control_chat_id()
         log.info(f"send_batch_bot control_id={control_id} template_id={template_id} mins={mins} targets_count={len(targets)}")
         if not control_id:
             return False
         header = f"/watch_from_links {int(template_id)} --window-min {int(mins)}"
+        if project:
+            header += f" --project {project}"
         body = "\n".join(targets)
         cmd = header + "\n" + body if body else header
         await bot.send_message(control_id, cmd)
@@ -376,7 +378,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
 
     sent_ok = False
     if control_id and tid:
-        sent_ok = await _send_watch_from_links_batch_bot(cb.bot, targets, mins, int(tid))
+        sent_ok = await _send_watch_from_links_batch_bot(cb.bot, targets, mins, int(tid), data.get("project"))
         if sent_ok:
             created.extend(targets)
         else:

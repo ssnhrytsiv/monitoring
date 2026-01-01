@@ -25,13 +25,13 @@ except Exception:
 
 # ⬇️ Google Sheets writer (те, що ми тестували у REPL)
 try:
-    from app.services.gsheets_writer import (
+    from app.sheet_bot.services.gsheets_writer import (
         create_or_get_daily_sheet,
         append_daily_row,
     )
     # Спробуємо також підтягнути HEADER, щоб адаптуватися під 8 або 9 колонок.
     try:
-        from app.services.gsheets_writer import HEADER as GS_HEADER  # type: ignore
+        from app.sheet_bot.services.gsheets_writer import HEADER as GS_HEADER  # type: ignore
     except Exception:
         GS_HEADER = None  # type: ignore
     _GS_OK = True
@@ -156,7 +156,7 @@ def _db_channel_meta(channel_id: int) -> Tuple[Optional[str], Optional[str]]:
 def setup(*, client=None, control_peer=None, monitor_buffer=None):
     """
     Команда:
-      /watch_from_links <template_id> [--window-min N] [--window <spec>]
+      /watch_from_links <template_id> [--window-min N] [--window <spec>] [--project <ALI|PATRON|EXPRESS>]
 
     Де <spec> може бути:
       • 30m  — 30 хвилин
@@ -185,6 +185,7 @@ def setup(*, client=None, control_peer=None, monitor_buffer=None):
 
             template_id: Optional[int] = None
             window_minutes: Optional[int] = None  # None => безстроково (якщо взагалі не задано — беремо дефолт)
+            project: Optional[str] = None
 
             i = 1
             while i < len(parts):
@@ -203,6 +204,19 @@ def setup(*, client=None, control_peer=None, monitor_buffer=None):
                 if p.startswith("--window="):
                     wm = _parse_window_spec(p.split("=", 1)[1])
                     window_minutes = wm
+                    i += 1
+                    continue
+
+                if p == "--project":
+                    if i + 1 < len(parts):
+                        project = parts[i + 1].strip()
+                        i += 2
+                        continue
+                    else:
+                        i += 1
+                        continue
+                if p.startswith("--project="):
+                    project = p.split("=", 1)[1].strip()
                     i += 1
                     continue
 
@@ -265,6 +279,11 @@ def setup(*, client=None, control_peer=None, monitor_buffer=None):
                     seen.add(su)
                     links.append(su)
 
+            log.info(
+                "watch_from_links: parsed cmd tpl=%s window_minutes=%s project=%s links=%s",
+                template_id, window_minutes, project, len(links)
+            )
+
             if not links:
                 await ev.reply("❌ Не знайдено посилань у повідомленні (нижче команди).")
                 return
@@ -323,6 +342,7 @@ def setup(*, client=None, control_peer=None, monitor_buffer=None):
                             time_window_start=time_window_start,
                             time_window_end=time_window_end,
                             source_url=url,  # нове поле (лише якщо воно вже є)
+                            project=project,
                         )
                     except TypeError:
                         # стара сигнатура без source_url
@@ -338,8 +358,8 @@ def setup(*, client=None, control_peer=None, monitor_buffer=None):
                         )
                     created += 1
                     log.info(
-                        "watch_from_links: watch_id=%s created for cid=%s url=%s window_end=%s",
-                        wid, cid, url, time_window_end
+                        "watch_from_links: watch_id=%s created for cid=%s url=%s window_end=%s project=%s",
+                        wid, cid, url, time_window_end, project
                     )
 
                     # -------- Google Sheets: запис у денний аркуш (на моменті створення) --------

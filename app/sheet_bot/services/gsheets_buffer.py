@@ -9,9 +9,11 @@ from zoneinfo import ZoneInfo
 from app.services.posts_watch_result_db import raw_connection
 from app.services import channel_db
 from app.utils.tg_links import extract_bot_username
-from app.services import gsheets_writer as gw
+from app.sheet_bot.services import gsheets_writer as gw
+import logging
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+log = logging.getLogger("sheet_bot.gsheets_buffer")
 
 TARGET_FLUSH_SEC = 15.0
 MIN_FLUSH_GAP_SEC = 5.0
@@ -24,10 +26,10 @@ _flusher_thread: Optional[threading.Thread] = None
 _flusher_stop: Optional[threading.Event] = None
 _last_flush_ts: float = 0.0
 
-_pending_appends: Dict[str, List[Tuple[int, List[str]]]] = {}
-_pending_updates: Dict[str, Dict[int, Dict[str, str]]] = {}
-_known_row_index: Dict[str, Dict[int, int]] = {}
-_recent_events: Dict[Tuple[str, int, str], float] = {}
+_pending_appends: Dict[Tuple[str, str], List[Tuple[int, List[str]]]] = {}
+_pending_updates: Dict[Tuple[str, str], Dict[int, Dict[str, str]]] = {}
+_known_row_index: Dict[Tuple[str, str], Dict[int, int]] = {}
+_recent_events: Dict[Tuple[str, str, int, str], float] = {}
 _oldest_event_ts: Optional[float] = None
 
 
@@ -67,14 +69,18 @@ def _touch_oldest_event_ts():
         _oldest_event_ts = now
 
 
-def _dedup_ttl_key(sheet: str, wid: int, etype: str) -> bool:
+def _dedup_ttl_key(sheet_key: Tuple[str, str], wid: int, etype: str) -> bool:
     now = time.time()
-    key = (sheet, wid, etype)
+    key = (sheet_key[0], sheet_key[1], wid, etype)
     ts = _recent_events.get(key)
     if ts is not None and now - ts < EVENT_TTL_SEC:
         return False
     _recent_events[key] = now
     return True
+
+
+def _mk_key(sheet: str, ssid: Optional[str]) -> Tuple[str, str]:
+    return (ssid or "", sheet)
 
 
 def _db_get_watch_core(wid: int):
@@ -85,7 +91,8 @@ def _db_get_watch_core(wid: int):
             """
             SELECT channel_id, template_id, expected_links_json,
                    time_window_start, matched_at, deleted_at,
-                   source_url
+                   source_url,
+                   project
             FROM watch_posts
             WHERE id = ?
             """,
@@ -102,6 +109,7 @@ def _db_get_watch_core(wid: int):
             "matched_at": row[4],
             "deleted_at": row[5],
             "source_url": row[6] if row[6] else None,
+            "project": row[7] if len(row) > 7 else None,
         }
     except Exception:
         return None
@@ -175,11 +183,34 @@ def _edited_other_value(when_str: str | None) -> str:
     return f"Відредаговано, інший пост ({t})"
 
 
-def _build_row_for_matched(wid: int) -> Tuple[str, List[str]]:
+def _select_sheet_for_watch(wc: dict) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Визначає аркуш і Spreadsheet ID для проєкту (якщо обрано).
+    Повертає (sheet_title_override, spreadsheet_id_override).
+    """
+    sheet_title_override = None
+    ssid_override = None
+    project = wc.get("project")
+    if project:
+        try:
+            proj_info = channel_db.get_active_sheet(project)
+            if proj_info and proj_info.get("spreadsheet_id"):
+                ssid_override = proj_info["spreadsheet_id"]
+                log.info(
+                    "sheet_select: project=%s -> spreadsheet=%s",
+                    project,
+                    ssid_override,
+                )
+        except Exception:
+            ssid_override = None
+    return sheet_title_override, ssid_override
+
+
+def _build_row_for_matched(wid: int) -> Tuple[str, List[str], Optional[str]]:
     wc = _db_get_watch_core(wid)
     if not wc:
         date_str = gw.sheet_title_from_time_window_start(None)
-        return date_str, [""] * 9
+        return date_str, [""] * 9, None
     date_str = gw.sheet_title_from_time_window_start(wc.get("time_window_start"))
     ch_title, owner_display = _resolve_title_and_owner(wc["channel_id"], wc.get("source_url"))
     t_title = _db_get_template_title(wc.get("template_id"))
@@ -187,6 +218,7 @@ def _build_row_for_matched(wid: int) -> Tuple[str, List[str]]:
     posted_at = wc.get("matched_at") or _human(datetime.now(MOSCOW_TZ))
     posted_time = _only_time(posted_at)
     source_url = wc.get("source_url") or ""
+    sheet_title_override, ssid_override = _select_sheet_for_watch(wc)
     row = [
         ch_title or "",
         source_url,
@@ -198,19 +230,20 @@ def _build_row_for_matched(wid: int) -> Tuple[str, List[str]]:
         owner_display or "",
         wid,
     ]
-    return date_str, row
+    return sheet_title_override or date_str, row, ssid_override
 
 
-def _build_row_for_expired(wid: int) -> Tuple[str, List[str]]:
+def _build_row_for_expired(wid: int) -> Tuple[str, List[str], Optional[str]]:
     wc = _db_get_watch_core(wid)
     if not wc:
         date_str = gw.sheet_title_from_time_window_start(None)
-        return date_str, [""] * 9
+        return date_str, [""] * 9, None
     date_str = gw.sheet_title_from_time_window_start(wc.get("time_window_start"))
     ch_title, owner_display = _resolve_title_and_owner(wc["channel_id"], wc.get("source_url"))
     t_title = _db_get_template_title(wc.get("template_id"))
     links_text = _links_text_from_json(wc.get("expected_links_json"))
     source_url = wc.get("source_url") or ""
+    sheet_title_override, ssid_override = _select_sheet_for_watch(wc)
     row = [
         ch_title or "",
         source_url,
@@ -222,19 +255,20 @@ def _build_row_for_expired(wid: int) -> Tuple[str, List[str]]:
         owner_display or "",
         wid,
     ]
-    return date_str, row
+    return sheet_title_override or date_str, row, ssid_override
 
 
-def _build_row_for_edited_other(wid: int, when_str: str | None) -> Tuple[str, List[str]]:
+def _build_row_for_edited_other(wid: int, when_str: str | None) -> Tuple[str, List[str], Optional[str]]:
     wc = _db_get_watch_core(wid)
     if not wc:
         date_str = gw.sheet_title_from_time_window_start(None)
-        return date_str, [""] * 9
+        return date_str, [""] * 9, None
     date_str = gw.sheet_title_from_time_window_start(wc.get("time_window_start"))
     ch_title, owner_display = _resolve_title_and_owner(wc["channel_id"], wc.get("source_url"))
     t_title = _db_get_template_title(wc.get("template_id"))
     links_text = _links_text_from_json(wc.get("expected_links_json"))
     source_url = wc.get("source_url") or ""
+    sheet_title_override, ssid_override = _select_sheet_for_watch(wc)
     row = [
         ch_title or "",
         source_url,
@@ -246,7 +280,7 @@ def _build_row_for_edited_other(wid: int, when_str: str | None) -> Tuple[str, Li
         owner_display or "",
         wid,
     ]
-    return date_str, row
+    return sheet_title_override or date_str, row, ssid_override
 
 
 def record_matched(watch_id: int) -> bool:
@@ -259,16 +293,18 @@ def record_matched(watch_id: int) -> bool:
       - якщо в кеші немає, але рядок уже існує в шиті – знаходимо його по колонці I і додаємо update;
       - лише якщо рядка взагалі ніде немає – додаємо новий append.
     """
-    date_str, row = _build_row_for_matched(watch_id)
+    date_str, row, ssid = _build_row_for_matched(watch_id)
     if not date_str:
         return False
+    key = _mk_key(date_str, ssid)
+    log.info("record_matched: wid=%s sheet=%s ssid=%s project_row=%s", watch_id, date_str, ssid, row[0:2])
 
     # Спочатку перевіряємо буфери під локом
     with _buf_lock:
-        gw.ensure_daily_sheet(date_str)
+        gw.ensure_daily_sheet(date_str, spreadsheet_id=ssid)
 
         # 1) оновлюємо вже запланований append, якщо він є
-        bucket_app = _pending_appends.setdefault(date_str, [])
+        bucket_app = _pending_appends.setdefault(key, [])
         for idx, (wid, existing_row) in enumerate(bucket_app):
             if wid == watch_id:
                 bucket_app[idx] = (watch_id, row)
@@ -276,16 +312,16 @@ def record_matched(watch_id: int) -> bool:
                 return True
 
         # 2) якщо знаємо рядок у вже записаному шиті – робимо update по C
-        known_rows = _known_row_index.get(date_str, {})
+        known_rows = _known_row_index.get(key, {})
         if watch_id in known_rows:
-            bucket_upd = _pending_updates.setdefault(date_str, {})
+            bucket_upd = _pending_updates.setdefault(key, {})
             entry = bucket_upd.setdefault(watch_id, {})
             entry["C"] = row[2]
             _touch_oldest_event_ts()
             return True
 
     # 2.5) поза локом: спробувати знайти рядок напряму в Google Sheets по колонці I
-    values_i = gw.read_col_I(date_str)
+    values_i = gw.read_col_I(date_str, spreadsheet_id=ssid)
     mapping: Dict[int, int] = {}
     for idx in range(2, len(values_i) + 1):
         try:
@@ -298,19 +334,19 @@ def record_matched(watch_id: int) -> bool:
 
     with _buf_lock:
         # оновлюємо кеш відомих рядків
-        km = _known_row_index.setdefault(date_str, {})
+        km = _known_row_index.setdefault(key, {})
         km.update(mapping)
 
         if row_idx:
             # 3) тепер знаємо рядок -> робимо update по C
-            bucket_upd = _pending_updates.setdefault(date_str, {})
+            bucket_upd = _pending_updates.setdefault(key, {})
             entry = bucket_upd.setdefault(watch_id, {})
             entry["C"] = row[2]
             _touch_oldest_event_ts()
             return True
 
         # 4) взагалі не знайшли цей watch_id у шиті -> створюємо новий рядок
-        _pending_appends.setdefault(date_str, []).append((watch_id, row))
+        _pending_appends.setdefault(key, []).append((watch_id, row))
         _touch_oldest_event_ts()
     return True
 
@@ -320,10 +356,13 @@ def record_views(watch_id: int, views: int | None) -> bool:
     if not wc:
         return False
     date_str = gw.sheet_title_from_time_window_start(wc.get("time_window_start"))
-    if not _dedup_ttl_key(date_str, watch_id, "views"):
+    sheet_title_override, ssid_override = _select_sheet_for_watch(wc)
+    sheet_title = sheet_title_override or date_str
+    key = _mk_key(sheet_title, ssid_override)
+    if not _dedup_ttl_key(key, watch_id, "views"):
         return True
     with _buf_lock:
-        bucket = _pending_updates.setdefault(date_str, {})
+        bucket = _pending_updates.setdefault(key, {})
         entry = bucket.setdefault(watch_id, {})
         entry["D"] = _fmt_views(views)
         _touch_oldest_event_ts()
@@ -335,11 +374,14 @@ def record_deleted(watch_id: int, when_str: str | None = None) -> bool:
     if not wc:
         return False
     date_str = gw.sheet_title_from_time_window_start(wc.get("time_window_start"))
+    sheet_title_override, ssid_override = _select_sheet_for_watch(wc)
+    sheet_title = sheet_title_override or date_str
+    key = _mk_key(sheet_title, ssid_override)
     when = when_str or wc.get("deleted_at") or _human(datetime.now(MOSCOW_TZ))
-    if not _dedup_ttl_key(date_str, watch_id, "deleted"):
+    if not _dedup_ttl_key(key, watch_id, "deleted"):
         return True
     with _buf_lock:
-        bucket = _pending_updates.setdefault(date_str, {})
+        bucket = _pending_updates.setdefault(key, {})
         entry = bucket.setdefault(watch_id, {})
         entry["E"] = _only_time(when)
         _touch_oldest_event_ts()
@@ -351,25 +393,30 @@ def record_expired(watch_id: int) -> bool:
     if not wc:
         return False
     date_str = gw.sheet_title_from_time_window_start(wc.get("time_window_start"))
-    if not _dedup_ttl_key(date_str, watch_id, "expired"):
+    sheet_title_override, ssid_override = _select_sheet_for_watch(wc)
+    sheet_title = sheet_title_override or date_str
+    key = _mk_key(sheet_title, ssid_override)
+    if not _dedup_ttl_key(key, watch_id, "expired"):
         return True
     with _buf_lock:
         existing = False
-        if _known_row_index.get(date_str, {}).get(watch_id):
+        if _known_row_index.get(key, {}).get(watch_id):
             existing = True
         if not existing:
-            for wid, _ in _pending_appends.get(date_str, []):
+            for wid, _ in _pending_appends.get(key, []):
                 if wid == watch_id:
                     existing = True
                     break
         if existing:
-            bucket = _pending_updates.setdefault(date_str, {})
+            bucket = _pending_updates.setdefault(key, {})
             entry = bucket.setdefault(watch_id, {})
             entry["C"] = "Не вийшов"
         else:
-            d, row = _build_row_for_expired(watch_id)
-            gw.ensure_daily_sheet(d)
-            _pending_appends.setdefault(d, []).append((watch_id, row))
+            d, row, ssid = _build_row_for_expired(watch_id)
+            key_inner = _mk_key(d, ssid)
+            log.info("record_expired: wid=%s sheet=%s ssid=%s", watch_id, d, ssid)
+            gw.ensure_daily_sheet(d, spreadsheet_id=ssid)
+            _pending_appends.setdefault(key_inner, []).append((watch_id, row))
         _touch_oldest_event_ts()
     return True
 
@@ -379,11 +426,14 @@ def record_edited_other_post(watch_id: int, when_str: str | None = None) -> bool
     if not wc:
         return False
     date_str = gw.sheet_title_from_time_window_start(wc.get("time_window_start"))
-    if not _dedup_ttl_key(date_str, watch_id, "edited_other"):
+    sheet_title_override, ssid_override = _select_sheet_for_watch(wc)
+    sheet_title = sheet_title_override or date_str
+    key = _mk_key(sheet_title, ssid_override)
+    if not _dedup_ttl_key(key, watch_id, "edited_other"):
         return True
     val_c = _edited_other_value(when_str)
     with _buf_lock:
-        bucket = _pending_updates.setdefault(date_str, {})
+        bucket = _pending_updates.setdefault(key, {})
         entry = bucket.setdefault(watch_id, {})
         entry["C"] = val_c
         _touch_oldest_event_ts()
@@ -434,16 +484,20 @@ def stop_flusher() -> None:
 def flush_now() -> None:
     with _buf_lock:
         sheets = sorted(set(_pending_appends.keys()) | set(_pending_updates.keys()))
-    for sheet in sheets:
-        _flush_sheet(sheet)
+    for sheet_key in sheets:
+        _flush_sheet(sheet_key)
 
 
-def _flush_sheet(sheet: str) -> None:
+def _flush_sheet(sheet_key: Tuple[str, str]) -> None:
+    ssid = sheet_key[0] or None
+    sheet = sheet_key[1]
+    log.info("flush_sheet: sheet=%s ssid=%s", sheet, ssid)
+    gw.ensure_daily_sheet(sheet, spreadsheet_id=ssid)
     with _buf_lock:
-        appends = list(_pending_appends.get(sheet, []))
-        updates = dict(_pending_updates.get(sheet, {}))
-        _pending_appends[sheet] = []
-        _pending_updates[sheet] = {}
+        appends = list(_pending_appends.get(sheet_key, []))
+        updates = dict(_pending_updates.get(sheet_key, {}))
+        _pending_appends[sheet_key] = []
+        _pending_updates[sheet_key] = {}
 
     merged_rows: List[List[str]] = []
 
@@ -461,11 +515,11 @@ def _flush_sheet(sheet: str) -> None:
             merged_rows.append(row)
         if merged_rows:
             for i in range(0, len(merged_rows), APPEND_CHUNK):
-                gw.append_rows(sheet, merged_rows[i: i + APPEND_CHUNK])
+                gw.append_rows(sheet, merged_rows[i: i + APPEND_CHUNK], spreadsheet_id=ssid)
 
     # у updates залишилися тільки ті wid, для яких немає append'ів
     if updates:
-        values_i = gw.read_col_I(sheet)
+        values_i = gw.read_col_I(sheet, spreadsheet_id=ssid)
         mapping: Dict[int, int] = {}
         for idx in range(2, len(values_i) + 1):
             try:
@@ -475,12 +529,12 @@ def _flush_sheet(sheet: str) -> None:
             mapping[wid] = idx
 
         with _buf_lock:
-            km = _known_row_index.setdefault(sheet, {})
+            km = _known_row_index.setdefault(sheet_key, {})
             km.update(mapping)
 
         data: List[Dict[str, Any]] = []
         for wid, fields in updates.items():
-            row_idx = mapping.get(wid) or _known_row_index.get(sheet, {}).get(wid)
+            row_idx = mapping.get(wid) or _known_row_index.get(sheet_key, {}).get(wid)
             if not row_idx:
                 continue
             if "C" in fields:
@@ -490,7 +544,7 @@ def _flush_sheet(sheet: str) -> None:
             if "E" in fields:
                 data.append({"range": f"'{sheet}'!E{row_idx}:E{row_idx}", "values": [[fields["E"]]]})
         if data:
-            gw.batch_update_values(sheet, data)
+            gw.batch_update_values(sheet, data, spreadsheet_id=ssid)
 
     _cleanup_recent()
 

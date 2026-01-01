@@ -130,6 +130,29 @@ def init() -> None:
     _conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_bot_links_username ON bot_links(username)")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_bot_links_status ON bot_links(status)")
 
+    # Проєктні таблиці для Google Sheets (активні та архівні)
+    _conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sheet_projects (
+            project TEXT PRIMARY KEY,
+            active_spreadsheet_id TEXT,
+            active_title TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    _conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sheet_project_archives (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project TEXT NOT NULL,
+            spreadsheet_id TEXT NOT NULL,
+            title TEXT,
+            archived_at TEXT
+        )
+        """
+    )
+
     _conn.commit()
 
 
@@ -640,3 +663,123 @@ def delete_bot_link(username: str) -> bool:
         cur.execute("DELETE FROM bot_links WHERE username = ?", (username,))
         conn.commit()
         return cur.rowcount > 0
+
+
+# --------- Sheet projects (Google Sheets per project) ----------
+
+def set_active_sheet(project: str, spreadsheet_id: str, title: Optional[str]) -> None:
+    """
+    Встановлює активну таблицю для проєкту і додає попередню у архів (якщо була).
+    """
+    project = (project or "").strip()
+    if not project or not spreadsheet_id:
+        return
+    conn = _ensure_conn()
+    now = _now()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT active_spreadsheet_id, active_title FROM sheet_projects WHERE project=? LIMIT 1",
+            (project,),
+        )
+        row = cur.fetchone()
+        prev_id = row[0] if row else None
+        prev_title = row[1] if row else None
+        if prev_id:
+            cur.execute(
+                """
+                INSERT INTO sheet_project_archives(project, spreadsheet_id, title, archived_at)
+                VALUES (?,?,?,?)
+                """,
+                (project, prev_id, prev_title, now),
+            )
+        cur.execute(
+            """
+            INSERT INTO sheet_projects(project, active_spreadsheet_id, active_title, updated_at)
+            VALUES (?,?,?,?)
+            ON CONFLICT(project) DO UPDATE SET
+                active_spreadsheet_id=excluded.active_spreadsheet_id,
+                active_title=excluded.active_title,
+                updated_at=excluded.updated_at
+            """,
+            (project, spreadsheet_id, title, now),
+        )
+        conn.commit()
+
+
+def get_active_sheet(project: str) -> Optional[Dict[str, Any]]:
+    project = (project or "").strip()
+    if not project:
+        return None
+    conn = _ensure_conn()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT project, active_spreadsheet_id, active_title, updated_at
+            FROM sheet_projects
+            WHERE project=? LIMIT 1
+            """,
+            (project,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "project": row[0],
+        "spreadsheet_id": row[1],
+        "title": row[2],
+        "updated_at": row[3],
+    }
+
+
+def list_archived_sheets(project: Optional[str] = None) -> List[Dict[str, Any]]:
+    conn = _ensure_conn()
+    params: list[Any] = []
+    where = ""
+    if project:
+        where = "WHERE project=?"
+        params.append(project)
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT id, project, spreadsheet_id, title, archived_at
+            FROM sheet_project_archives
+            {where}
+            ORDER BY archived_at DESC, id DESC
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "id": r[0],
+                "project": r[1],
+                "spreadsheet_id": r[2],
+                "title": r[3],
+                "archived_at": r[4],
+            }
+        )
+    return out
+
+
+def list_sheet_projects() -> List[str]:
+    """
+    Повертає унікальні назви проєктів, для яких є активні або архівні таблиці.
+    """
+    conn = _ensure_conn()
+    res: set[str] = set()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT project FROM sheet_projects")
+        for (p,) in cur.fetchall():
+            if p:
+                res.add(str(p))
+        cur.execute("SELECT DISTINCT project FROM sheet_project_archives")
+        for (p,) in cur.fetchall():
+            if p:
+                res.add(str(p))
+    return sorted(res)
