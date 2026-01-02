@@ -30,6 +30,9 @@ __all__ = [
     "get_watch_source_url",
     "get_watch_created_by",
     "get_watch_created_via",
+    "create_watch_group",
+    "fetch_pending_by_group",
+    "fetch_watches_by_group",
     "insert_watch_event",
     "fetch_unsent_events",
     "mark_event_sent",
@@ -81,6 +84,7 @@ def init() -> None:
         CREATE TABLE IF NOT EXISTS watch_posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             channel_id BIGINT NOT NULL,
+            group_id BIGINT,
             template_id BIGINT,
             expected_text_hash TEXT,
             expected_text_norm_len INTEGER,
@@ -104,6 +108,22 @@ def init() -> None:
         )
         """
     )
+
+    _conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS watch_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project TEXT,
+            title TEXT,
+            created_by BIGINT,
+            created_via TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    if not _has_column(_conn, "watch_posts", "group_id"):
+        _conn.execute("ALTER TABLE watch_posts ADD COLUMN group_id BIGINT")
 
     if not _has_column(_conn, "watch_posts", "source_url"):
         _conn.execute("ALTER TABLE watch_posts ADD COLUMN source_url TEXT")
@@ -136,6 +156,7 @@ def init() -> None:
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_wp_covcheck ON watch_posts(coverage_check_at)")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_wp_matched_session ON watch_posts(matched_session)")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_wp_created_by ON watch_posts(created_by)")
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_wp_group ON watch_posts(group_id)")
 
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_we_sent_at ON watch_events(sent_at)")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_we_unsent ON watch_events(sent_at, id)")
@@ -156,15 +177,42 @@ class DuplicateWatchError(RuntimeError):
     pass
 
 
+def create_watch_group(
+    project: Optional[str] = None,
+    title: Optional[str] = None,
+    created_by: Optional[int] = None,
+    created_via: Optional[str] = None,
+) -> int:
+    conn = _ensure_conn()
+    now = _now()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO watch_groups (project, title, created_by, created_via, created_at)
+            VALUES (?,?,?,?,?)
+            """,
+            (project, title, created_by, created_via, now),
+        )
+        conn.commit()
+        gid = int(cur.lastrowid)
+    log.debug(
+        "[posts_watch_result_db.create_watch_group] group_id=%s project=%s title=%s created_by=%s via=%s",
+        gid, project, title, created_by, created_via,
+    )
+    return gid
+
+
 def create_watch(
     channel_id: int,
-    template_id: Optional[int],
-    expected_text_hash: Optional[str],
-    expected_text_norm_len: Optional[int],
-    expected_links_json: Optional[str],
-    expected_media_fingerprint: Optional[str],
-    time_window_start: Optional[str],
-    time_window_end: Optional[str],
+    group_id: Optional[int] = None,
+    template_id: Optional[int] = None,
+    expected_text_hash: Optional[str] = None,
+    expected_text_norm_len: Optional[int] = None,
+    expected_links_json: Optional[str] = None,
+    expected_media_fingerprint: Optional[str] = None,
+    time_window_start: Optional[str] = None,
+    time_window_end: Optional[str] = None,
     source_url: Optional[str] = None,
     created_by: Optional[int] = None,
     created_via: Optional[str] = None,
@@ -178,7 +226,7 @@ def create_watch(
             cur.execute(
                 """
                 INSERT INTO watch_posts (
-                    channel_id, template_id,
+                    channel_id, group_id, template_id,
                     expected_text_hash, expected_text_norm_len, expected_links_json,
                     expected_media_fingerprint,
                     time_window_start, time_window_end,
@@ -188,10 +236,10 @@ def create_watch(
                     created_by,
                     created_via,
                     project
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    channel_id, template_id,
+                    channel_id, group_id, template_id,
                     expected_text_hash, expected_text_norm_len, expected_links_json,
                     expected_media_fingerprint,
                     time_window_start, time_window_end,
@@ -210,8 +258,8 @@ def create_watch(
             ) from e
 
     log.info(
-        "[posts_watch_result_db.create_watch] watch_id=%s channel_id=%s status=pending source_url=%s created_by=%s created_via=%s",
-        wid, channel_id, source_url, created_by, created_via,
+        "[posts_watch_result_db.create_watch] watch_id=%s channel_id=%s status=pending group_id=%s source_url=%s created_by=%s created_via=%s",
+        wid, channel_id, group_id, source_url, created_by, created_via,
     )
     return wid
 
@@ -283,6 +331,78 @@ def insert_watch_event(watch_id: int, event_type: str, payload: Optional[Dict[st
             ),
         )
         conn.commit()
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "watch_event inserted id=%s watch_id=%s type=%s created_at=%s",
+                cur.lastrowid,
+                watch_id,
+                event_type,
+                now,
+            )
+
+
+def fetch_pending_by_group(group_id: int) -> List[Dict[str, Any]]:
+    conn = _ensure_conn()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, channel_id, source_url, project, created_at
+            FROM watch_posts
+            WHERE group_id=? AND status='pending'
+            ORDER BY id ASC
+            """,
+            (int(group_id),),
+        )
+        rows = cur.fetchall()
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("fetch_pending_by_group: group_id=%s fetched=%s", group_id, len(rows))
+    result: List[Dict[str, Any]] = []
+    for r in rows:
+        result.append(
+            {
+                "id": int(r[0]),
+                "channel_id": int(r[1]),
+                "source_url": str(r[2]) if r[2] else None,
+                "project": r[3],
+                "created_at": str(r[4] or ""),
+            }
+        )
+    return result
+
+
+def fetch_watches_by_group(group_id: int) -> List[Dict[str, Any]]:
+    conn = _ensure_conn()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, channel_id, source_url, project, status, created_at, updated_at, deleted_at, final_views
+            FROM watch_posts
+            WHERE group_id=?
+            ORDER BY id ASC
+            """,
+            (int(group_id),),
+        )
+        rows = cur.fetchall()
+    result: List[Dict[str, Any]] = []
+    for r in rows:
+        result.append(
+            {
+                "id": int(r[0]),
+                "channel_id": int(r[1]),
+                "source_url": str(r[2]) if r[2] else None,
+                "project": r[3],
+                "status": r[4],
+                "created_at": str(r[5] or ""),
+                "updated_at": str(r[6] or ""),
+                "deleted_at": str(r[7] or ""),
+                "final_views": r[8],
+            }
+        )
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("fetch_watches_by_group: group_id=%s fetched=%s", group_id, len(result))
+    return result
 
 
 def fetch_unsent_events(limit: int = 100) -> List[Tuple[int, int, str, str, str]]:
@@ -300,6 +420,8 @@ def fetch_unsent_events(limit: int = 100) -> List[Tuple[int, int, str, str, str]
             (int(limit),),
         )
         rows = cur.fetchall()
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("fetch_unsent_events: fetched=%s", len(rows))
     return [
         (int(r[0]), int(r[1]), str(r[2]), str(r[3] or ""), str(r[4] or ""))
         for r in rows
@@ -310,7 +432,7 @@ def mark_event_sent(event_id: int, sent_to: int) -> None:
     conn = _ensure_conn()
     now = _now()
     with _lock:
-        conn.execute(
+        cur = conn.execute(
             """
             UPDATE watch_events
             SET sent_to=?, sent_at=?
@@ -319,6 +441,8 @@ def mark_event_sent(event_id: int, sent_to: int) -> None:
             (int(sent_to), now, int(event_id)),
         )
         conn.commit()
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("mark_event_sent: id=%s sent_to=%s updated=%s at=%s", event_id, sent_to, cur.rowcount, now)
 
 
 def mark_matched(
@@ -362,20 +486,44 @@ def mark_done_views(watch_id: int, final_views: Optional[int]) -> None:
     log.info("[posts_watch_result_db.mark_done_views] watch_id=%s final_views=%s status=done", watch_id, final_views)
 
 
-def mark_done_deleted(watch_id: int) -> None:
+def mark_done_deleted(watch_id: int) -> Optional[str]:
     conn = _ensure_conn()
     now = _now()
     with _lock:
+        cur = conn.execute(
+            "SELECT status FROM watch_posts WHERE id=? LIMIT 1",
+            (watch_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        status = (row[0] or "").lower()
+
+        # Якщо встигли поставити фінальні views (status=done) — залишаємо status як є.
+        if status == "done":
+            conn.execute(
+                """
+                UPDATE watch_posts
+                SET deleted_at=COALESCE(deleted_at, ?), updated_at=?
+                WHERE id=? AND status='done'
+                """,
+                (now, now, watch_id),
+            )
+            conn.commit()
+            log.info("[posts_watch_result_db.mark_done_deleted] watch_id=%s deleted_at set, status kept as done", watch_id)
+            return status
+
         conn.execute(
             """
             UPDATE watch_posts
-            SET deleted_at=COALESCE(deleted_at, ?), status='done', updated_at=?
-            WHERE id=? AND status IN ('matched','done')
+            SET deleted_at=COALESCE(deleted_at, ?), status='deleted', updated_at=?
+            WHERE id=? AND status IN ('matched','deleted','edited')
             """,
             (now, now, watch_id),
         )
         conn.commit()
-    log.info("[posts_watch_result_db.mark_done_deleted] watch_id=%s deleted status=done", watch_id)
+    log.info("[posts_watch_result_db.mark_done_deleted] watch_id=%s deleted status=deleted", watch_id)
+    return status
 
 
 def find_matched_by_message(channel_id: int, message_id: int) -> list[int]:
@@ -386,7 +534,7 @@ def find_matched_by_message(channel_id: int, message_id: int) -> list[int]:
             """
             SELECT id
             FROM watch_posts
-            WHERE status IN ('matched','done') AND channel_id=? AND matched_message_id=?
+            WHERE status IN ('matched','done','deleted','edited') AND channel_id=? AND matched_message_id=?
             """,
             (channel_id, message_id),
         )
@@ -416,7 +564,7 @@ def mark_unmatched_after_edit(watch_id: int) -> None:
             SET status=CASE WHEN status='matched' THEN 'expired' ELSE status END,
                 coverage_check_at=NULL,
                 updated_at=?
-            WHERE id=? AND status IN ('matched','done')
+            WHERE id=? AND status IN ('matched','done','edited')
             """,
             (now, watch_id),
         )

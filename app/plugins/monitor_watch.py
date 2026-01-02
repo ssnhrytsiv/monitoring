@@ -16,7 +16,7 @@ from app.utils.tg_links import sanitize_link
 
 from app.services.joiner import probe_channel_id
 from app.services.membership_db import map_invite_get
-from app.services.posts_watch_result_db import create_watch, raw_connection
+from app.services.posts_watch_result_db import create_watch, create_watch_group, raw_connection
 
 try:
     from app.services.post_watch_db import list_templates_full
@@ -313,6 +313,18 @@ def setup(*, client=None, control_peer=None, monitor_buffer=None):
             else:
                 time_window_end = None
 
+            # Група вотчів для цього запиту (щоб потім відобразити pending у нотіфікаторі)
+            group_id = None
+            try:
+                group_id = create_watch_group(
+                    project=project,
+                    title=tpl_title,
+                    created_by=getattr(ev, "sender_id", None),
+                    created_via="control_chat",
+                )
+            except Exception:
+                log.warning("watch_from_links: create_watch_group failed", exc_info=True)
+
             for url in links:
                 try:
                     cid, kind, inv = await _resolve_channel_id_from_link(url)
@@ -343,9 +355,10 @@ def setup(*, client=None, control_peer=None, monitor_buffer=None):
                             time_window_end=time_window_end,
                             source_url=url,  # нове поле (лише якщо воно вже є)
                             project=project,
+                            group_id=group_id,
                         )
                     except TypeError:
-                        # стара сигнатура без source_url
+                        # стара сигнатура без source_url/group_id
                         wid = create_watch(
                             channel_id=cid,
                             template_id=template_id,

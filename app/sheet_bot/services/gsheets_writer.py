@@ -17,11 +17,13 @@ try:
     from google.oauth2.service_account import Credentials as SACredentials  # type: ignore
     from google.oauth2.credentials import Credentials as UserCredentials  # type: ignore
     from google.auth.transport.requests import Request  # type: ignore
+    from googleapiclient.discovery import build  # type: ignore
 except Exception as e:
     gspread = None  # type: ignore
     SACredentials = None  # type: ignore
     UserCredentials = None  # type: ignore
     Request = None  # type: ignore
+    build = None  # type: ignore
     print("gsheets_writer: Google SDK not available:", repr(e))
     if log:
         log.error("Google SDK not available: %s", e)
@@ -40,11 +42,15 @@ HEADER = [
 ROW_RANGE = ("A", "I")
 
 _GC = None
+_GC_SA = None
 _SH_CACHE: Dict[str, Any] = {}
 _WS_CACHE: Dict[str, Dict[str, Any]] = {}
 _SHEETS_WITH_HEADER: set[Tuple[str, str]] = set()
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+GSHEET_DRIVE_ID = os.getenv("GSHEET_DRIVE_ID")
+GSHEET_PREFER_SA = os.getenv("GSHEET_PREFER_SA", "1") == "1"
+_SA_EMAIL: Optional[str] = None
 
 
 def _print_err(msg: str, exc: Exception | None = None):
@@ -56,15 +62,45 @@ def _print_err(msg: str, exc: Exception | None = None):
         log.error(msg)
 
 
-def _client():
+def _client(service_only: bool = False):
     global _GC
+    global _GC_SA
+    global _SA_EMAIL
     if gspread is None or SACredentials is None:
         _print_err("Google SDK is not installed (gspread / google-auth). pip install gspread google-auth")
         return None
+
+    # 1) Service Account (примусово, щоб створення йшло через SA)
+    if _GC_SA is None:
+        try:
+            if not GSHEET_CREDS_FILE or not os.path.exists(GSHEET_CREDS_FILE):
+                _print_err(f"Credentials file not found: {GSHEET_CREDS_FILE!r}")
+            else:
+                with open(GSHEET_CREDS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                scopes = [
+                    "https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive.file",
+                    "https://www.googleapis.com/auth/drive",
+                ]
+                creds_sa = SACredentials.from_service_account_info(data, scopes=scopes)
+                _GC_SA = gspread.authorize(creds_sa)
+                _SA_EMAIL = data.get("client_email")
+                log.info("gsheets: using service account credentials (client_email=%s)", data.get("client_email"))
+        except Exception as e:
+            _print_err("Failed to authorize Google client (service account)", e)
+            _GC_SA = None
+
+    if not service_only and GSHEET_PREFER_SA and _GC_SA is not None:
+        return _GC_SA
+
+    if service_only:
+        return _GC_SA
+
     if _GC is not None:
         return _GC
 
-    # 1) Пробуємо OAuth token.json (user credentials)
+    # 2) OAuth token.json (user credentials)
     token_path = os.getenv("GSHEET_OAUTH_TOKEN_FILE", "token.json")
     if UserCredentials is not None and os.path.exists(token_path):
         try:
@@ -74,7 +110,11 @@ def _client():
                 "https://www.googleapis.com/auth/drive",
             ])
             if creds and creds.expired and creds.refresh_token and Request is not None:
-                creds.refresh(Request())
+                try:
+                    creds.refresh(Request())
+                except Exception as refresh_exc:
+                    _print_err(f"Failed to refresh OAuth token from {token_path}", refresh_exc)
+                    raise
                 with open(token_path, "w", encoding="utf-8") as f:
                     f.write(creds.to_json())
             _GC = gspread.authorize(creds)
@@ -82,44 +122,111 @@ def _client():
             return _GC
         except Exception as e:
             _print_err(f"Failed to load OAuth token from {token_path}", e)
+            _GC = None
 
-    # 2) Fallback: service account
-    try:
-        if not GSHEET_CREDS_FILE or not os.path.exists(GSHEET_CREDS_FILE):
-            _print_err(f"Credentials file not found: {GSHEET_CREDS_FILE!r}")
-            return None
-        with open(GSHEET_CREDS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive.file",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = SACredentials.from_service_account_info(data, scopes=scopes)
-        _GC = gspread.authorize(creds)
-        log.info("gsheets: using service account credentials (client_email=%s)", data.get("client_email"))
-        return _GC
-    except Exception as e:
-        _print_err("Failed to authorize Google client", e)
-        _GC = None
-        return None
+    # fallback до SA, якщо OAuth не вдалось
+    return _GC_SA
 
 
 def create_spreadsheet(title: str) -> Optional[Dict[str, str]]:
     """
     Створює новий Spreadsheet і повертає {"spreadsheet_id": ..., "title": ...}.
     """
-    gc = _client()
+    # 1) Пробуємо через OAuth користувача (token.json) + Drive API, щоб створювати в Shared Drive
+    if build and UserCredentials is not None:
+        token_path = os.getenv("GSHEET_OAUTH_TOKEN_FILE", "token.json")
+        if os.path.exists(token_path):
+            try:
+                scopes = [
+                    "https://www.googleapis.com/auth/drive",
+                    "https://www.googleapis.com/auth/drive.file",
+                    "https://www.googleapis.com/auth/spreadsheets",
+                ]
+                creds_user = UserCredentials.from_authorized_user_file(token_path, scopes=scopes)
+                if creds_user and creds_user.expired and creds_user.refresh_token and Request is not None:
+                    creds_user.refresh(Request())
+                    with open(token_path, "w", encoding="utf-8") as f:
+                        f.write(creds_user.to_json())
+                drive = build("drive", "v3", credentials=creds_user)
+                body = {
+                    "name": title,
+                    "mimeType": "application/vnd.google-apps.spreadsheet",
+                }
+                if GSHEET_DRIVE_ID:
+                    body["parents"] = [GSHEET_DRIVE_ID]
+                    log.info("gsheets: creating spreadsheet via OAuth in shared drive %s (title=%s)", GSHEET_DRIVE_ID, title)
+                else:
+                    log.info("gsheets: creating spreadsheet via OAuth in MyDrive (title=%s)", title)
+                file = drive.files().create(
+                    body=body,
+                    fields="id,name",
+                    supportsAllDrives=True,
+                ).execute()
+                # Поділимось на service account, щоб усі подальші операції міг виконувати SA
+                sa_email = _SA_EMAIL
+                if not sa_email and GSHEET_CREDS_FILE and os.path.exists(GSHEET_CREDS_FILE):
+                    try:
+                        with open(GSHEET_CREDS_FILE, "r", encoding="utf-8") as f:
+                            sa_email = json.load(f).get("client_email")
+                    except Exception:
+                        sa_email = None
+                if sa_email:
+                    try:
+                        drive.permissions().create(
+                            fileId=file.get("id"),
+                            supportsAllDrives=True,
+                            body={
+                                "type": "user",
+                                "role": "writer",
+                                "emailAddress": sa_email,
+                            },
+                            sendNotificationEmail=False,
+                        ).execute()
+                        log.info("gsheets: shared newly created sheet %s with service account %s", file.get("id"), sa_email)
+                    except Exception as share_exc:
+                        _print_err(f"Failed to share spreadsheet {file.get('id')} with SA {sa_email}", share_exc)
+                return {"spreadsheet_id": file.get("id"), "title": file.get("name")}
+            except Exception as e:
+                _print_err("Failed to create spreadsheet via Drive API (OAuth)", e)
+
+    # 2) Спроба через service account + Drive API
+    if build and GSHEET_CREDS_FILE and os.path.exists(GSHEET_CREDS_FILE):
+        try:
+            scopes = [
+                "https://www.googleapis.com/auth/drive",
+                "https://www.googleapis.com/auth/drive.file",
+                "https://www.googleapis.com/auth/spreadsheets",
+            ]
+            creds_sa = SACredentials.from_service_account_file(GSHEET_CREDS_FILE, scopes=scopes)
+            drive = build("drive", "v3", credentials=creds_sa)
+            body = {
+                "name": title,
+                "mimeType": "application/vnd.google-apps.spreadsheet",
+            }
+            if GSHEET_DRIVE_ID:
+                body["parents"] = [GSHEET_DRIVE_ID]
+                log.info("gsheets: creating spreadsheet in shared drive %s (title=%s) via SA", GSHEET_DRIVE_ID, title)
+            else:
+                log.info("gsheets: creating spreadsheet in MyDrive of service account (title=%s)", title)
+            file = drive.files().create(
+                body=body,
+                fields="id,name",
+                supportsAllDrives=True,
+            ).execute()
+            return {"spreadsheet_id": file.get("id"), "title": file.get("name")}
+        except Exception as e:
+            _print_err("Failed to create spreadsheet via Drive API (service account)", e)
+    elif build is None:
+        log.error("google-api-python-client is not installed; fallback to gspread create (без Shared Drive)")
+    elif not GSHEET_CREDS_FILE or not os.path.exists(GSHEET_CREDS_FILE):
+        _print_err("Cannot create spreadsheet: GSHEET_CREDS_FILE is missing", None)
+
+    # 3) Фолбек через gspread (OAuth -> SA)
+    gc = _client(service_only=False)
     if not gc:
         return None
     try:
         sh = gc.create(title)
-        # спробуємо зробити перегляд за лінком (reader)
-        try:
-            sh.share(None, perm_type="anyone", role="reader", notify=False)  # type: ignore
-        except Exception as e:
-            log.debug("gsheets: share skipped: %s", e)
         return {"spreadsheet_id": sh.id, "title": sh.title}
     except Exception as e:
         _print_err("Failed to create spreadsheet", e)

@@ -73,7 +73,7 @@ def _read_default_coverage_hours() -> float:
     try:
         return float(h)
     except Exception:
-        return 24.0
+        return 24
 
 
 DEFAULT_COVERAGE_HOURS: float = _read_default_coverage_hours()
@@ -370,8 +370,8 @@ def _mark_done_edited_other(wid: int) -> str:
         cur.execute(
             """
             UPDATE watch_posts
-            SET status='done', updated_at=?
-            WHERE id=? AND status IN ('matched','done')
+            SET status='edited', updated_at=?
+            WHERE id=? AND status IN ('matched','done','edited')
             """,
             (now_str, int(wid)),
         )
@@ -604,7 +604,17 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 _GLOBAL_DELETED_SEEN[wid] = now_m
 
                 try:
-                    mark_done_deleted(wid)
+                    prev_status = mark_done_deleted(wid)
+                except Exception:
+                    _pylog.exception("deleted: mark_done_deleted failed (wid=%s)", wid)
+                    continue
+
+                # Якщо пост уже відстояв перегляди (status=done), не шлемо повторну подію
+                if prev_status == "done":
+                    log.info("deleted: wid=%s cid=%s mid=%s -> status done, event skipped", wid, cid, mid)
+                    continue
+
+                try:
                     insert_watch_event(
                         wid,
                         "deleted",
@@ -614,9 +624,9 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                             "message_id": int(mid),
                         },
                     )
-                    log.info("deleted: wid=%s cid=%s mid=%s -> done", wid, cid, mid)
+                    log.info("deleted: wid=%s cid=%s mid=%s -> deleted", wid, cid, mid)
                 except Exception:
-                    _pylog.exception("deleted: mark_done_deleted failed (wid=%s)", wid)
+                    _pylog.exception("deleted: insert_watch_event failed (wid=%s)", wid)
 
                 if SHEETS_OK and gsheets_buffer:
                     try:

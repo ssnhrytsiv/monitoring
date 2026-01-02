@@ -14,7 +14,7 @@ from app.services import channel_db
 from app.sheet_bot.services import gsheets_writer as gsw
 from app.sheet_bot.services import gsheets_buffer as gsb
 from app.bot.keyboards import main_menu_kb, back_to_menu_kb, yes_no_kb
-from app.services.posts_watch_result_db import create_watch, insert_watch_event
+from app.services.posts_watch_result_db import create_watch, create_watch_group, insert_watch_event
 from app.services.time_utils import msk_now
 from app.bot.services.channels_repo import resolve_cid_by_target, normalize_target_link, get_links_by_channel_ids
 from app.utils.tg_links import sanitize_link
@@ -676,6 +676,17 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
         targets_links = _unique_preserve(targets_links)
         channels_links_json = json.dumps(targets_links, ensure_ascii=False) if targets_links else None
 
+        group_id = None
+        try:
+            group_id = create_watch_group(
+                project=project,
+                title=None,
+                created_by=cb.from_user.id if cb.from_user else None,
+                created_via="bot_fallback",
+            )
+        except Exception:
+            log.warning("create_watch_group (fallback) failed", exc_info=True)
+
         for t in targets:
             cid = resolve_cid_by_target(t)
             if not cid or not tid:
@@ -694,6 +705,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                     source_url=links_map.get(int(cid)),
                     created_by=None,
                     project=project,
+                    group_id=group_id,
                 )
                 try:
                     insert_watch_event(wid, "created", {"via": "bot_fallback"})
@@ -707,6 +719,24 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                     except Exception:
                         log.exception("bind watch to project failed")
                 created.append(f"{t} (fallback wid={wid})")
+            except TypeError:
+                try:
+                    wid = create_watch(
+                        channel_id=int(cid),
+                        template_id=int(tid),
+                        expected_text_hash=None,
+                        expected_text_norm_len=None,
+                        expected_links_json=channels_links_json,
+                        expected_media_fingerprint=None,
+                        time_window_start=data.get("time_window_start"),
+                        time_window_end=data.get("time_window_end"),
+                        source_url=links_map.get(int(cid)),
+                        created_by=None,
+                        project=project,
+                    )
+                    created.append(f"{t} (fallback wid={wid})")
+                except Exception:
+                    failed.append(t)
             except Exception:
                 failed.append(t)
 

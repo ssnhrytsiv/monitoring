@@ -29,6 +29,7 @@ from app.bot.run import run_bot
 from admin_bot.run import run_admin_bot
 from admin_bot.config import ADMIN_BOT_TOKEN
 from scripts.forward_bot import start_forward_bot
+from app.notificator_bot.run import start_notificator_bot
 
 
 def setup_logging():
@@ -44,6 +45,7 @@ async def _main():
     bot_task = None
     admin_bot_task = None
     forward_bot_task = None
+    notifier_task = None
 
     def _log_task_result(name: str):
         def _inner(t: asyncio.Task):
@@ -174,6 +176,13 @@ async def _main():
         log.info("Forward bot task created: %s", forward_bot_task.get_name())
     except Exception:
         log.exception("Failed to start Forward bot task")
+
+    try:
+        notifier_task = asyncio.create_task(start_notificator_bot(), name="notificator_bot")
+        notifier_task.add_done_callback(_log_task_result("Notifier bot"))
+        log.info("Notifier bot task created: %s", notifier_task.get_name())
+    except Exception:
+        log.exception("Failed to start Notifier bot task")
 
     try:
         if ADMIN_BOT_TOKEN:

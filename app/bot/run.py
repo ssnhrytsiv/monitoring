@@ -7,7 +7,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramNetworkError
 
 from app.bot.handlers import router  # центральний router
-from app.bot.notifier import notifier_loop
 from app.config import BOT_TOKEN
 
 async def run_bot():
@@ -21,8 +20,6 @@ async def run_bot():
 
     # Підключаємо один кореневий router, який усередині вже містить усі підроутери
     dp.include_router(router)
-
-    asyncio.create_task(notifier_loop(bot), name="bot_notifier")
 
     while True:
         try:
