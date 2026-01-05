@@ -1,7 +1,7 @@
 from typing import List, Any, Dict, Tuple, Optional
 from datetime import datetime
 
-from app.services.posts_watch_result_db import raw_connection
+from app.notificator_bot.db.posts_watch_result_db import raw_connection
 
 # Ключі станів для фільтра: pending, matched, expired.
 # Зроблено окремо, щоб уникнути SQL-ін'єкцій і контролювати дозволені значення.

@@ -9,9 +9,9 @@ from .export_channels_table import export_channels_table
 
 log = logging.getLogger("channels_exporter")
 
-_STATE = {
-    "task": None,         # type: Optional[asyncio.Task]
-    "stop_event": None,   # type: Optional[asyncio.Event]
+_STATE: dict[str, Optional[asyncio.Task | asyncio.Event]] = {
+    "task": None,
+    "stop_event": None,
 }
 
 def _is_enabled() -> bool:

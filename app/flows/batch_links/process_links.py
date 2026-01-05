@@ -1,7 +1,7 @@
 import logging
 import os
 import asyncio
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Iterable, Tuple
 from html import escape as _escape
 
 from telethon.tl import types as ttypes  # для читання MessageEntityTextUrl
@@ -163,7 +163,13 @@ async def _recheck_requested_with_client(client, channel_id: int, who_sess: str)
     return False
 
 
-def _build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None) -> tuple[str, List[tuple[str, str]]]:
+def _build_full_footer(
+    items: List[dict],
+    raw_lines: Optional[List[str]] = None,
+    raw_text_full: Optional[str] = None,
+    entities: Optional[Iterable[Any]] = None,
+    raw_html_original: Optional[str] = None,
+) -> tuple[str, List[tuple[str, str]]]:
     """
     Формує секції підсумку:
       - головна: лише «чисті» пункти з ренумерацією 1..N
@@ -255,6 +261,66 @@ def _build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None)
             return False
         return True  # joined / already / інше нормальне
 
+    def _render_html_with_statuses(text: str, ents: Optional[Iterable[Any]], url_tags_map: Dict[str, tuple[str, str]]) -> str:
+        """
+        Рендерить HTML із статусами біля кожного лінка.
+        Використовує entities, якщо є, інакше шукає URL regex'ом.
+        """
+        if not text:
+            return ""
+
+        def _status_for_url(u: str) -> tuple[str, str]:
+            try:
+                nu = sanitize_link(u) or u
+            except Exception:
+                nu = u
+            return url_tags_map.get(nu, ("✅", "OK"))
+
+        parts: List[str] = []
+        pos = 0
+        idx_ctr = 1
+
+        def _emit(start: int, end: int, href: Optional[str], disp_text: str) -> None:
+            nonlocal pos, idx_ctr
+            if pos < start:
+                parts.append(_esc(text[pos:start]))
+            disp = _esc(disp_text)
+            emoji, label = _status_for_url(href or disp_text)
+            status_txt = f"[{idx_ctr}. {emoji} {label}]"
+            if href:
+                parts.append(f'<a href="{_esc(href)}">{disp}</a> {status_txt}')
+            else:
+                parts.append(f"{disp} {status_txt}")
+            idx_ctr += 1
+            pos = end
+
+        try:
+            if ents:
+                sorted_ents = sorted(list(ents), key=lambda e: getattr(e, "offset", 0))
+                for ent in sorted_ents:
+                    off = int(getattr(ent, "offset", 0) or 0)
+                    length = int(getattr(ent, "length", 0) or 0)
+                    if off > len(text) or length <= 0:
+                        continue
+                    chunk = text[off:off+length]
+                    href = None
+                    if isinstance(ent, ttypes.MessageEntityTextUrl):
+                        href = getattr(ent, "url", None)
+                    elif isinstance(ent, ttypes.MessageEntityUrl):
+                        href = chunk
+                    _emit(off, off+length, href, chunk)
+            else:
+                URL_RE = re.compile(r"https?://\S+|t\.me/\S+|\+\S+")
+                for m in URL_RE.finditer(text):
+                    href = m.group(0)
+                    _emit(m.start(), m.end(), href, href)
+            if pos < len(text):
+                parts.append(_esc(text[pos:]))
+        except Exception:
+            log.debug("[PL] _render_html_with_statuses failed", exc_info=True)
+
+        return "".join(parts)
+
     def _link_line(idx: int, url: str, title: Optional[str], status: str, tag: str = "") -> str:
         """
         Рендер для всіх, крім блоку заявок (requested_items).
@@ -343,6 +409,14 @@ def _build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None)
         elif _is_invalid_or_error(status):
             invalid_raw.append((idx, url, title, status))
         else:
+            # clean
+            if url:
+                try:
+                    nu = sanitize_link(url) or url
+                except Exception:
+                    nu = url
+                if nu not in url_tags:
+                    url_tags[nu] = ("✅", "OK")
             clean_items_raw.append((url, title, status))
 
     # ---------- Основний чистий список (ренумерація 1..N) ----------
@@ -397,7 +471,7 @@ def _build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None)
                 lines.append("  " + _link_line(orig_idx, url, title, status, tag="[дубликат]"))
         sections.append(("🔁 Дубликаты", "\n".join(lines)))
 
-    # Список у вихідному порядку: показуємо лише проблемні стани біля оригінальної URL
+    # Список у вихідному порядку: тепер показуємо всі URL з тегами (включно з ОК)
     if items:
         raw_lines_out: List[str] = []
         if raw_lines:
@@ -417,7 +491,6 @@ def _build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None)
                 else:
                     raw_lines_out.append(line)
         else:
-            # fallback: будуємо список з URL, якщо немає сирих рядків
             for it in items:
                 url = it.get("url") or ""
                 tag = ""
@@ -434,6 +507,22 @@ def _build_full_footer(items: List[dict], raw_lines: Optional[List[str]] = None)
                     raw_lines_out.append(url)
 
         sections.append(("Список", "\n".join(raw_lines_out)))
+
+        # Raw з тегами по вихідних рядках
+        if raw_lines:
+            sections.append(("Raw", "\n".join(raw_lines_out)))
+
+        # Raw с HTML: оригінальний текст з гіперлінками і тегами статусів
+        # Raw HTML на базі оригінального тексту/ентіті або збереженого HTML
+        base_html = None
+        if raw_html_original:
+            base_html = raw_html_original
+            log.debug("[PL] raw_html_original len=%s", len(raw_html_original))
+        elif raw_text_full:
+            base_html = _render_html_with_statuses(raw_text_full, entities, url_tags)
+            log.debug("[PL] raw_html_rendered len=%s", len(base_html))
+        if base_html:
+            sections.append(("Raw HTML", base_html))
 
     return "\n".join(out), sections
 
@@ -635,6 +724,14 @@ async def process_links(
     bot_user_id: Optional[int] = None
     raw_text = text or ""
     raw_text_full = getattr(message, "raw_text", None) or raw_text
+    raw_html_original: Optional[str] = None
+    try:
+        to_html = getattr(message, "to_html", None)
+        if callable(to_html):
+            raw_html_original = to_html()
+            log.debug("[PL] message.to_html len=%s", len(raw_html_original))
+    except Exception:
+        log.debug("[PL] message.to_html failed", exc_info=True)
     first_line, _, rest_text = raw_text.partition("\n")
     m_uid = re.match(r"\[BOT_UID:(\d+)\]", first_line.strip())
     if m_uid:
@@ -674,6 +771,8 @@ async def process_links(
         return
 
     try:
+        log.info("[PL] start process_links", extra={"msg_id": getattr(message, 'id', None), "chat_id": getattr(getattr(message, 'chat', None), 'id', None)})
+
         links_text = extract_links(text)
         hidden = _extract_hidden_links_from_message(message)
 
@@ -691,7 +790,7 @@ async def process_links(
             if nu not in seen:
                 seen.add(nu)
                 links.append(nu)
-        log.debug("[PL] unique links=%d", len(links))
+        log.info("[PL] unique links=%d", len(links))
 
         if not links:
             await message.reply("❌ Посилань не знайдено")
@@ -1148,7 +1247,13 @@ async def process_links(
                 await _short_pause()
 
         try:
-            footer_full_main, footer_full_sections = _build_full_footer(result_items, raw_lines=raw_lines_original)
+            footer_full_main, footer_full_sections = _build_full_footer(
+                result_items,
+                raw_lines=raw_lines_original,
+                raw_text_full=raw_text_full,
+                entities=getattr(message, "entities", None),
+                raw_html_original=raw_html_original,
+            )
         except Exception:
             footer_full_main, footer_full_sections = ("📊 Итог (все):\n(ошибка формирования футера)", [])
 
@@ -1172,11 +1277,24 @@ async def process_links(
                 combined = "\n\n".join(block for block in status_blocks if block)
                 for part in _split_text_for_telegram(combined, max_len=3500):
                     if part:
+                        log.info(
+                            "[PL] send control status chunk: peer=%s part_len=%d preview=%s",
+                            control_peer,
+                            len(part),
+                            part[:80].replace("\n", " "),
+                        )
                         await control_client.send_message(
                             control_peer,
                             part,
                             link_preview=False,
+                            parse_mode="html",
                         )
+            else:
+                log.info(
+                    "[PL] skip control status send: client=%s peer=%s",
+                    bool(control_client),
+                    control_peer,
+                )
         except Exception:
             log.debug("Failed to send full status list to control chat", exc_info=True)
 

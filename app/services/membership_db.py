@@ -184,6 +184,13 @@ def map_invite_set(invite_or_hash: str, channel_id: Optional[int], title: Option
     if not h:
         return
     now = int(time.time())
+    try:
+        import logging
+        logging.getLogger("services.membership_db").debug(
+            "map_invite_set: invite=%s channel_id=%s title=%r", h, channel_id, title
+        )
+    except Exception:
+        pass
     with _conn() as c:
         # М’які міграції (на випадок, якщо init() ще не викликано)
         if not _has_column(c, "invite_map", "title"):
@@ -244,11 +251,45 @@ def invite_status_put(invite_or_hash: str, status: str) -> None:
     h = _extract_invite_hash(invite_or_hash)
     if not h:
         return
+    # debug-лог для відслідковування записів invite_status
+    try:
+        import logging
+        logging.getLogger("services.membership_db").debug("invite_status_put: invite=%s status=%s", h, status)
+    except Exception:
+        pass
     with _conn() as c:
         c.execute(
             "INSERT OR REPLACE INTO invite_status(invite_hash,status,ts) VALUES (?,?,?)",
             (h, status, int(time.time()))
         )
+
+
+def bump_requested_attempt(invite_or_hash: str) -> int:
+    """
+    Інкрементує лічильник requested для інвайта за поточну добу.
+    Повертає нове значення лічильника (0, якщо не змогли витягти інвайт).
+    """
+    h = _extract_invite_hash(invite_or_hash)
+    if not h:
+        return 0
+    day = int(time.time()) // 86400
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT attempts FROM invite_attempts WHERE invite_hash=? AND day=?",
+            (h, day),
+        )
+        row = cur.fetchone()
+        attempts = int(row[0]) if row and row[0] is not None else 0
+        attempts += 1
+        c.execute(
+            """
+            INSERT INTO invite_attempts(invite_hash, day, attempts)
+            VALUES (?,?,?)
+            ON CONFLICT(invite_hash, day) DO UPDATE SET attempts=excluded.attempts
+            """,
+            (h, day, attempts),
+        )
+        return attempts
 
 
 def invite_status_get(invite_or_hash: str) -> Optional[str]:

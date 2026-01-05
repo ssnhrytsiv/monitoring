@@ -6,7 +6,7 @@ from typing import Dict, List, Tuple, Any, Optional
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from app.services.posts_watch_result_db import raw_connection
+from app.notificator_bot.db.posts_watch_result_db import raw_connection
 from app.services import channel_db
 from app.utils.tg_links import extract_bot_username
 from app.sheet_bot.services import gsheets_writer as gw

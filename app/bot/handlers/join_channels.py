@@ -270,6 +270,17 @@ async def join_channels_input(m: Message, state: FSMContext):
             raw_join_links=norm_links,  # чистий список t.me-URL
         )
 
+        log.info(
+            "join_channels.forward_send",
+            extra={
+                "control_id": control_id,
+                "user_id": user_id,
+                "links_count": len(norm_links),
+                "payload_len": len(payload),
+                "raw_links": raw_links,
+            },
+        )
+
         await m.bot.send_message(control_id, payload)
         log.info(
             "join_channels.forward",

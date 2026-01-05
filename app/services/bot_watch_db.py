@@ -1,3 +1,0 @@
-"""
-Bot-watch support removed.
-"""

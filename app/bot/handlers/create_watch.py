@@ -14,7 +14,7 @@ from app.services import channel_db
 from app.sheet_bot.services import gsheets_writer as gsw
 from app.sheet_bot.services import gsheets_buffer as gsb
 from app.bot.keyboards import main_menu_kb, back_to_menu_kb, yes_no_kb
-from app.services.posts_watch_result_db import create_watch, create_watch_group, insert_watch_event
+from app.notificator_bot.db.posts_watch_result_db import create_watch, create_watch_group, insert_watch_event
 from app.services.time_utils import msk_now
 from app.bot.services.channels_repo import resolve_cid_by_target, normalize_target_link, get_links_by_channel_ids
 from app.utils.tg_links import sanitize_link

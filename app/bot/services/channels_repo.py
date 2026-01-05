@@ -2,7 +2,7 @@ from typing import Optional, List, Dict
 import re
 import logging
 
-from app.services.posts_watch_result_db import raw_connection
+from app.notificator_bot.db.posts_watch_result_db import raw_connection
 
 log = logging.getLogger("channels_repo")
 

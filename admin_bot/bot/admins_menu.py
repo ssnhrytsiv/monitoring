@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import logging
 from typing import List, Dict, Any
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -12,7 +13,7 @@ from admin_bot.db import models as m
 from admin_bot.db.session import SessionLocal
 from admin_bot.services import admins as svc_admins
 from admin_bot.services import networks as svc_networks
-from admin_bot.services.pagination import page_kb
+from admin_bot.bot.keyboards import page_kb
 from admin_bot.bot.states import NetworkFlow
 from admin_bot.utils.messages import extract_links_from_message
 from admin_bot.services.networks import channel_hyperlink
@@ -24,6 +25,7 @@ from admin_bot.bot.keyboards import main_menu_kb
 from app.services import channel_db
 
 router = Router()
+log = logging.getLogger("admin_bot.bot.admins_menu")
 
 
 async def _edit_text_safe(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup):
@@ -94,11 +96,16 @@ def _render_admin_view(msg, admin, nets, stats):
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Посмотреть каналы", callback_data=f"admin_net_edit:{admin.id}")],
-            [InlineKeyboardButton(text="Посмотреть ботов", callback_data=f"admin_bots:{admin.id}")],
-            [InlineKeyboardButton(text="⬅️ До списку", callback_data="show_admins"),
-             InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
+            [
+                InlineKeyboardButton(text="Посмотреть каналы", callback_data=f"admin_net_edit:{admin.id}"),
+                InlineKeyboardButton(text="Посмотреть ботов", callback_data=f"admin_bots:{admin.id}"),
+            ],
+            [InlineKeyboardButton(text="Оновити список каналів", callback_data=f"refresh_channels:{admin.id}")],
             [InlineKeyboardButton(text="🗑 Видалити адміна", callback_data=f"admin_delete_confirm:{admin.id}")],
+            [
+                InlineKeyboardButton(text="⬅️ До списку", callback_data="show_admins"),
+                InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu"),
+            ],
         ]
     )
     return msg.edit_text("\n".join(lines), reply_markup=kb)
@@ -340,10 +347,14 @@ async def cb_admins_page_nav(cb: CallbackQuery):
     total_pages = max(1, math.ceil(len(admins) / ADMINS_PER_PAGE))
     # поточну сторінку беремо з кнопки пагінації (текст типу 1/3)
     cur_page = _current_page_from_markup(cb.message)
+    old_page = cur_page
     if cb.data == "admins_page_prev":
         cur_page = (cur_page - 1) % total_pages
     else:
         cur_page = (cur_page + 1) % total_pages
+    if cur_page == old_page:
+        await cb.answer()
+        return
     kb = _build_admins_kb(admins, page=cur_page, per_page=ADMINS_PER_PAGE)
     await cb.message.edit_text("Адміни:", reply_markup=kb)
     await cb.answer()
@@ -410,13 +421,22 @@ def _build_bots_view(admin, bots: List[Dict[str, Any]], page: int = 0, per_page:
             lines.append(_format_bot_line(idx, b))
     else:
         lines.append("Ботів не знайдено.")
-    nav = page_kb(page, total_pages, prefix="admin_bots_page")
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin.id}")],
-            [InlineKeyboardButton(text="🚫 Отписаться от ботов", callback_data=f"admin_unsub_bots:{admin.id}")],
-        ] + nav.inline_keyboard
-    )
+    if total_pages > 1:
+        nav_rows = page_kb(page, total_pages, prefix="admin_bots_page", menu_cb="admins_back_to_menu").inline_keyboard
+        pagination_row, menu_row = nav_rows[0], nav_rows[1]
+    else:
+        pagination_row = None
+        menu_row = [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")]
+
+    inline_keyboard = [
+        [InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin.id}")],
+    ]
+    if pagination_row:
+        inline_keyboard.append(pagination_row)
+    inline_keyboard.append([InlineKeyboardButton(text="🚫 Отписаться от ботов", callback_data=f"admin_unsub_bots:{admin.id}")])
+    inline_keyboard.append(menu_row)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
     return "\n".join(lines), kb
 
 
@@ -556,6 +576,13 @@ async def cb_admin_delete_yes(cb: CallbackQuery):
     db = next(_db())
     # 1) збираємо канали та сесії, що підписані
     chan_ids = [ac.channel_id for ac in db.execute(select(m.AdminChannel).where(m.AdminChannel.admin_id == admin_id)).scalars().all()]
+    # канали із сіток цього адміна
+    net_chan_ids = db.execute(
+        select(m.NetworkChannel.channel_id).join(m.Network, m.NetworkChannel.network_id == m.Network.id).where(m.Network.admin_id == admin_id)
+    ).scalars().all()
+    if net_chan_ids:
+        chan_ids = list(set(chan_ids) | set(net_chan_ids))
+
     memberships = db.execute(
         select(m.Membership).where(m.Membership.channel_id.in_(chan_ids), m.Membership.account != "")
     ).scalars().all()
@@ -572,13 +599,17 @@ async def cb_admin_delete_yes(cb: CallbackQuery):
         await cb.answer("Не знайшов адміна", show_alert=True)
         return
     leaves = "; ".join([f"{s['session']}: left={s.get('left',0)} errors={s.get('errors',0)}" for s in leave_stats]) or "нема"
+    leave_errors = sum(s.get("errors", 0) or 0 for s in leave_stats)
+    if leave_errors:
+        log.warning("admin_delete: leave errors admin_id=%s stats=%s", admin_id, leave_stats)
     text = (
         "Адміна видалено.\n"
         f"Прив'язок каналів: {res['admin_channels_deleted']}\n"
         f"Сіток: {res['networks_deleted']}, каналів у сітках: {res['network_channels_deleted']}\n"
         f"membership: {res.get('membership_deleted',0)}, invite_map: {res.get('invite_map_deleted',0)}, invite_status: {res.get('invite_status_deleted',0)}, links: {res.get('links_deleted',0)}, channels: {res.get('channels_deleted',0)}\n"
-        f"Відписка: {leaves}\n"
-        "Увага: link_queue/інші таблиці не чіпалися."
+        f"link_queue: {res.get('link_queue_deleted',0)}\n"
+        f"Відписка: {leaves}"
+        + ("" if not leave_errors else "\n⚠️ Помилки відписки: перевірити вручну")
     )
     admins = _load_admins()
     kb = _build_admins_kb(admins, page=0, per_page=ADMINS_PER_PAGE) if admins else InlineKeyboardMarkup(

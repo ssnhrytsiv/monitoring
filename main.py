@@ -14,7 +14,7 @@ from app.services.requested_reconciler import run_requested_reconciler
 from app.services import requested_reconciler_db as reqdb
 from app.services.models import init_db as orm_init_db
 from app.services.owner_conflict_guard import init as owner_guard_init
-from app.services.posts_watch_result_db import init as posts_result_init
+from app.notificator_bot.db.posts_watch_result_db import init as posts_result_init
 from dotenv import load_dotenv
 
 load_dotenv()

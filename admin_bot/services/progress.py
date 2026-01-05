@@ -20,6 +20,7 @@ class Progress:
         self.done = 0
         self.ok = 0
         self.already = 0
+        self.left = 0
         self.requested = 0
         self.bad = 0
         self.flood = 0
@@ -48,7 +49,7 @@ class Progress:
         return (
             f"📦 <b>Пакет посилань</b>\n"
             f"{bar}  {self.done}/{self.total}\n"
-            f"✅ <b>Подписался:</b> {self.ok}   ☑️ <b>Был подписан:</b> {self.already}\n"
+            f"✅ <b>Подписался:</b> {self.ok}   ☑️ <b>Был подписан:</b> {self.already}   ↩️ <b>Отписался:</b> {self.left}\n"
             f"✉️ <b>Заявки:</b> {self.requested}   ❌ <b>Невалидные/ошибки:</b> {self.bad}   ⏳ <b>Flood:</b> {self.flood}   🔁 <b>Дубликаты:</b> {self.duplicates}"
             f"{line_now}{footer}"
         )
@@ -80,9 +81,11 @@ class Progress:
             self.ok += 1
         elif "already" in s:
             self.already += 1
+        elif "left" in s or "отпис" in s or "unsubscribe" in s:
+            self.left += 1
         elif "requested" in s:
             self.requested += 1
-        elif "flood" in s:
+        elif "flood" in s or "wait of" in s:
             self.flood += 1
         else:
             self.bad += 1

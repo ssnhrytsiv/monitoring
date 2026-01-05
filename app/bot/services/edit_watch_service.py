@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 from telethon.tl.types import Message as TgMessage  # тип пересланого поста
 
-from app.services.posts_watch_result_db import (
+from app.notificator_bot.db.posts_watch_result_db import (
     raw_connection,
     insert_watch_event,
     get_watch_source_url,
@@ -161,7 +161,7 @@ def _calc_coverage_at(hours_after: float | None = None) -> Optional[str]:
 
 
 from aiogram.types import Message as AiogramMessage
-from app.services.posts_watch_result_db import (
+from app.notificator_bot.db.posts_watch_result_db import (
     raw_connection,
     insert_watch_event,
     get_watch_source_url,

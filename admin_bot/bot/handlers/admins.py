@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
+import re
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command, StateFilter
 import logging
 import asyncio
@@ -12,9 +13,10 @@ from aiogram.exceptions import TelegramServerError
 from admin_bot.db.session import SessionLocal
 from admin_bot.services import admins as svc_admins
 from admin_bot.config import ADMIN_ALLOWED_IDS
-from admin_bot.bot.states import AddAdminFlow
+from admin_bot.bot.states import AddAdminFlow, RefreshChannelsFlow
 from admin_bot.bot.keyboards import main_menu_kb
 from admin_bot.services.queue_worker import process_batch
+from admin_bot.services.subscription import refresh_channels_for_admin, finalize_refresh_confirmation
 from admin_bot.utils.messages import extract_links_from_message
 from app.services import link_queue
 
@@ -36,6 +38,34 @@ def _is_allowed(user_id: int | None) -> bool:
     if user_id is None:
         return False
     return user_id in ADMIN_ALLOWED_IDS
+
+
+def _clean_urls(urls: list[str]) -> list[str]:
+    """
+    Прибирає зайві розділові символи (типу закриваючої дужки) та дублікати, зберігаючи порядок.
+    Залишає лише t.me-посилання (інвайти/username), усе інше сміття відкидає.
+    """
+    from app.utils.tg_links import sanitize_link
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    # Шукаємо тільки t.me інвайти (+hash). Користувацькі профілі без '+' відкидаємо, щоб не падати на user-url.
+    tg_pattern = re.compile(r"^(?:https?://)?t\.me/\+[A-Za-z0-9_-]{8,}$")
+    for u in urls:
+        try:
+            c = sanitize_link(u) or u
+        except Exception:
+            c = u
+        c = (c or "").strip()
+        # Вирізаємо зайві хвости
+        c = re.sub(r"[^\w\-./:?&=#%+]+$", "", c)
+        c = c.rstrip(").,;'\"<>[]{}")
+        if not tg_pattern.match(c):
+            continue
+        if c not in seen:
+            cleaned.append(c)
+            seen.add(c)
+    return cleaned
 
 
 async def _answer_with_retry(msg: Message, text: str, **kwargs):
@@ -134,17 +164,123 @@ async def cb_add_admin_flow(cb: CallbackQuery, state):
     await cb.answer()
 
 
+@router.callback_query(F.data.startswith("refresh_channels:"))
+async def cb_refresh_channels(cb: CallbackQuery, state: FSMContext):
+    if not _is_allowed(cb.from_user.id):
+        return
+    db = next(_db())
+    admin = None
+    admin_id = None
+    if cb.data and ":" in cb.data:
+        try:
+            admin_id = int(cb.data.split(":", 1)[1])
+        except Exception:
+            admin_id = None
+    if admin_id:
+        admin = svc_admins.get_admin_by_id(db, admin_id)
+    if admin is None:
+        admin = svc_admins.find_admin(
+            db,
+            tg_id=cb.from_user.id if cb.from_user else None,
+            username=cb.from_user.username if cb.from_user else None,
+            display=None,
+        )
+    if not admin:
+        await cb.message.answer("Спочатку додай себе як адміна (/add_admin).")
+        await cb.answer()
+        return
+    await state.clear()
+    await state.set_state(RefreshChannelsFlow.waiting_links)
+    await state.update_data(admin_id=admin.id)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="❌ Скасувати оновлення каналів",
+                    callback_data="refresh_channels_cancel",
+                )
+            ]
+        ]
+    )
+    await cb.message.answer(
+        "Надішли новий список каналів (інвайт-посилання t.me/+...). "
+        "Канали, яких не буде у списку, будуть відписані й очищені з бази.",
+        reply_markup=kb,
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "refresh_channels_cancel")
+async def cb_refresh_channels_cancel(cb: CallbackQuery, state: FSMContext):
+    if not _is_allowed(cb.from_user.id):
+        return
+    log.info("refresh_channels_cancel: invoked chat=%s user=%s", cb.message.chat.id if cb.message else None, cb.from_user.id if cb.from_user else None)
+    await state.clear()
+    try:
+        if cb.message:
+            await cb.message.delete()
+            log.info("refresh_channels_cancel: prompt deleted")
+    except Exception:
+        log.exception("refresh_channels_cancel: failed to delete prompt message")
+    await cb.answer("Оновлення скасовано.")
+
+
+@router.callback_query(F.data.startswith("refresh_unsub_yes:"))
+async def cb_refresh_unsub_yes(cb: CallbackQuery):
+    if not _is_allowed(cb.from_user.id if cb.from_user else None):
+        return
+    batch_id = cb.data.split(":", 1)[1] if cb.data and ":" in cb.data else None
+    if not batch_id:
+        await cb.answer("Запит не знайдено", show_alert=True)
+        return
+    try:
+        if cb.message:
+            await cb.message.edit_reply_markup()
+    except Exception:
+        log.warning("refresh_unsub_yes: failed to clear markup", exc_info=True)
+    target_msg = cb.message
+    if not target_msg:
+        await cb.answer("Не знайшов повідомлення для відповіді", show_alert=True)
+        return
+    await cb.answer("Готую звіт…")
+    asyncio.create_task(finalize_refresh_confirmation(batch_id, True, target_msg))
+
+
+@router.callback_query(F.data.startswith("refresh_unsub_no:"))
+async def cb_refresh_unsub_no(cb: CallbackQuery):
+    if not _is_allowed(cb.from_user.id if cb.from_user else None):
+        return
+    batch_id = cb.data.split(":", 1)[1] if cb.data and ":" in cb.data else None
+    if not batch_id:
+        await cb.answer("Запит не знайдено", show_alert=True)
+        return
+    try:
+        if cb.message:
+            await cb.message.edit_reply_markup()
+    except Exception:
+        log.warning("refresh_unsub_no: failed to clear markup", exc_info=True)
+    target_msg = cb.message
+    if not target_msg:
+        await cb.answer("Не знайшов повідомлення для відповіді", show_alert=True)
+        return
+    await cb.answer("Відписку скасовано.")
+    asyncio.create_task(finalize_refresh_confirmation(batch_id, False, target_msg))
+
+
 @router.message(AddAdminFlow.waiting_link)
 async def on_link_message(m: Message, state: FSMContext):
     if not _is_allowed(m.from_user.id if m.from_user else None):
         return
-    urls = extract_links_from_message(m)
+    urls = _clean_urls(extract_links_from_message(m))
+    log.info("admins.extract_urls chat_id=%s urls=%s", m.chat.id if m.chat else None, urls)
     if not urls:
         await m.answer("Не знайшов посилання. Надішли t.me/... або tg://")
         return
     await state.update_data(
         urls=urls,
         raw_text=m.text or m.caption or "",
+        raw_html=m.html_text or m.text or m.caption or "",
+        entities=m.entities or [],
     )
     await state.set_state(AddAdminFlow.waiting_name)
     log.info("auto-flow: state set to waiting_name chat_id=%s urls=%d", m.chat.id if m.chat else None, len(urls))
@@ -164,17 +300,68 @@ async def on_any_links(m: Message, state: FSMContext):
     cur_state = await state.get_state()
     if cur_state:
         return
-    urls = extract_links_from_message(m)
+    urls = _clean_urls(extract_links_from_message(m))
     if not urls:
         return
+    log.info("admins.extract_urls chat_id=%s urls=%s", m.chat.id if m.chat else None, urls)
     log.info("auto-flow: detected %s urls in chat_id=%s", len(urls), m.chat.id if m.chat else None)
     await state.update_data(
         urls=urls,
         raw_text=m.text or m.caption or "",
+        raw_html=m.html_text or m.text or m.caption or "",
+        entities=m.entities or [],
     )
     await state.set_state(AddAdminFlow.waiting_name)
     log.info("auto-flow (no btn): state set to waiting_name chat_id=%s urls=%d", m.chat.id if m.chat else None, len(urls))
     await m.answer("Надішли ім'я адміна (обов'язково). Username опційний — вкажи через пробіл після імені.")
+
+
+@router.message(RefreshChannelsFlow.waiting_links)
+async def on_refresh_links(m: Message, state: FSMContext):
+    if not _is_allowed(m.from_user.id if m.from_user else None):
+        return
+    urls = _clean_urls(extract_links_from_message(m))
+    log.info("admins.refresh_urls chat_id=%s urls=%s", m.chat.id if m.chat else None, urls)
+    if not urls:
+        await m.answer("Не знайшов посилання. Надішли t.me/+ інвайти.")
+        return
+
+    data = await state.get_data()
+    db = next(_db())
+    admin = None
+    admin_id = data.get("admin_id")
+    if admin_id:
+        admin = svc_admins.get_admin_by_id(db, admin_id)
+    if admin is None and m.from_user:
+        admin = svc_admins.find_admin(
+            db,
+            tg_id=m.from_user.id,
+            username=m.from_user.username if m.from_user.username else None,
+            display=None,
+        )
+    if not admin:
+        await m.answer("Адміна не знайдено. Додай його через /add_admin і спробуй ще раз.")
+        await state.clear()
+        return
+
+    raw_text = m.text or m.caption or ""
+    raw_html = m.html_text or raw_text
+    entities = m.entities or []
+    batch_id = f"refresh:{m.chat.id}:{int(time.time())}"
+    await _answer_with_retry(m, "Прийняв посилання, оновлюю…")
+    asyncio.create_task(
+        refresh_channels_for_admin(
+            batch_id=batch_id,
+            chat_id=m.chat.id,
+            reply_msg=m,
+            admin=admin,
+            urls=urls,
+            raw_text=raw_text,
+            raw_html=raw_html,
+            entities=entities,
+        )
+    )
+    await state.clear()
 
 
 @router.message(AddAdminFlow.waiting_name)
@@ -213,6 +400,8 @@ async def on_admin_name(m: Message, state: FSMContext):
 
         candidate_username = username or data.get("admin_username")
         raw_text = data.get("raw_text") or ""
+        raw_html = data.get("raw_html") or raw_text
+        entities = data.get("entities") or []
         batch_id = f"adminbot:{m.chat.id}:{int(time.time())}"
         log.info("on_admin_name: enqueue batch_id=%s urls=%s admin_display=%s username=%s", batch_id, len(urls), display, candidate_username)
         added = link_queue.enqueue(
@@ -236,6 +425,9 @@ async def on_admin_name(m: Message, state: FSMContext):
                 admin_username=candidate_username,
                 admin_tg_id=None,
                 raw_text=raw_text,
+                raw_html=raw_html,
+                entities=entities,
+                original_urls=urls,
             )
         )
 

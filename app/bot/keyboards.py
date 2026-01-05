@@ -4,7 +4,6 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Додати watch", callback_data="menu:add_watch")],
-        [InlineKeyboardButton(text="➕ Додати канали для підписки", callback_data="menu:add_join_channels")],
         [InlineKeyboardButton(text="📋 Мої активні watch", callback_data="menu:list_active")],
         [InlineKeyboardButton(text="🧩 Шаблони постів", callback_data="menu:list_templates")],
         [InlineKeyboardButton(text="📑 Управління таблицями", callback_data="menu:sheet_mgmt")],

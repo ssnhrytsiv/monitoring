@@ -1,9 +1,9 @@
 from typing import Optional, Any, List, Tuple, Dict
 import logging
 
-from app.services.posts_watch_result_db import raw_connection
+from app.notificator_bot.db.posts_watch_result_db import raw_connection
 from app.services.time_utils import msk_now
-from app.services.posts_watch_result_db import insert_watch_event
+from app.notificator_bot.db.posts_watch_result_db import insert_watch_event
 
 log = logging.getLogger("active_watches.service")
 
@@ -68,6 +68,43 @@ def get_group_leader_key(
 
     cid_i = int(cid) if cid is not None else None
     return tid_i, tw_key, cby, cid_i
+
+
+def get_group_leader_for_watch(wid: int) -> Optional[int]:
+    """
+    Повертає id лідерського watch'а (мінімальний id за ключем групи) для переданого wid.
+    Якщо не знайдено – None.
+    """
+    conn = raw_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT template_id, time_window_end, created_by FROM watch_posts WHERE id=?",
+        (wid,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    tid, tw_end, cby = row
+    tid_i = int(tid) if tid is not None else None
+    tw_key = None
+    if tw_end is not None:
+        s = str(tw_end)
+        tw_key = s[:16] if len(s) >= 16 else s
+
+    cur.execute(
+        """
+        SELECT id
+        FROM watch_posts
+        WHERE template_id IS ?
+          AND time_window_end IS ?
+          AND created_by IS ?
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (tid_i, tw_key, cby),
+    )
+    r = cur.fetchone()
+    return int(r[0]) if r else None
 
 
 def load_group_items(

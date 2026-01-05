@@ -9,10 +9,17 @@ from app.utils.tg_links import extract_bot_username
 from app.services import channel_db
 from app.services.account_pool import session_name
 
-log = logging.getLogger("services.bot_actions")
+log = logging.getLogger("subscription.subscription_for_bot")
 
 
-async def ensure_bot_started(client, url: str, *, owner_display: Optional[str] = None, owner_username: Optional[str] = None, batch_id: Optional[str] = None) -> Tuple[str, Optional[str]]:
+async def ensure_bot_started(
+    client,
+    url: str,
+    *,
+    owner_display: Optional[str] = None,
+    owner_username: Optional[str] = None,
+    batch_id: Optional[str] = None,
+) -> Tuple[str, Optional[str]]:
     """
     Надсилає /start боту. Повертає (status, username).
     status:
@@ -88,3 +95,6 @@ async def ensure_bot_started(client, url: str, *, owner_display: Optional[str] =
         )
         log.exception("bot_actions: send_message failed for %s", username)
         return "bot_error", username
+
+
+__all__ = ["ensure_bot_started"]

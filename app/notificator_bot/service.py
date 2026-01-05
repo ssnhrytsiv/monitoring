@@ -15,7 +15,7 @@ from app.notificator_bot.config import NOTIFIER_TARGET_IDS
 from app.notificator_bot.db import db_session
 from app.notificator_bot.models import NotifierMessage
 from app.services import channel_db
-from app.services.posts_watch_result_db import (
+from app.notificator_bot.db.posts_watch_result_db import (
     fetch_watches_by_group,
     fetch_unsent_events,
     mark_event_sent,

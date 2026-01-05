@@ -1,6 +1,7 @@
 from typing import Optional, List, Any, Dict
 import logging
 import re
+import html
 
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
@@ -24,12 +25,24 @@ from app.bot.services.active_watches_service import (
     load_group_channels,
     cancel_group_watches,
     get_watch_by_id,
+    get_group_leader_for_watch,
 )
 from app.bot.services.edit_watch_service import (
     set_watch_status_pending,
     update_watch_time_window,
     manual_match_watch_from_message,
 )
+from app.notificator_bot.db.posts_watch_result_db import (
+    list_watch_candidates,
+    list_group_watch_candidates,
+    list_candidates_by_hash,
+    get_watch_candidate,
+    accept_watch_candidate,
+    set_watch_candidate_status,
+    get_watch_expected_links,
+    get_watch_expected_text,
+)
+from app.services.post_matcher import normalize_text, extract_links_norm
 from app.bot.utils.active_watches_formatters import (
     fmt_tw_end_human,
     short_title,
@@ -61,6 +74,47 @@ def _edit_back_kb(wid: int) -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ Back", callback_data=f"watch:edit:{wid}")
     return kb
+
+
+def _back_to_group_cb(wid: Optional[int]) -> Optional[str]:
+    # Завжди повертаємо у список активних вотчів (за замовчуванням — pending)
+    return "menu:list_active:pending"
+
+
+def _collect_links(text: str) -> List[str]:
+    """
+    Витягує унікальні посилання: href з HTML + голі URL із очищеного тексту (без тегів).
+    Прибирає сміття типу \"><u> тощо.
+    """
+    links: List[str] = []
+    seen = set()
+    if not text:
+        return links
+
+    def _clean(u: str) -> str:
+        u = html.unescape(u or "").strip()
+        u = u.strip(" '\"<>")
+        return u
+
+    # href
+    for m in re.findall(r'href\s*=\s*(?:"|\')([^"\']+)(?:"|\')', text, flags=re.IGNORECASE):
+        u = _clean(m)
+        if u and u not in seen:
+            seen.add(u)
+            links.append(u)
+
+    # текст без тегів
+    plain = re.sub(r"<[^>]+>", " ", html.unescape(text))
+    try:
+        for u in extract_links_norm(plain):
+            u = _clean(u)
+            if u and u not in seen:
+                seen.add(u)
+                links.append(u)
+    except Exception:
+        pass
+
+    return links
 
 
 @router.callback_query(F.data == "watch:noop")
@@ -251,6 +305,12 @@ async def watch_group_details(cb: CallbackQuery):
     back_cb = "menu:list_active"
     if status_key:
         back_cb = f"menu:list_active:{status_key}"
+    kb.row(
+        InlineKeyboardButton(
+            text="🔍 Похожие посты (группа)",
+            callback_data=f"watch:group_similar:{leader_wid}",
+        )
+    )
     kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data=back_cb))
 
     # 7) Заголовок повідомлення
@@ -277,6 +337,107 @@ async def watch_group_details(cb: CallbackQuery):
             reply_markup=kb.as_markup(),
             parse_mode="Markdown",
         )
+
+
+@router.callback_query(F.data.startswith("watch:group_similar:"))
+async def watch_group_similar(cb: CallbackQuery):
+    """
+    Показує кандидати для всієї групи вотчів (одним списком).
+    """
+    try:
+        leader_wid = int(cb.data.split(":")[-1])
+    except Exception:
+        leader_wid = None
+
+    if not leader_wid:
+        await cb.answer("bad id", show_alert=True)
+        return
+
+    try:
+        key = get_group_leader_key(leader_wid)
+    except Exception as e:
+        log.exception("get_group_leader_key failed: %s", e)
+        key = None
+
+    if not key:
+        await cb.answer("Групу не знайдено", show_alert=True)
+        return
+
+    tid_i, tw_key, cby, _leader_cid = key
+    try:
+        items = load_group_items(tid_i, tw_key, cby, statuses=["pending", "matched"])
+    except Exception as e:
+        log.exception("load_group_items failed: %s", e)
+        items = []
+
+    wids = [wid for wid, _, _, _, _ in items]
+    if not wids:
+        await cb.answer("Вотчів у групі немає", show_alert=True)
+        return
+
+    cands = list_group_watch_candidates(wids)
+    if not cands:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="⬅️ Back", callback_data=f"watch:group:{leader_wid}")
+        await cb.message.edit_text("Схожих постів у групі немає.", reply_markup=kb.as_markup())
+        await cb.answer()
+        return
+
+    # Підготуємо довідники назв/лінків каналів
+    cids = [c.get("channel_id") for c in cands if c.get("channel_id")]
+    titles_map: Dict[int, str] = {}
+    links_map: Dict[int, str] = {}
+    if cids:
+        try:
+            titles_map = get_titles_by_channel_ids(list(set(cids))) or {}
+            links_map = get_links_by_channel_ids(list(set(cids))) or {}
+        except Exception:
+            titles_map = {}
+            links_map = {}
+
+    # Групуємо кандидати за text_hash (одна кнопка на один текст)
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for cand in cands:
+        key = cand.get("text_hash") or f"id:{cand.get('id')}"
+        bucket = grouped.setdefault(key, {"items": [], "repr": cand})
+        bucket["items"].append(cand)
+
+    lines = ["Схожі пости (вся група):"]
+    kb = InlineKeyboardBuilder()
+    idx = 1
+    for key, group in grouped.items():
+        cand = group["repr"]
+        cid = cand.get("id")
+        preview = (cand.get("message_text") or "").strip()
+        preview_short = (preview[:80] + "…") if len(preview) > 80 else preview
+
+        # Канали/вотчі для цього тексту
+        titles = []
+        wids = []
+        for item in group["items"]:
+            channel_id = item.get("channel_id")
+            title = titles_map.get(channel_id, f"cid={channel_id}") if channel_id else "—"
+            link = links_map.get(channel_id)
+            if link:
+                titles.append(f"<a href=\"{html.escape(str(link))}\">{html.escape(str(title))}</a>")
+            else:
+                titles.append(html.escape(str(title)))
+            wids.append(str(item.get("watch_id")))
+
+        lines.append(f"Пост #{idx}")
+        lines.append("   Канали:")
+        for j, t in enumerate(titles, start=1):
+            lines.append(f"      {j}. {t}")
+
+        btn_title = f"Відкрити пост ({idx})"
+        kb.button(text=btn_title, callback_data=f"watch:similar:view:{cid}")
+        idx += 1
+
+    kb.adjust(2)
+    kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data=f"watch:group:{leader_wid}"))
+
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb.as_markup(), parse_mode="HTML")
+    await cb.answer()
 
 
 @router.callback_query(F.data.startswith("watch:edit:"))
@@ -355,6 +516,7 @@ async def watch_edit(cb: CallbackQuery):
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ Додати пост", callback_data=f"watch:add_post:{wid_i}")
     kb.button(text="🔄 Змінити статус", callback_data=f"watch:change_status:{wid_i}")
+    kb.button(text="🔍 Похожие посты", callback_data=f"watch:similar:{wid_i}")
     kb.row(
         InlineKeyboardButton(
             text="⬅️ Back",
@@ -372,6 +534,218 @@ async def watch_edit(cb: CallbackQuery):
             text,
             reply_markup=kb.as_markup(),
         )
+
+
+@router.callback_query(F.data.startswith("watch:similar:accept:"))
+async def watch_similar_accept(cb: CallbackQuery):
+    try:
+        cid = int(cb.data.split(":")[-1])
+    except Exception:
+        cid = None
+    if not cid:
+        await cb.answer("bad candidate", show_alert=True)
+        return
+    cand = get_watch_candidate(cid)
+    if not cand:
+        await cb.answer("кандидат не знайдений", show_alert=True)
+        return
+    ok = accept_watch_candidate(cid)
+    if not ok:
+        await cb.answer("не вдалось заметчити", show_alert=True)
+        return
+    await cb.answer("Готово, поставлено matched")
+    back_wid = cand.get("watch_id")
+    kb = InlineKeyboardBuilder()
+    back_cb = _back_to_group_cb(back_wid)
+    if back_cb:
+        kb.button(text="⬅️ Back", callback_data=back_cb)
+    await cb.message.edit_text("✅ Кандидат заметчено", reply_markup=kb.as_markup() if kb.buttons else None)
+
+
+@router.callback_query(F.data.startswith("watch:similar:reject:"))
+async def watch_similar_reject(cb: CallbackQuery):
+    try:
+        cid = int(cb.data.split(":")[-1])
+    except Exception:
+        cid = None
+    if not cid:
+        await cb.answer("bad candidate", show_alert=True)
+        return
+    cand = get_watch_candidate(cid)
+    if not cand:
+        await cb.answer("кандидат не знайдений", show_alert=True)
+        return
+    # Відхиляємо всі pending з таким самим text_hash, щоб забрати всю групу
+    text_hash = cand.get("text_hash") or ""
+    rejected_any = False
+    if text_hash:
+        for c in list_candidates_by_hash(text_hash, status="pending"):
+            set_watch_candidate_status(int(c["id"]), "rejected")
+            rejected_any = True
+    else:
+        set_watch_candidate_status(cid, "rejected")
+        rejected_any = True
+
+    await cb.answer("Відхилено")
+    back_wid = cand.get("watch_id")
+    kb = InlineKeyboardBuilder()
+    back_cb = _back_to_group_cb(back_wid)
+    if back_cb:
+        kb.button(text="⬅️ Back", callback_data=back_cb)
+    await cb.message.edit_text(
+        "❌ Кандидати відхилено" if rejected_any else "Нема що відхиляти",
+        reply_markup=kb.as_markup() if kb.buttons else None,
+    )
+
+
+@router.callback_query(F.data.startswith("watch:similar:view:"))
+async def watch_similar_view(cb: CallbackQuery):
+    try:
+        cid = int(cb.data.split(":")[-1])
+    except Exception:
+        cid = None
+    if not cid:
+        await cb.answer("bad id", show_alert=True)
+        return
+    cand = get_watch_candidate(cid)
+    if not cand:
+        await cb.answer("не знайдено", show_alert=True)
+        return
+    wid = cand.get("watch_id")
+
+    # Всі кандидати з тим самим text_hash (щоб показати всі канали разом; тільки pending)
+    same_hash = list_candidates_by_hash(cand.get("text_hash") or "", status="pending") or [cand]
+    cids = [c.get("channel_id") for c in same_hash if c.get("channel_id")]
+    links_map: Dict[int, str] = {}
+    titles_map: Dict[int, str] = {}
+    if cids:
+        try:
+            titles_map = get_titles_by_channel_ids(list(set(cids))) or {}
+            links_map = get_links_by_channel_ids(list(set(cids))) or {}
+        except Exception:
+            titles_map = {}
+            links_map = {}
+
+    msg_text = cand.get("message_text") or "—"
+    # Лінки: очікувані (з watch) та фактичні (з поста)
+    expected_links = []
+    try:
+        expected_html = get_watch_expected_text(wid) if wid else None
+        if expected_html:
+            expected_links = _collect_links(expected_html)
+        if not expected_links:
+            expected_links = get_watch_expected_links(wid) if wid else []
+    except Exception:
+        expected_links = []
+    cand_links = _collect_links(msg_text)
+
+    lines = [
+        f"<b>Кандидат #{cid}</b>",
+        f"watch_id: {html.escape(str(wid))}",
+        f"Схожість: {int((cand.get('similarity') or 0)*100)}%",
+        f"Створено: {html.escape(str(cand.get('created_at') or '—'))}",
+        "",
+        "<b>Пост:</b>",
+        msg_text,
+        "",
+        "<b>Канали:</b>",
+    ]
+    for item in same_hash:
+        channel_id = item.get("channel_id")
+        title = titles_map.get(channel_id, f"cid={channel_id}") if channel_id else "—"
+        link = links_map.get(channel_id, "") if channel_id else ""
+        title_safe = html.escape(str(title))
+        link_safe = html.escape(str(link)) if link else ""
+        wid_i = item.get("watch_id")
+        prefix = f"wid={wid_i}: " if wid_i else ""
+        if link_safe:
+            lines.append(f"- {prefix}<a href=\"{link_safe}\">{title_safe}</a>")
+        else:
+            lines.append(f"- {prefix}{title_safe}")
+
+    lines.append("")
+    lines.append("<b>Очікувані лінки:</b>")
+    if expected_links:
+        for l in expected_links:
+            l_safe = html.escape(str(l))
+            lines.append(f"- <a href=\"{l_safe}\">{l_safe}</a>")
+    else:
+        lines.append("- немає")
+
+    lines.append("<b>Лінки кандидата:</b>")
+    if cand_links:
+        for l in cand_links:
+            l_safe = html.escape(str(l))
+            lines.append(f"- <a href=\"{l_safe}\">{l_safe}</a>")
+    else:
+        lines.append("- немає")
+
+    text = "\n".join(lines)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Заметчити", callback_data=f"watch:similar:accept:{cid}")
+    kb.button(text="❌ Ні", callback_data=f"watch:similar:reject:{cid}")
+    back_cb = _back_to_group_cb(wid)
+    if back_cb:
+        kb.button(text="⬅️ Back", callback_data=back_cb)
+    await cb.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("watch:similar:"))
+async def watch_similar_list(cb: CallbackQuery):
+    """
+    Показує список схожих постів для watch.
+    """
+    try:
+        wid = int(cb.data.split(":")[-1])
+    except Exception:
+        wid = None
+
+    if not wid:
+        await cb.answer("bad id", show_alert=True)
+        return
+
+    cands = list_watch_candidates(wid)
+    if not cands:
+        await cb.message.edit_text("Схожих постів поки немає.", reply_markup=_edit_back_kb(wid).as_markup())
+        await cb.answer()
+        return
+
+    # Підтягуємо назви/лінки каналів для кнопок/списку
+    cids = [c.get("channel_id") for c in cands if c.get("channel_id")]
+    titles_map: Dict[int, str] = {}
+    links_map: Dict[int, str] = {}
+    if cids:
+        try:
+            titles_map = get_titles_by_channel_ids(list(set(cids))) or {}
+            links_map = get_links_by_channel_ids(list(set(cids))) or {}
+        except Exception:
+            titles_map = {}
+            links_map = {}
+
+    kb = InlineKeyboardBuilder()
+    lines = ["Схожі пости:"]
+    for idx, cand in enumerate(cands, start=1):
+        cid = cand.get("id")
+        channel_id = cand.get("channel_id")
+        title = titles_map.get(channel_id, f"cid={channel_id}") if channel_id else "—"
+        link = links_map.get(channel_id, "")
+        title_safe = html.escape(str(title))
+        link_safe = html.escape(str(link)) if link else ""
+        lines.append(f"Пост #{idx}")
+        lines.append("   Канали:")
+        if link_safe:
+            lines.append(f"      1. <a href=\"{link_safe}\">{title_safe}</a>")
+        else:
+            lines.append(f"      1. {title_safe}")
+        kb.button(text=f"Відкрити пост ({idx})", callback_data=f"watch:similar:view:{cid}")
+    kb.adjust(2)
+    back_cb = _back_to_group_cb(wid)
+    if back_cb:
+        kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data=back_cb))
+
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb.as_markup(), parse_mode="HTML")
+    await cb.answer()
 
 
 @router.callback_query(F.data.startswith("watch:change_status:"))

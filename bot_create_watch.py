@@ -13,7 +13,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.bot.states import CreateWatch
 from app.bot.keyboards import main_menu_kb, back_to_menu_kb, yes_no_kb
-from app.services.posts_watch_result_db import create_watch, raw_connection, insert_watch_event
+from app.notificator_bot.db.posts_watch_result_db import create_watch, raw_connection, insert_watch_event
 from app.services.time_utils import msk_now
 
 router = Router()
@@ -503,7 +503,7 @@ async def watch_cancel(cb: CallbackQuery):
 
     cancelled_ok = False
     try:
-        from app.services.posts_watch_result_db import mark_cancelled
+        from app.notificator_bot.db.posts_watch_result_db import mark_cancelled
         mark_cancelled(wid)
         cancelled_ok = True
     except Exception:

@@ -7,13 +7,14 @@ from datetime import datetime, timedelta
 from typing import Callable, Optional, Dict, Any
 from zoneinfo import ZoneInfo
 import re
+from difflib import SequenceMatcher
 
 from telethon import events
 from telethon.tl.types import Message
 
 from app.telethon_client import client as MAIN_CLIENT
 from app.logging_json import get_logger
-from app.services.posts_watch_result_db import (
+from app.notificator_bot.db.posts_watch_result_db import (
     list_active_channels,
     get_pending_by_channel,
     mark_matched,
@@ -25,9 +26,12 @@ from app.services.posts_watch_result_db import (
     mark_expired,
     raw_connection,
     insert_watch_event,
+    insert_watch_candidate,
+    calc_text_hash,
 )
 from app.services.html_match import exact_html_equal
 from app.services.account_pool import iter_pool_clients, session_name
+from app.services.post_matcher import normalize_text, extract_links_norm
 from app import config
 import html as _html_mod
 
@@ -52,6 +56,9 @@ COVERAGE_POLL_TICK_SEC = 30
 
 _GLOBAL_DELETED_SEEN: Dict[int, float] = {}
 GLOBAL_DELETED_TTL = 180.0
+_GLOBAL_CANDIDATE_SEEN: Dict[tuple[int, int], float] = {}
+CANDIDATE_SEEN_TTL = 24 * 60 * 60  # 1 доба
+CANDIDATE_SIM_THRESHOLD = 0.70
 
 
 def _now_monotonic() -> float:
@@ -173,6 +180,38 @@ def _strip_simple_tags(html_fragment: str) -> str:
     # прибираємо відкриваючі/закриваючі теги b/u/i/strong/em (без атрибутів)
     return re.sub(r'</?(?:b|u|i|strong|em)>', '', html_fragment, flags=re.IGNORECASE)
 
+def _collect_links_from_html(text: str) -> list[str]:
+    """
+    Витягує унікальні посилання: href з HTML + голі URL із очищеного тексту.
+    """
+    links: list[str] = []
+    seen = set()
+    if not text:
+        return links
+
+    def _clean(u: str) -> str:
+        u = _html_mod.unescape(u or "").strip()
+        u = u.strip(" '\"<>")
+        return u
+
+    for m in re.findall(r'href\s*=\s*(?:"|\')([^"\']+)(?:"|\')', text, flags=re.IGNORECASE):
+        u = _clean(m)
+        if u and u not in seen:
+            seen.add(u)
+            links.append(u)
+
+    plain = re.sub(r"<[^>]+>", " ", _html_mod.unescape(text))
+    try:
+        for u in extract_links_norm(normalize_text(plain)):
+            u = _clean(u)
+            if u and u not in seen:
+                seen.add(u)
+                links.append(u)
+    except Exception:
+        pass
+
+    return links
+
 
 def _normalize_html_full(html_text: str) -> str:
     """
@@ -202,6 +241,18 @@ def _normalize_html_full(html_text: str) -> str:
     s = s.strip()
 
     return s
+
+
+def _strip_tags_to_text(html_text: str) -> str:
+    """
+    Грубо прибирає теги і декодує HTML-ентіті, щоб порівняти лише текст.
+    """
+    try:
+        txt = re.sub(r"<[^>]+>", " ", html_text)
+        txt = _html_mod.unescape(txt)
+        return re.sub(r"\s+", " ", txt).strip()
+    except Exception:
+        return html_text
 
 
 def _normalize_html_links(html: str) -> str:
@@ -416,7 +467,6 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             return
 
         if not pending:
-            _pylog.info("listen: no pending watches for cid=%s", cid)
             return
 
         _pylog.info("listen: found %s pending watches for cid=%s", len(pending), cid)
@@ -432,9 +482,12 @@ def _attach_listener_for_client(tag: str, cli) -> None:
         for row in pending:
             wid = int(row["id"])
             expected_html = row.get("expected_text_hash")
+            expected_links_json = row.get("expected_links_json")
             if not expected_html:
                 _pylog.info("listen: wid=%s has no expected_html, skip", wid)
                 continue
+            msg_html_norm = msg_html
+            expected_html_norm = expected_html
 
             try:
                 # РОЗШИРЕНА нормалізація:
@@ -442,17 +495,77 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 #  - html.unescape (&quot; vs ")
                 msg_html_norm = _normalize_html_full(msg_html)
                 expected_html_norm = _normalize_html_full(expected_html)
-
                 ok = exact_html_equal(msg_html_norm, expected_html_norm)
-               # _pylog.info(
-                #    "listen: compare wid=%s cid=%s mid=%s session=%s -> %s",
-                #    wid, cid, mid, tag, ok,
-                #)
             except Exception:
                 _pylog.exception("listen: exact_html_equal failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                 ok = False
 
             if not ok:
+                # Фаззі-перевірка схожості (якщо дуже схоже, додаємо в кандидати)
+                msg_plain = ""
+                expected_plain = ""
+                try:
+                    ratio = SequenceMatcher(None, msg_html_norm, expected_html_norm).ratio()
+                except Exception:
+                    ratio = 0.0
+                ratio_text = 0.0
+                try:
+                    msg_plain = _strip_tags_to_text(msg_html_norm)
+                    expected_plain = _strip_tags_to_text(expected_html_norm)
+                    ratio_text = SequenceMatcher(None, msg_plain, expected_plain).ratio()
+                except Exception:
+                    ratio_text = 0.0
+
+                if ratio >= CANDIDATE_SIM_THRESHOLD or ratio_text >= CANDIDATE_SIM_THRESHOLD:
+                    # якщо лінки не збігаються — відправляємо у foreign
+                    exp_links = _collect_links_from_html(expected_html_norm)
+                    if not exp_links and expected_links_json:
+                        try:
+                            import json
+                            data = json.loads(expected_links_json)
+                            if isinstance(data, list):
+                                exp_links = [str(x) for x in data if x]
+                        except Exception:
+                            pass
+                    cand_links = _collect_links_from_html(msg_html_norm)
+
+                    if exp_links and cand_links and sorted(exp_links) != sorted(cand_links):
+                        try:
+                            insert_watch_candidate(
+                                watch_id=wid,
+                                channel_id=cid,
+                                message_id=mid,
+                                similarity=ratio,
+                                message_text=msg_html,
+                                ttl_days=1.0,
+                                expires_at=row.get("time_window_end"),
+                                status="foreign",
+                            )
+                            log.info("similar: wid=%s cid=%s mid=%s ratio=%.3f -> foreign (links mismatch)", wid, cid, mid, ratio)
+                        except Exception:
+                            _pylog.exception("similar: insert foreign candidate failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
+                        continue
+
+                    text_hash_input = msg_plain or msg_html_norm
+                    text_hash = calc_text_hash(text_hash_input)
+                    key = (wid, text_hash)
+                    now_m = _now_monotonic()
+                    last_seen = _GLOBAL_CANDIDATE_SEEN.get(key)
+                    if last_seen is None or (now_m - last_seen) >= CANDIDATE_SEEN_TTL:
+                        _GLOBAL_CANDIDATE_SEEN[key] = now_m
+                        try:
+                            insert_watch_candidate(
+                                watch_id=wid,
+                                channel_id=cid,
+                                message_id=mid,
+                                similarity=ratio,
+                                message_text=msg_html,
+                                ttl_days=1.0,
+                                expires_at=row.get("time_window_end"),
+                            )
+                            log.info("similar: wid=%s cid=%s mid=%s ratio=%.3f -> candidate", wid, cid, mid, ratio)
+                        except Exception:
+                            _pylog.exception("similar: insert_watch_candidate failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                 continue
 
             coverage_at = _calc_coverage_at()

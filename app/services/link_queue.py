@@ -280,3 +280,44 @@ def mark_failed(item_id: int, error: str, backoff_sec: int, max_retries: int = 5
                    WHERE id=?""",
                 (tries, error[:500], now + max(5, int(backoff_sec)), item_id)
             )
+
+
+def delete_by_owner(
+    owner_display: Optional[str] = None,
+    owner_username: Optional[str] = None,
+    urls: Optional[list[str]] = None,
+) -> int:
+    """
+    Видаляє записи з link_queue за власником (display/username) та/або списком URL.
+    Повертає кількість видалених рядків.
+    """
+    conditions = []
+    params: list = []
+    if owner_display:
+        conditions.append("owner_display = ?")
+        params.append(owner_display)
+    if owner_username:
+        conditions.append("owner_username = ?")
+        params.append(owner_username)
+    if urls:
+        placeholders = ",".join("?" for _ in urls)
+        conditions.append(f"url IN ({placeholders})")
+        params.extend(urls)
+    if not conditions:
+        return 0
+    where_clause = " OR ".join(conditions)
+    attempts = 3
+    delay = 0.2
+    for i in range(attempts):
+        try:
+            with _conn() as c:
+                cur = c.execute(f"DELETE FROM link_queue WHERE {where_clause}", params)
+                c.commit()
+                return cur.rowcount or 0
+        except sqlite3.OperationalError as e:
+            # Якщо база заблокована – невеликий ретрай
+            if "locked" in str(e).lower() and i < attempts - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise

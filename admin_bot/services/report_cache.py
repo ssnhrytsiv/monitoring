@@ -1,8 +1,10 @@
+"""Простий in-memory кеш звітів для навігації між сторінками."""
+
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
-# Кеш звітів: ключ (chat_id, msg_id) -> {"pages": [...], "page": int, "report_idx": Optional[int]}
+# Ключ: (chat_id, msg_id) -> {"pages": [...], "page": int, "report_idx": Optional[int]}
 _CACHE: Dict[Tuple[int, int], Dict] = {}
 
 
@@ -25,3 +27,6 @@ def pages_count(chat_id: int, msg_id: int) -> int:
     if not entry:
         return 0
     return len(entry.get("pages") or [])
+
+
+__all__ = ["register", "get", "set_page", "pages_count"]

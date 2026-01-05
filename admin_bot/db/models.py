@@ -8,8 +8,14 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Float,
+    delete,
+    select,
 )
-from sqlalchemy.orm import relationship, foreign
+import time
+from typing import List, Optional, Tuple
+
+from sqlalchemy.orm import Session, relationship, foreign
+from sqlalchemy.sql import text
 
 from admin_bot.db.session import Base
 
@@ -60,6 +66,25 @@ class Membership(Base):
     account = Column(String, primary_key=True)
     status = Column(String, nullable=False)
     ts = Column(Integer, nullable=False)
+
+
+def upsert_membership(db: Session, channel_id: int, account: str, status: str) -> None:
+    """Зберігає статус підписки для пари (channel_id, account)."""
+    now = int(time.time())
+    row = (
+        db.query(Membership)
+        .filter(
+            Membership.channel_id == channel_id,
+            Membership.account == account,
+        )
+        .one_or_none()
+    )
+    if row:
+        row.status = status
+        row.ts = now
+    else:
+        db.add(Membership(channel_id=channel_id, account=account, status=status, ts=now))
+    db.commit()
 
 
 class LinkQueue(Base):
@@ -166,3 +191,98 @@ class NetworkChannel(Base):
     note = Column(Text)
     created_at = Column(Integer)
     updated_at = Column(Integer)
+
+
+# ------------------ Helper-функції видалення ------------------ #
+
+
+def delete_admin_channels_by_admin(db: Session, admin_id: int) -> int:
+    return db.execute(delete(AdminChannel).where(AdminChannel.admin_id == admin_id)).rowcount or 0
+
+
+def delete_network_channels_by_networks(db: Session, net_ids: List[int]) -> int:
+    if not net_ids:
+        return 0
+    return db.execute(delete(NetworkChannel).where(NetworkChannel.network_id.in_(net_ids))).rowcount or 0
+
+
+def delete_networks_by_admin(db: Session, admin_id: int) -> Tuple[int, List[int]]:
+    net_ids = list(db.execute(select(Network.id).where(Network.admin_id == admin_id)).scalars().all())
+    if net_ids:
+        db.execute(delete(Network).where(Network.id.in_(net_ids)))
+    return len(net_ids), net_ids
+
+
+def delete_admin_by_id(db: Session, admin_id: int) -> int:
+    return db.execute(delete(Admin).where(Admin.id == admin_id)).rowcount or 0
+
+
+def delete_memberships_by_channels(db: Session, chan_ids: List[int]) -> int:
+    if not chan_ids:
+        return 0
+    return db.execute(delete(Membership).where(Membership.channel_id.in_(chan_ids))).rowcount or 0
+
+
+def delete_membership_status_by_channels(db: Session, chan_ids: List[int]) -> int:
+    if not chan_ids:
+        return 0
+    try:
+        placeholders = ",".join([str(cid) for cid in chan_ids])
+        return db.execute(text(f"DELETE FROM membership_status WHERE channel_id IN ({placeholders})")).rowcount or 0
+    except Exception:
+        return 0
+
+
+def delete_invite_status_by_hashes(db: Session, hashes: List[str]) -> int:
+    if not hashes:
+        return 0
+    return db.execute(delete(InviteStatus).where(InviteStatus.invite_hash.in_(hashes))).rowcount or 0
+
+
+def delete_invite_map_by_channels(db: Session, chan_ids: List[int]) -> int:
+    if not chan_ids:
+        return 0
+    return db.execute(delete(InviteMap).where(InviteMap.channel_id.in_(chan_ids))).rowcount or 0
+
+
+def delete_owner_conflict_by_channels(db: Session, chan_ids: List[int]) -> int:
+    if not chan_ids:
+        return 0
+    return db.execute(delete(OwnerConflict).where(OwnerConflict.channel_id.in_(chan_ids))).rowcount or 0
+
+
+def delete_links_by_channels(db: Session, chan_ids: List[int]) -> int:
+    if not chan_ids:
+        return 0
+    return db.execute(delete(Link).where(Link.channel_id.in_(chan_ids))).rowcount or 0
+
+
+def delete_channels_by_ids(db: Session, chan_ids: List[int]) -> int:
+    if not chan_ids:
+        return 0
+    return db.execute(delete(Channel).where(Channel.channel_id.in_(chan_ids))).rowcount or 0
+
+
+def delete_invite_owners_and_links_no_channel(
+    db: Session, owner_disp: Optional[str], owner_user: Optional[str]
+) -> Tuple[int, int]:
+    where_raw = []
+    params_raw = {}
+    if owner_disp:
+        where_raw.append("owner_display = :od")
+        params_raw["od"] = owner_disp
+    if owner_user:
+        where_raw.append("owner_username = :ou")
+        params_raw["ou"] = owner_user
+    if not where_raw:
+        return 0, 0
+    where_expr = " OR ".join(where_raw)
+    invite_owners_deleted = db.execute(
+        text(f"DELETE FROM invite_owners WHERE {where_expr}"),
+        params_raw,
+    ).rowcount or 0
+    links_no_channel_deleted = db.execute(
+        text(f"DELETE FROM links WHERE channel_id IS NULL AND ({where_expr})"),
+        params_raw,
+    ).rowcount or 0
+    return invite_owners_deleted, links_no_channel_deleted

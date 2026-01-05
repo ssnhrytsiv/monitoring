@@ -9,7 +9,7 @@ from aiogram.client.default import DefaultBotProperties
 from app.notificator_bot.config import NOTIFIER_BOT_TOKEN, NOTIFIER_POLL_INTERVAL_SEC, NOTIFIER_TARGET_IDS
 from app.notificator_bot.service import send_notifications
 from app.notificator_bot.models import ensure_tables
-from app.services import posts_watch_result_db
+from app.notificator_bot.db import posts_watch_result_db
 
 log = logging.getLogger("notificator.run")
 

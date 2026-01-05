@@ -16,7 +16,7 @@ from app.utils.tg_links import sanitize_link
 
 from app.services.joiner import probe_channel_id
 from app.services.membership_db import map_invite_get
-from app.services.posts_watch_result_db import create_watch, create_watch_group, raw_connection
+from app.notificator_bot.db.posts_watch_result_db import create_watch, create_watch_group, raw_connection
 
 try:
     from app.services.post_watch_db import list_templates_full

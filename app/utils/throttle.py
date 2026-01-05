@@ -3,6 +3,7 @@ import os
 import random
 import asyncio
 import logging
+import inspect
 from typing import Tuple
 
 log = logging.getLogger("utils.throttle")
@@ -36,6 +37,25 @@ PROBE_DELAY_MIN, PROBE_DELAY_MAX = _clamp_pair(PROBE_DELAY_MIN, PROBE_DELAY_MAX)
 LINK_DELAY_PUBLIC_MIN, LINK_DELAY_PUBLIC_MAX = _clamp_pair(LINK_DELAY_PUBLIC_MIN, LINK_DELAY_PUBLIC_MAX)
 LINK_DELAY_INVITE_MIN, LINK_DELAY_INVITE_MAX = _clamp_pair(LINK_DELAY_INVITE_MIN, LINK_DELAY_INVITE_MAX)
 
+
+def _log_caller(kind: str, url: str = "") -> None:
+    """Debug helper: log who triggered throttle (always on)."""
+    try:
+        # беремо перший фрейм поза цим модулем
+        caller = "unknown"
+        for frame_info in inspect.stack()[2:]:
+            fname = frame_info.filename or ""
+            if "utils/throttle.py" not in fname:
+                caller = f"{os.path.basename(fname)}:{frame_info.function}"
+                break
+        if url:
+            log.debug("throttle(%s): caller=%s url=%s", kind, caller, url)
+        else:
+            log.debug("throttle(%s): caller=%s", kind, caller)
+    except Exception:
+        pass
+
+
 # ---- нові зручні корутини ----
 async def throttle_probe(url: str = "") -> None:
     """
@@ -44,6 +64,7 @@ async def throttle_probe(url: str = "") -> None:
     - легкі get_entity
     """
     delay = random.uniform(PROBE_DELAY_MIN, PROBE_DELAY_MAX)
+    _log_caller("probe", url)
     if url:
         log.debug("throttle(probe): sleep %.2fs  url=%s", delay, url)
     else:
@@ -55,6 +76,7 @@ async def throttle_invite() -> None:
     Пауза перед важкими діями (імпорт інвайту/приєднання).
     """
     delay = random.uniform(LINK_DELAY_INVITE_MIN, LINK_DELAY_INVITE_MAX)
+    _log_caller("invite")
     log.debug("throttle(invite): sleep %.2fs", delay)
     await asyncio.sleep(delay)
 
@@ -63,6 +85,7 @@ async def throttle_public() -> None:
     Пауза між обробкою публічних посилань/юзернеймів.
     """
     delay = random.uniform(LINK_DELAY_PUBLIC_MIN, LINK_DELAY_PUBLIC_MAX)
+    _log_caller("public")
     log.debug("throttle(public): sleep %.2fs", delay)
     await asyncio.sleep(delay)
 
@@ -71,6 +94,7 @@ async def throttle_bot() -> None:
     Пауза між /start ботам.
     """
     delay = random.uniform(LINK_DELAY_BOT_MIN, LINK_DELAY_BOT_MAX)
+    _log_caller("bot")
     log.debug("throttle(bot): sleep %.2fs", delay)
     await asyncio.sleep(delay)
 
@@ -89,6 +113,7 @@ async def throttle_between_links(kind: str | None, url: str = "") -> None:
         label = "public"
 
     delay = random.uniform(lo, hi)
+    _log_caller(label, url)
     if url:
         log.debug("throttle(%s): sleep %.2fs  url=%s", label, delay, url)
     else:

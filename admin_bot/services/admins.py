@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, delete, text, or_
 
 from admin_bot.db import models as m
-from app.services import membership_db
+from app.services import membership_db, link_queue
 from app.utils.tg_links import sanitize_link
 import re
 
@@ -154,21 +154,23 @@ def remove_admin_deep(db: Session, admin_id: int, cleanup_channels: bool = True)
     admin_obj = db.execute(select(m.Admin).where(m.Admin.id == admin_id)).scalar_one_or_none()
 
     # Збираємо канали адміна
-    chan_ids = [
-        ac.channel_id
-        for ac in db.execute(select(m.AdminChannel).where(m.AdminChannel.admin_id == admin_id)).scalars().all()
-    ]
-    log.debug("remove_admin_deep admin_id=%s chan_ids=%s", admin_id, chan_ids)
+    chan_ids = list(
+        {ac.channel_id for ac in db.execute(select(m.AdminChannel).where(m.AdminChannel.admin_id == admin_id)).scalars().all()}
+    )
+    # додаємо канали із сіток адміна (Network -> NetworkChannel)
+    net_chan_ids = db.execute(
+        select(m.NetworkChannel.channel_id).join(m.Network, m.NetworkChannel.network_id == m.Network.id).where(m.Network.admin_id == admin_id)
+    ).scalars().all()
+    if net_chan_ids:
+        chan_ids = list(set(chan_ids) | set(net_chan_ids))
+    log.info("remove_admin_deep admin_id=%s chan_ids=%s", admin_id, chan_ids)
 
     # Прибираємо прив'язки admin_channels
-    ac_deleted = db.execute(delete(m.AdminChannel).where(m.AdminChannel.admin_id == admin_id)).rowcount or 0
+    ac_deleted = m.delete_admin_channels_by_admin(db, admin_id)
     # Прибираємо мережі та їх канали
-    net_ids = list(db.execute(select(m.Network.id).where(m.Network.admin_id == admin_id)).scalars().all())
-    nc_deleted = 0
-    if net_ids:
-        nc_deleted = db.execute(delete(m.NetworkChannel).where(m.NetworkChannel.network_id.in_(net_ids))).rowcount or 0
-        db.execute(delete(m.Network).where(m.Network.id.in_(net_ids)))
-    adm_deleted = db.execute(delete(m.Admin).where(m.Admin.id == admin_id)).rowcount or 0
+    net_deleted_count, net_ids = m.delete_networks_by_admin(db, admin_id)
+    nc_deleted = m.delete_network_channels_by_networks(db, net_ids) if net_ids else 0
+    adm_deleted = m.delete_admin_by_id(db, admin_id)
 
     # Додаткове очищення
     mem_deleted = 0
@@ -181,6 +183,7 @@ def remove_admin_deep(db: Session, admin_id: int, cleanup_channels: bool = True)
     links_deleted = 0
     channels_deleted = 0
     membership_status_deleted = 0
+    link_queue_deleted = 0
 
     urls_for_cleanup: list[str] = []
     if cleanup_channels and chan_ids:
@@ -190,26 +193,18 @@ def remove_admin_deep(db: Session, admin_id: int, cleanup_channels: bool = True)
                 urls_for_cleanup.extend(_expand_url_variants(r[0]))
         pre_count = _count_url_cache(urls_for_cleanup) if urls_for_cleanup else 0
         if urls_for_cleanup:
-            log.debug("remove_admin_deep urls_for_cleanup(chan) count=%s sample=%s", len(urls_for_cleanup), _sample(urls_for_cleanup))
-            log.debug("remove_admin_deep url_cache pre-count (chan)=%s", pre_count)
+            log.info("remove_admin_deep urls_for_cleanup(chan) count=%s sample=%s", len(urls_for_cleanup), _sample(urls_for_cleanup))
+            log.info("remove_admin_deep url_cache pre-count (chan)=%s", pre_count)
         # membership
-        mem_deleted = db.execute(delete(m.Membership).where(m.Membership.channel_id.in_(chan_ids))).rowcount or 0
-        # membership_status (raw table) — видаляємо лише якщо є колонка channel_id
-        try:
-            placeholders = ",".join([str(cid) for cid in chan_ids])
-            membership_status_deleted = db.execute(
-                text(f"DELETE FROM membership_status WHERE channel_id IN ({placeholders})")
-            ).rowcount or 0
-        except Exception:
-            membership_status_deleted = 0  # таблиця/колонка може відрізнятись у схемі
+        mem_deleted = m.delete_memberships_by_channels(db, chan_ids)
+        membership_status_deleted = m.delete_membership_status_by_channels(db, chan_ids)
         # invite_map + invite_status
         hashes = [h for h in db.execute(select(m.InviteMap.invite_hash).where(m.InviteMap.channel_id.in_(chan_ids))).scalars().all()]
-        if hashes:
-            invite_status_deleted = db.execute(delete(m.InviteStatus).where(m.InviteStatus.invite_hash.in_(hashes))).rowcount or 0
-        invite_map_deleted = db.execute(delete(m.InviteMap).where(m.InviteMap.channel_id.in_(chan_ids))).rowcount or 0
-        owner_conflicts_deleted = db.execute(delete(m.OwnerConflict).where(m.OwnerConflict.channel_id.in_(chan_ids))).rowcount or 0
+        invite_status_deleted = m.delete_invite_status_by_hashes(db, hashes)
+        invite_map_deleted = m.delete_invite_map_by_channels(db, chan_ids)
+        owner_conflicts_deleted = m.delete_owner_conflict_by_channels(db, chan_ids)
         # links
-        links_deleted = db.execute(delete(m.Link).where(m.Link.channel_id.in_(chan_ids))).rowcount or 0
+        links_deleted = m.delete_links_by_channels(db, chan_ids)
         # url_cache у membership_db: прибираємо позитивні записи по знайдених URL
         try:
             url_cache_deleted = _delete_url_cache_db(db, urls_for_cleanup, ["already", "joined"])
@@ -220,10 +215,10 @@ def remove_admin_deep(db: Session, admin_id: int, cleanup_channels: bool = True)
         if pre_count > 0 and url_cache_deleted == 0:
             try:
                 url_cache_deleted = _delete_url_cache_db(db, urls_for_cleanup, None)
-                log.debug("remove_admin_deep chan_cleanup fallback url_cache_deleted=%s", url_cache_deleted)
+                log.info("remove_admin_deep chan_cleanup fallback url_cache_deleted=%s", url_cache_deleted)
             except Exception as e:
                 log.exception("remove_admin_deep url_cache delete fallback (chan) failed: %s", e)
-        log.debug(
+        log.info(
             "remove_admin_deep chan_cleanup mem_deleted=%s invite_map_deleted=%s invite_status_deleted=%s links_deleted=%s url_cache_deleted=%s url_cache_post=%s",
             mem_deleted,
             invite_map_deleted,
@@ -239,7 +234,7 @@ def remove_admin_deep(db: Session, admin_id: int, cleanup_channels: bool = True)
         ) | set(db.execute(select(m.NetworkChannel.channel_id)).scalars().all())
         delete_ids = [cid for cid in chan_ids if cid not in keep_ids]
         if delete_ids:
-            channels_deleted = db.execute(delete(m.Channel).where(m.Channel.channel_id.in_(delete_ids))).rowcount or 0
+            channels_deleted = m.delete_channels_by_ids(db, delete_ids)
 
     # invite_owners та links/url_cache/invite_status без channel_id для цього адміна (по display/username)
     if admin_obj:
@@ -262,15 +257,9 @@ def remove_admin_deep(db: Session, admin_id: int, cleanup_channels: bool = True)
                 where_raw.append("owner_username = :ou")
                 params_raw["ou"] = owner_user
             if where_raw:
-                where_expr = " OR ".join(where_raw)
-                invite_owners_deleted += db.execute(
-                    text(f"DELETE FROM invite_owners WHERE {where_expr}"),
-                    params_raw,
-                ).rowcount or 0
-                links_no_channel_deleted += db.execute(
-                    text(f"DELETE FROM links WHERE channel_id IS NULL AND ({where_expr})"),
-                    params_raw,
-                ).rowcount or 0
+                inv_del, links_nc_del = m.delete_invite_owners_and_links_no_channel(db, owner_disp, owner_user)
+                invite_owners_deleted += inv_del
+                links_no_channel_deleted += links_nc_del
 
             # Збираємо URL без channel_id для цього власника і чистимо url_cache (joined/already) + invite_status
             links_owner = db.execute(
@@ -293,10 +282,10 @@ def remove_admin_deep(db: Session, admin_id: int, cleanup_channels: bool = True)
                 if _count_url_cache(owner_urls) > 0 and url_cache_deleted == 0:
                     try:
                         url_cache_deleted += _delete_url_cache_db(db, owner_urls, None)
-                        log.debug("remove_admin_deep owner_cleanup fallback url_cache_deleted=%s", url_cache_deleted)
+                        log.info("remove_admin_deep owner_cleanup fallback url_cache_deleted=%s", url_cache_deleted)
                     except Exception as e:
                         log.exception("remove_admin_deep url_cache delete fallback (owner) failed: %s", e)
-                log.debug(
+                log.info(
                     "remove_admin_deep owner_cleanup url_cache_deleted+=%s urls_count=%s sample=%s url_cache_post=%s",
                     url_cache_deleted,
                     len(owner_urls),
@@ -315,18 +304,32 @@ def remove_admin_deep(db: Session, admin_id: int, cleanup_channels: bool = True)
                         invite_status_deleted += membership_db.invite_status_delete(inv_hashes, statuses=["already", "joined"])
                     except Exception:
                         pass
-                    log.debug(
+                    log.info(
                         "remove_admin_deep owner_cleanup invite_status_deleted=%s hashes=%s",
                         invite_status_deleted,
                         _sample(inv_hashes),
                     )
+
+        # link_queue (sqlite) за власником або відомими URL
+        # Завершуємо поточні транзакції перед доступом до link_queue (sqlite), щоб уникнути locked
+        db.commit()
+        try:
+            link_queue_deleted = link_queue.delete_by_owner(
+                owner_display=owner_disp,
+                owner_username=owner_user,
+                urls=list(set(urls_for_cleanup)) if urls_for_cleanup else None,
+            )
+        except Exception as e:
+            log.exception("remove_admin_deep link_queue cleanup failed: %s", e)
+            link_queue_deleted = 0
+        # Подальших записів у цю сесію немає, тож commit нижче не обов'язковий, але лишаємо для узгодженості
 
     db.commit()
     return {
         "admin_deleted": adm_deleted,
         "admin_channels_deleted": ac_deleted,
         "network_channels_deleted": nc_deleted,
-        "networks_deleted": len(net_ids),
+        "networks_deleted": net_deleted_count,
         "membership_deleted": mem_deleted,
         "invite_map_deleted": invite_map_deleted,
         "invite_status_deleted": invite_status_deleted,
@@ -337,6 +340,7 @@ def remove_admin_deep(db: Session, admin_id: int, cleanup_channels: bool = True)
         "membership_status_deleted": membership_status_deleted,
         "invite_owners_deleted": invite_owners_deleted,
         "links_no_channel_deleted": links_no_channel_deleted,
+        "link_queue_deleted": link_queue_deleted,
     }
 
 
