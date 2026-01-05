@@ -19,6 +19,7 @@ from admin_bot.services.queue_worker import process_batch
 from admin_bot.services.subscription import refresh_channels_for_admin, finalize_refresh_confirmation
 from admin_bot.utils.messages import extract_links_from_message
 from app.services import link_queue
+from app.utils.tg_links import extract_bot_username
 
 router = Router()
 log = logging.getLogger("admin_bot.handlers.admins")
@@ -43,14 +44,15 @@ def _is_allowed(user_id: int | None) -> bool:
 def _clean_urls(urls: list[str]) -> list[str]:
     """
     Прибирає зайві розділові символи (типу закриваючої дужки) та дублікати, зберігаючи порядок.
-    Залишає лише t.me-посилання (інвайти/username), усе інше сміття відкидає.
+    Залишає лише t.me інвайти (t.me/+hash), ботів (username_bot) або публічні канали (t.me/username).
     """
     from app.utils.tg_links import sanitize_link
 
     cleaned: list[str] = []
     seen: set[str] = set()
-    # Шукаємо тільки t.me інвайти (+hash). Користувацькі профілі без '+' відкидаємо, щоб не падати на user-url.
+    # Шукаємо t.me інвайти (+hash), bot-юзернейми (_bot/bot) або канал за username.
     tg_pattern = re.compile(r"^(?:https?://)?t\.me/\+[A-Za-z0-9_-]{8,}$")
+    channel_pattern = re.compile(r"^(?:https?://)?t\.me/[A-Za-z0-9_]{3,}$")
     for u in urls:
         try:
             c = sanitize_link(u) or u
@@ -60,11 +62,15 @@ def _clean_urls(urls: list[str]) -> list[str]:
         # Вирізаємо зайві хвости
         c = re.sub(r"[^\w\-./:?&=#%+]+$", "", c)
         c = c.rstrip(").,;'\"<>[]{}")
-        if not tg_pattern.match(c):
+        is_invite = bool(tg_pattern.match(c))
+        bot_username = extract_bot_username(c)
+        is_channel_username = bool(channel_pattern.match(c))
+        if not is_invite and not bot_username and not is_channel_username:
             continue
-        if c not in seen:
-            cleaned.append(c)
-            seen.add(c)
+        key = f"https://t.me/{bot_username}" if bot_username else c
+        if key not in seen:
+            cleaned.append(key)
+            seen.add(key)
     return cleaned
 
 
