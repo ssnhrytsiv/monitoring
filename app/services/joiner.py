@@ -326,6 +326,9 @@ async def ensure_join(client, url: str):
 
             # --- КРОК 1: реальна спроба приєднатися
         log.debug("ensure_join(invite): ImportChatInviteRequest invite=%s (network)", invite_hash)
+        if not invite_hash:
+            log.debug("ensure_join(invite): empty invite_hash -> invalid url=%s", url)
+            return "invalid", None, "invite", None, invite_hash
         await throttle_invite()
         try:
             updates = await client(ImportChatInviteRequest(invite_hash))
