@@ -325,16 +325,16 @@ async def ensure_join(client, url: str):
                 return st_norm, (title_known or None), "invite", (int(cid_known) if cid_known else None), invite_hash
 
             # --- КРОК 1: реальна спроба приєднатися
-        log.debug("ensure_join(invite): ImportChatInviteRequest invite=%s (network)", invite_hash)
-        if not invite_hash:
-            log.debug("ensure_join(invite): empty invite_hash -> invalid url=%s", url)
-            return "invalid", None, "invite", None, invite_hash
-        await throttle_invite()
-        try:
-            updates = await client(ImportChatInviteRequest(invite_hash))
-        except FloodWaitError as e:
-            log.warning("FLOOD ensure_join(ImportChatInviteRequest): invite=%s seconds=%s", invite_hash, e.seconds)
-            return f"flood_wait_{int(e.seconds)}", None, "invite", None, invite_hash
+            log.debug("ensure_join(invite): ImportChatInviteRequest invite=%s (network)", invite_hash)
+            if not invite_hash:
+                log.debug("ensure_join(invite): empty invite_hash -> invalid url=%s", url)
+                return "invalid", None, "invite", None, invite_hash
+            await throttle_invite()
+            try:
+                updates = await client(ImportChatInviteRequest(invite_hash))
+            except FloodWaitError as e:
+                log.warning("FLOOD ensure_join(ImportChatInviteRequest): invite=%s seconds=%s", invite_hash, e.seconds)
+                return f"flood_wait_{int(e.seconds)}", None, "invite", None, invite_hash
 
             chats = getattr(updates, "chats", None)
             if not chats:
