@@ -269,6 +269,7 @@ async def refresh_channels_for_admin(
     ).scalars().all()
     if net_chan_ids:
         current_cids |= set(net_chan_ids)
+    conflict_clear_cids: Set[int] = set()
 
     added = link_queue.enqueue(
         urls,
@@ -390,6 +391,18 @@ async def refresh_channels_for_admin(
             human = f"{human} [{account_pool.session_display(session_hint)}]"
         return human
 
+    def _is_same_owner(candidate: Optional[str], admin_obj: m.Admin) -> bool:
+        if not candidate:
+            return False
+        cand = candidate.strip().lstrip("@").lower()
+        if admin_obj.display and cand == admin_obj.display.strip().lstrip("@").lower():
+            return True
+        if admin_obj.username and cand == admin_obj.username.strip().lstrip("@").lower():
+            return True
+        if admin_obj.tg_id and cand == str(admin_obj.tg_id):
+            return True
+        return False
+
     # --- Формуємо список усіх отриманих каналів зі статусами ---
     status_lines: List[str] = ["📋 Обновление списка каналов"]
 
@@ -451,17 +464,21 @@ async def refresh_channels_for_admin(
                     or getattr(oc, "reason", None)
                     or ac_display
                 )
-                # Якщо є конфлікт – записуємо його з власником, щоб показати у звіті
                 conflict_with = "" if existing is None else str(existing).strip()
                 # Якщо у таблиці збережено «unknown», але ми знаємо адміна — показуємо його
                 if (not conflict_with or conflict_with.lower() in ("unknown", "невідомий адмін")) and ac_display:
                     conflict_with = ac_display
+                # Якщо конфлікт записаний на цього ж адміна — очищаємо і не показуємо
+                if conflict_with and _is_same_owner(conflict_with, admin):
+                    conflict_clear_cids.add(int(cid))
+                    conflict_with = ""
                 if not conflict_with:
-                    conflict_with = "невідомий адмін"
-                if status_raw and "owner_conflict" in status_raw:
-                    status_raw = f"owner_conflict(existing={conflict_with})"
-                elif not status_raw:
-                    status_raw = f"owner_conflict(existing={conflict_with})"
+                    conflict_with = None
+                if conflict_with:
+                    if status_raw and "owner_conflict" in status_raw:
+                        status_raw = f"owner_conflict(existing={conflict_with})"
+                    elif not status_raw:
+                        status_raw = f"owner_conflict(existing={conflict_with})"
             elif ac_admin_id and admin.id and ac_admin_id != admin.id:
                 # Канал уже прив'язаний до іншого адміна, але конфлікт не записаний у таблиці
                 conflict_with = ac_display or str(ac_admin_id) or "невідомий адмін"
@@ -487,6 +504,13 @@ async def refresh_channels_for_admin(
         title_txt = title or clean or url or "невідомо"
         href = clean or url
         status_lines.append(f"{idx}. <a href=\"{href}\">{title_txt}</a> — {human}")
+
+    if conflict_clear_cids:
+        try:
+            db.execute(delete(m.OwnerConflict).where(m.OwnerConflict.channel_id.in_(conflict_clear_cids)))
+            db.commit()
+        except Exception:
+            pass
 
     to_remove = {cid for cid in current_cids if cid not in keep_cids}
 

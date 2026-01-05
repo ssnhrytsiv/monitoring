@@ -284,17 +284,34 @@ def move_orphans_to_primary(db: Session, admin_id: int) -> int:
 def channel_hyperlink(db: Session, ch: m.Channel) -> str:
     """
     Повертає HTML-посилання на канал: username -> https://t.me/<username>,
-    якщо немає username – шукаємо invite_hash у invite_map і будуємо https://t.me/+<hash>,
-    якщо немає і цього – повертаємо екрановану назву.
+    якщо немає username – шукаємо invite_hash у invite_map і будуємо https://t.me/+<hash> (з назвою з invite_map.title, якщо є),
+    якщо немає і цього – повертаємо екрановану назву або останній raw_url.
     """
     title = ch.title or ""
     if ch.username:
         label = title or f"@{ch.username}"
         return f'<a href="https://t.me/{html.escape(ch.username)}">{html.escape(label)}</a>'
-    inv = db.execute(
-        select(m.InviteMap.invite_hash).where(m.InviteMap.channel_id == ch.channel_id)
+
+    inv_row = db.execute(
+        select(m.InviteMap.invite_hash, m.InviteMap.title).where(m.InviteMap.channel_id == ch.channel_id)
+    ).first()
+    if inv_row:
+        inv_hash, inv_title = inv_row
+        label = title or inv_title or inv_hash
+        return f'<a href="https://t.me/+{html.escape(inv_hash)}">{html.escape(label)}</a>'
+
+    # Фолбек: використовуємо останній raw_url із links, щоб показати хоч щось клікабельне
+    raw_url = db.execute(
+        select(m.Link.raw_url)
+        .where(m.Link.channel_id == ch.channel_id, m.Link.raw_url != None)  # noqa: E711
+        .order_by(m.Link.id.desc())
     ).scalars().first()
-    if inv:
-        label = title or inv
-        return f'<a href="https://t.me/+{html.escape(inv)}">{html.escape(label)}</a>'
+    if raw_url:
+        try:
+            href = sanitize_link(raw_url) or raw_url
+        except Exception:
+            href = raw_url
+        label = title or href or str(ch.channel_id)
+        return f'<a href="{html.escape(href)}">{html.escape(label)}</a>'
+
     return html.escape(title or str(ch.channel_id))
