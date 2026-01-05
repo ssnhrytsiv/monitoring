@@ -11,8 +11,10 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from admin_bot.db.session import SessionLocal
 from admin_bot.db import models as m
+from admin_bot.services import report_cache
 from admin_bot.services import admins as svc_admins
 from admin_bot.services.subscription.subscription_report import answer_with_retry
+from admin_bot.services.subscription.subscription_menu import split_text_for_telegram, make_report_kb
 from app.services import channel_db, membership_db, link_queue
 from app.services import account_pool
 from app.utils.tg_links import sanitize_link
@@ -234,11 +236,30 @@ async def _send_refresh_report(
         f"links {stats['links_deleted']}, url_cache {stats['url_cache_deleted']}, link_queue {stats['link_queue_deleted']}"
     )
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin.id}")]]
-    )
-
-    await answer_with_retry(reply_msg, "\n".join(lines), disable_web_page_preview=True, reply_markup=kb)
+    text_full = "\n".join(lines)
+    pages = split_text_for_telegram(text_full, max_len=5000)
+    if len(pages) == 1:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin.id}")]]
+        )
+        await answer_with_retry(
+            reply_msg,
+            pages[0],
+            disable_web_page_preview=True,
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    else:
+        kb = make_report_kb(0, len(pages), has_report=False)
+        sent = await answer_with_retry(
+            reply_msg,
+            pages[0],
+            disable_web_page_preview=True,
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+        if sent:
+            report_cache.register(sent.chat.id, sent.message_id, pages, None)  # type: ignore[name-defined]
 
 
 async def refresh_channels_for_admin(
@@ -594,12 +615,27 @@ async def refresh_channels_for_admin(
                 ]
             ]
         )
-        await answer_with_retry(
-            reply_msg,
-            "\n".join(preview_lines),
-            disable_web_page_preview=True,
-            reply_markup=kb_confirm,
-        )
+        text_preview = "\n".join(preview_lines)
+        pages = split_text_for_telegram(text_preview, max_len=5000)
+        if len(pages) == 1:
+            await answer_with_retry(
+                reply_msg,
+                pages[0],
+                disable_web_page_preview=True,
+                reply_markup=kb_confirm,
+                parse_mode="HTML",
+            )
+        else:
+            kb = make_report_kb(0, len(pages), has_report=False)
+            sent = await answer_with_retry(
+                reply_msg,
+                pages[0],
+                disable_web_page_preview=True,
+                parse_mode="HTML",
+                reply_markup=kb,
+            )
+            if sent:
+                report_cache.register(sent.chat.id, sent.message_id, pages, None)
         db.close()
         return
 

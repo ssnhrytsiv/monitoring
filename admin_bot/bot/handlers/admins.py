@@ -231,6 +231,20 @@ async def cb_refresh_channels_cancel(cb: CallbackQuery, state: FSMContext):
     await cb.answer("Оновлення скасовано.")
 
 
+def _refresh_collect_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➕ Добавити", callback_data="refresh_channels_collect_add"),
+                InlineKeyboardButton(text="🚀 Перейти до підписки", callback_data="refresh_channels_collect_go"),
+            ],
+            [
+                InlineKeyboardButton(text="❌ Скасувати оновлення каналів", callback_data="refresh_channels_cancel"),
+            ],
+        ]
+    )
+
+
 @router.callback_query(F.data.startswith("refresh_unsub_yes:"))
 async def cb_refresh_unsub_yes(cb: CallbackQuery):
     if not _is_allowed(cb.from_user.id if cb.from_user else None):
@@ -271,6 +285,65 @@ async def cb_refresh_unsub_no(cb: CallbackQuery):
         return
     await cb.answer("Відписку скасовано.")
     asyncio.create_task(finalize_refresh_confirmation(batch_id, False, target_msg))
+
+
+@router.callback_query(F.data == "refresh_channels_collect_add")
+async def cb_refresh_collect_add(cb: CallbackQuery):
+    if not _is_allowed(cb.from_user.id):
+        return
+    await cb.answer("Надішли додаткові посилання.")
+
+
+@router.callback_query(F.data == "refresh_channels_collect_go")
+async def cb_refresh_collect_go(cb: CallbackQuery, state: FSMContext):
+    if not _is_allowed(cb.from_user.id):
+        return
+    if not cb.message:
+        await cb.answer()
+        return
+    data = await state.get_data()
+    urls: list[str] = data.get("urls") or []
+    if not urls:
+        await cb.answer("Немає зібраних посилань. Надішли t.me/+ ...", show_alert=True)
+        return
+    db = next(_db())
+    admin = None
+    admin_id = data.get("admin_id")
+    if admin_id:
+        admin = svc_admins.get_admin_by_id(db, admin_id)
+    if admin is None:
+        admin = svc_admins.find_admin(
+            db,
+            tg_id=cb.from_user.id if cb.from_user else None,
+            username=cb.from_user.username if cb.from_user else None,
+            display=None,
+        )
+    if not admin:
+        await cb.answer("Адміна не знайдено. Додай через /add_admin", show_alert=True)
+        await state.clear()
+        return
+
+    raw_texts: list[str] = data.get("raw_texts") or []
+    raw_htmls: list[str] = data.get("raw_htmls") or raw_texts
+    raw_text = "\n".join(raw_texts) if raw_texts else ""
+    raw_html = "\n".join(raw_htmls) if raw_htmls else raw_text
+    entities = data.get("entities") or []
+    batch_id = f"refresh:{cb.message.chat.id}:{int(time.time())}"
+
+    await state.clear()
+    await cb.answer("Запускаю підписку…", show_alert=False)
+    asyncio.create_task(
+        refresh_channels_for_admin(
+            batch_id=batch_id,
+            chat_id=cb.message.chat.id if cb.message else 0,
+            reply_msg=cb.message,
+            admin=admin,
+            urls=urls,
+            raw_text=raw_text,
+            raw_html=raw_html,
+            entities=entities,
+        )
+    )
 
 
 @router.message(AddAdminFlow.waiting_link)
@@ -350,24 +423,35 @@ async def on_refresh_links(m: Message, state: FSMContext):
         await state.clear()
         return
 
+    existing: list[str] = data.get("urls") or []
+    seen = set(existing)
+    merged = existing[:]
+    for u in urls:
+        if u not in seen:
+            merged.append(u)
+            seen.add(u)
+
+    raw_texts: list[str] = data.get("raw_texts") or []
+    raw_htmls: list[str] = data.get("raw_htmls") or []
     raw_text = m.text or m.caption or ""
     raw_html = m.html_text or raw_text
-    entities = m.entities or []
-    batch_id = f"refresh:{m.chat.id}:{int(time.time())}"
-    await _answer_with_retry(m, "Прийняв посилання, оновлюю…")
-    asyncio.create_task(
-        refresh_channels_for_admin(
-            batch_id=batch_id,
-            chat_id=m.chat.id,
-            reply_msg=m,
-            admin=admin,
-            urls=urls,
-            raw_text=raw_text,
-            raw_html=raw_html,
-            entities=entities,
-        )
+    if raw_text:
+        raw_texts.append(raw_text)
+    if raw_html:
+        raw_htmls.append(raw_html)
+
+    await state.update_data(
+        urls=merged,
+        raw_texts=raw_texts,
+        raw_htmls=raw_htmls,
+        entities=m.entities or [],
     )
-    await state.clear()
+    await _answer_with_retry(
+        m,
+        f"Додав {len(urls)} посилань (всього {len(merged)}). "
+        "Потрібно добавити ще канали, чи перейти до підписки?",
+        reply_markup=_refresh_collect_kb(),
+    )
 
 
 @router.message(AddAdminFlow.waiting_name)
