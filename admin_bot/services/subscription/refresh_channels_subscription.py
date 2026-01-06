@@ -385,6 +385,12 @@ async def refresh_channels_for_admin(
                 keep_cids.add(int(cached["channel_id"]))
     if keep_from_cache:
         keep_cids |= keep_from_cache
+    no_cid_resolution = False
+    if not keep_cids:
+        # не вдалося визначити channel_id для нових URL — не відписуємо поточні,
+        # але показуємо статуси з кешу
+        no_cid_resolution = True
+        keep_cids = set(current_cids)
 
     if not keep_cids:
         await answer_with_retry(
@@ -446,6 +452,8 @@ async def refresh_channels_for_admin(
 
     # --- Формуємо список усіх отриманих каналів зі статусами ---
     status_lines: List[str] = ["📋 Обновление списка каналов"]
+    if no_cid_resolution:
+        status_lines.append("⚠️ Не вдалося визначити channel_id за новими посиланнями; відписка пропущена, показуємо статуси за кешем.")
 
     for idx, url in enumerate(urls, start=1):
         status_raw = None

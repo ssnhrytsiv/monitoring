@@ -7,6 +7,7 @@ from aiogram.filters import Command, StateFilter
 import logging
 import asyncio
 import time
+import uuid
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramServerError
 
@@ -20,9 +21,13 @@ from admin_bot.services.subscription import refresh_channels_for_admin, finalize
 from admin_bot.utils.messages import extract_links_from_message
 from app.services import link_queue
 from app.utils.tg_links import extract_bot_username
+from app.services import account_pool
+from app.services.account_pool import iter_pool_clients
+from telethon.tl import types as tl_types
 
 router = Router()
 log = logging.getLogger("admin_bot.handlers.admins")
+_DEDUP_PENDING = {}
 
 
 def _db():
@@ -103,6 +108,140 @@ async def cmd_start(m: Message):
         "• /admins — список адмінів",
         reply_markup=main_menu_kb()
     )
+
+
+@router.callback_query(F.data == "dedup_sessions")
+async def cb_dedup_sessions(cb: CallbackQuery):
+    if not _is_allowed(cb.from_user.id if cb.from_user else None):
+        await cb.answer()
+        return
+    msg = await cb.message.answer("🔁 Сканую підписки сесій у пулі, шукаю дублікати...")
+
+    slots = iter_pool_clients()
+    if not slots:
+        await msg.edit_text("Пул сесій порожній (ACCOUNTS не налаштовані).")
+        await cb.answer()
+        return
+
+    session_channels: dict[str, dict[int, str]] = {}
+    errors = []
+
+    async def _collect(slot):
+        chans: dict[int, str] = {}
+        try:
+            async for dlg in slot.client.iter_dialogs():
+                ent = dlg.entity
+                if isinstance(ent, tl_types.Channel):
+                    cid = int(ent.id)
+                    title = getattr(ent, "title", "") or dlg.name or ""
+                    chans[cid] = title
+        except Exception as e:
+            errors.append(f"{slot.name}: {e}")
+        return chans
+
+    # зібрати канали для кожної сесії
+    for slot in slots:
+        chans = await _collect(slot)
+        session_channels[slot.name] = chans
+
+    # будуємо cid -> сесії
+    cid_map: dict[int, list[tuple[str, str]]] = {}
+    for sess, cid_title in session_channels.items():
+        for cid, title in cid_title.items():
+            cid_map.setdefault(cid, []).append((sess, title))
+
+    leave_plan: dict[str, set[int]] = {}
+    keep_map: dict[int, str] = {}
+    title_map: dict[int, str] = {}
+    for cid, sess_list in cid_map.items():
+        if len(sess_list) <= 1:
+            continue
+        keep = sorted(s for s, _ in sess_list)[0]
+        keep_map[cid] = keep
+        title_map[cid] = sess_list[0][1] or ""
+        for sess, _ in sess_list:
+            if sess == keep:
+                continue
+            leave_plan.setdefault(sess, set()).add(cid)
+
+    if not leave_plan:
+        lines = ["Дублікатів не знайдено."]
+        if errors:
+            lines.append("Помилки збору: " + "; ".join(errors))
+        await msg.edit_text("\n".join(lines))
+        await cb.answer()
+        return
+
+    # Формуємо попередній огляд
+    preview = ["Знайдені дублікати підписок:"]
+    dup_cids = [cid for cid, lst in cid_map.items() if len(lst) > 1]
+    preview.append(f"Каналів з дублями: {len(dup_cids)}")
+    for cid in sorted(dup_cids)[:50]:
+        keep = keep_map.get(cid)
+        leave = []
+        for sess, _ in cid_map.get(cid, []):
+            if sess != keep:
+                leave.append(account_pool.session_display(sess))
+        title = title_map.get(cid) or ""
+        title_txt = title or f"channel_id={cid}"
+        preview.append(f"• {title_txt} (ID: {cid}) — keep {account_pool.session_display(keep) if keep else '?'}; leave {', '.join(leave) if leave else '—'}")
+    if len(dup_cids) > 50:
+        preview.append(f"... ще {len(dup_cids)-50} каналів")
+    if errors:
+        preview.append("Помилки збору: " + "; ".join(errors))
+
+    token = str(uuid.uuid4())
+    _DEDUP_PENDING[token] = {
+        "leave_plan": leave_plan,
+        "title_map": title_map,
+        "keep_map": keep_map,
+    }
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Відписати дублікати", callback_data=f"dedup_confirm_yes:{token}"),
+                InlineKeyboardButton(text="❌ Не відписувати", callback_data=f"dedup_confirm_no:{token}"),
+            ]
+        ]
+    )
+    await msg.edit_text("\n".join(preview), reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("dedup_confirm_no:"))
+async def cb_dedup_confirm_no(cb: CallbackQuery):
+    token = cb.data.split(":", 1)[1]
+    _DEDUP_PENDING.pop(token, None)
+    await cb.message.edit_text("Відписка скасована.")
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("dedup_confirm_yes:"))
+async def cb_dedup_confirm_yes(cb: CallbackQuery):
+    token = cb.data.split(":", 1)[1]
+    plan = _DEDUP_PENDING.pop(token, None)
+    if not plan:
+        await cb.message.edit_text("Дані для відписки не знайдено. Запусти дедуп знову.")
+        await cb.answer()
+        return
+    leave_plan: dict[str, set[int]] = plan.get("leave_plan") or {}
+    title_map: dict[int, str] = plan.get("title_map") or {}
+    keep_map: dict[int, str] = plan.get("keep_map") or {}
+
+    stats_lines = []
+    left_total = 0
+    errors_total = 0
+    for sess, cids in leave_plan.items():
+        res = await account_pool.leave_channels(sess, list(cids))
+        left_total += res.get("left", 0) or 0
+        errors_total += res.get("errors", 0) or 0
+        stats_lines.append(f"{account_pool.session_display(sess)}: left={res.get('left',0)} errors={res.get('errors',0)}")
+
+    summary = [f"Відписка завершена. Каналів з дублями: {len(keep_map)}"]
+    summary.extend(stats_lines or ["Не було що відписувати"])
+    summary.append(f"Сумарно відписок: {left_total}, помилок: {errors_total}")
+    await cb.message.edit_text("\n".join(summary))
+    await cb.answer()
 
 
 @router.message(Command("admins"))

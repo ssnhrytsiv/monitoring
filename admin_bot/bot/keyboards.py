@@ -5,6 +5,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Адміни", callback_data="show_admins")],
+            [InlineKeyboardButton(text="🔁 Дедуп підписок", callback_data="dedup_sessions")],
         ]
     )
 
