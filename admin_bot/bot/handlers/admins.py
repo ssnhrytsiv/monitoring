@@ -28,6 +28,10 @@ log = logging.getLogger("admin_bot.handlers.admins")
 def _db():
     db = SessionLocal()
     try:
+        svc_admins.ensure_admin_schema(db)
+    except Exception:
+        pass
+    try:
         yield db
     finally:
         db.close()

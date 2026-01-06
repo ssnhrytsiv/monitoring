@@ -59,6 +59,7 @@ def _admin_label(a) -> str:
 
 
 def _render_admin_view(msg, admin, nets, stats):
+    label_new = "<code>[NEW]</code>" if getattr(admin, "is_new", 0) else ""
     bots = channel_db.list_bot_links(owner_display=admin.display, owner_username=admin.username)
     bots_count = len(bots)
     # підрахунок каналів по сітках
@@ -78,7 +79,7 @@ def _render_admin_view(msg, admin, nets, stats):
             net_lines.append(f"Сумарно: {total_channels}")
 
     lines = [
-        f"Адмін: {_admin_label(admin)}",
+        f"Адмін: {_admin_label(admin)}{' ' + label_new if label_new else ''}",
         f"Сіток: {len(nets)}",
         f"Боти: {bots_count}",
         f"Сумарна ціна: {stats['price_sum']:.2f}" if stats["price_sum"] is not None else "Сумарна ціна: —",
@@ -94,6 +95,7 @@ def _render_admin_view(msg, admin, nets, stats):
     else:
         lines.append("Сіток поки немає.")
 
+    toggle_text = "Старий" if getattr(admin, "is_new", 0) else "Новий"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -101,6 +103,8 @@ def _render_admin_view(msg, admin, nets, stats):
                 InlineKeyboardButton(text="Посмотреть ботов", callback_data=f"admin_bots:{admin.id}"),
             ],
             [InlineKeyboardButton(text="Оновити список каналів", callback_data=f"refresh_channels:{admin.id}")],
+            [InlineKeyboardButton(text="Задати параметри", callback_data=f"admin_set_params:{admin.id}")],
+            [InlineKeyboardButton(text=toggle_text, callback_data=f"admin_toggle_new:{admin.id}")],
             [InlineKeyboardButton(text="🗑 Видалити адміна", callback_data=f"admin_delete_confirm:{admin.id}")],
             [
                 InlineKeyboardButton(text="⬅️ До списку", callback_data="show_admins"),
@@ -108,7 +112,8 @@ def _render_admin_view(msg, admin, nets, stats):
             ],
         ]
     )
-    return msg.edit_text("\n".join(lines), reply_markup=kb)
+    text = "\n".join([ln for ln in lines if ln.strip()])
+    return msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 
 ADMINS_PER_PAGE = 30
@@ -521,6 +526,24 @@ async def cb_admin_back(cb: CallbackQuery):
     stats = svc_networks.stats_for_admin(db, admin_id)
     await _render_admin_view(cb.message, admin, nets, stats)
     await cb.answer()
+
+
+@router.callback_query(F.data.startswith("admin_toggle_new:"))
+async def cb_admin_toggle_new(cb: CallbackQuery):
+    try:
+        admin_id = int(cb.data.split(":", 1)[1])
+    except Exception:
+        await cb.answer()
+        return
+    db = next(_db())
+    admin = svc_admins.toggle_admin_new(db, admin_id)
+    if not admin:
+        await cb.answer("Адміна не знайдено", show_alert=True)
+        return
+    nets = svc_networks.list_networks_by_admin(db, admin.id)
+    stats = svc_networks.stats_for_admin(db, admin.id)
+    await _render_admin_view(cb.message, admin, nets, stats)
+    await cb.answer("Мітку оновлено.")
 
 
 @router.callback_query(F.data.startswith("admin_delete:"))

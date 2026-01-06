@@ -12,12 +12,14 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from admin_bot.db.session import SessionLocal
 from admin_bot.db import models as m
 from admin_bot.services import report_cache
+from admin_bot.services.subscription import batch_cache
 from admin_bot.services import admins as svc_admins
 from admin_bot.services.subscription.subscription_report import answer_with_retry
 from admin_bot.services.subscription.subscription_menu import split_text_for_telegram, make_report_kb
 from app.services import channel_db, membership_db, link_queue
 from app.services import account_pool
 from app.utils.tg_links import sanitize_link
+from admin_bot.services.subscription.subscription_utils import norm_keys as collect_norm_keys
 
 log = logging.getLogger("admin_bot.services.subscription.refresh_channels")
 
@@ -360,11 +362,29 @@ async def refresh_channels_for_admin(
         original_urls=urls,
     )
 
+    cache_entry = batch_cache.pop(batch_id) or {}
+    cached_items = cache_entry.get("items") or []
+    cache_map: Dict[str, Dict] = {}
+    keep_from_cache: Set[int] = set()
+    for it in cached_items:
+        nkeys = collect_norm_keys(it.get("url", ""))
+        for nk in nkeys:
+            cache_map[nk] = it
+        cid = it.get("channel_id")
+        if cid:
+            keep_from_cache.add(int(cid))
+
     keep_cids: Set[int] = set()
     for u in urls:
         cid = _resolve_channel_id(u)
         if cid:
             keep_cids.add(cid)
+        if not cid:
+            cached = cache_map.get(u) or cache_map.get(sanitize_link(u) or "")
+            if cached and cached.get("channel_id"):
+                keep_cids.add(int(cached["channel_id"]))
+    if keep_from_cache:
+        keep_cids |= keep_from_cache
 
     if not keep_cids:
         await answer_with_retry(
@@ -428,10 +448,12 @@ async def refresh_channels_for_admin(
     status_lines: List[str] = ["📋 Обновление списка каналов"]
 
     for idx, url in enumerate(urls, start=1):
+        status_raw = None
         try:
             clean = sanitize_link(url) or url
         except Exception:
             clean = url
+        cached_item = cache_map.get(clean) or cache_map.get(url)
         cid, title = None, None
         try:
             cid, title = membership_db.map_invite_get(clean)
@@ -442,15 +464,21 @@ async def refresh_channels_for_admin(
         if not title and cid:
             ch = db.execute(select(m.Channel).where(m.Channel.id == cid)).scalar_one_or_none()
             title = getattr(ch, "title", None)
+        if cached_item:
+            if cached_item.get("channel_id") and not cid:
+                cid = cached_item.get("channel_id")
+            if cached_item.get("title") and not title:
+                title = cached_item.get("title")
+            status_raw = cached_item.get("status")
         # Підтягуємо статус підписки; інколи кеш зберігається по неочищеному URL,
         # тому пробуємо і clean, і вихідний url.
-        status_raw = None
-        for candidate in (clean, url):
-            if not candidate:
-                continue
-            status_raw = membership_db.invite_status_get(candidate)  # type: ignore[attr-defined]
-            if status_raw:
-                break
+        if not status_raw:
+            for candidate in (clean, url):
+                if not candidate:
+                    continue
+                status_raw = membership_db.invite_status_get(candidate)  # type: ignore[attr-defined]
+                if status_raw:
+                    break
 
         session_hint = None
         # Конфлікт власника: читаємо з таблиці, щоб явно відобразити

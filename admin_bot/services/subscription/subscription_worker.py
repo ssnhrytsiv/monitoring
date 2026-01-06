@@ -28,6 +28,7 @@ from admin_bot.services.channels import upsert_channel_full
 from admin_bot.db.models import upsert_membership
 from admin_bot.services.owner_conflicts import log_conflict
 from admin_bot.services.subscription.subscription_menu import split_text_for_telegram, make_report_kb
+from admin_bot.services.subscription import batch_cache
 from admin_bot.services.progress import Progress
 from admin_bot.services import admins as svc_admins
 from admin_bot.services import networks as svc_networks
@@ -765,4 +766,8 @@ async def process_batch(
                 len(pages),
                 chat_id,
             )
+    try:
+        batch_cache.register(batch_id, result_items, original_urls)
+    except Exception:
+        log.exception("queue_worker: failed to cache result_items for batch_id=%s", batch_id)
     db.close()

@@ -13,6 +13,27 @@ import re
 log = logging.getLogger("admin_bot.services.admins")
 
 
+_ADMIN_SCHEMA_PATCHED = False
+
+
+def ensure_admin_schema(db: Session) -> None:
+    """
+    Додає відсутні колонки для admins (is_new), щоб уникнути помилок select.
+    """
+    global _ADMIN_SCHEMA_PATCHED
+    if _ADMIN_SCHEMA_PATCHED:
+        return
+    try:
+        cols = [r[1] for r in db.execute(text("PRAGMA table_info(admins)")).fetchall()]
+        if "is_new" not in cols:
+            db.execute(text("ALTER TABLE admins ADD COLUMN is_new INTEGER DEFAULT 0"))
+            db.commit()
+        _ADMIN_SCHEMA_PATCHED = True
+    except Exception:
+        db.rollback()
+        log.exception("ensure_admin_schema failed")
+
+
 def _expand_url_variants(url: str) -> list[str]:
     """
     Повертає список варіантів URL (raw, sanitized, joinchat/+ заміна) для надійного очищення кешів.
@@ -83,6 +104,7 @@ def get_or_create_admin(
     username: Optional[str],
     display: Optional[str],
 ) -> m.Admin:
+    ensure_admin_schema(db)
     admin = None
 
     if tg_id is not None:
@@ -117,6 +139,7 @@ def find_admin(
     """
     Повертає існуючого адміна за tg_id/username/display без створення нового.
     """
+    ensure_admin_schema(db)
     admin = None
 
     if tg_id is not None:
@@ -129,11 +152,25 @@ def find_admin(
 
 
 def list_admins(db: Session) -> List[m.Admin]:
+    ensure_admin_schema(db)
     return list(db.execute(select(m.Admin).order_by(m.Admin.id.desc())).scalars())
 
 
 def get_admin_by_id(db: Session, admin_id: int) -> Optional[m.Admin]:
+    ensure_admin_schema(db)
     return db.execute(select(m.Admin).where(m.Admin.id == admin_id)).scalar_one_or_none()
+
+
+def toggle_admin_new(db: Session, admin_id: int) -> Optional[m.Admin]:
+    ensure_admin_schema(db)
+    admin = db.execute(select(m.Admin).where(m.Admin.id == admin_id)).scalar_one_or_none()
+    if not admin:
+        return None
+    current = getattr(admin, "is_new", 0) or 0
+    admin.is_new = 0 if current else 1
+    db.commit()
+    db.refresh(admin)
+    return admin
 
 
 def remove_admin(db: Session, admin_id: int) -> bool:

@@ -140,6 +140,7 @@ class Admin(Base):
     tg_id = Column(BigInteger, unique=True, index=True, nullable=True)
     username = Column(String)
     display = Column(String)
+    is_new = Column(Integer, default=0)
 
     channels = relationship(
         "AdminChannel",
