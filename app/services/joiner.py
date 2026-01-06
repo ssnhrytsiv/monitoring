@@ -335,6 +335,9 @@ async def ensure_join(client, url: str):
             except FloodWaitError as e:
                 log.warning("FLOOD ensure_join(ImportChatInviteRequest): invite=%s seconds=%s", invite_hash, e.seconds)
                 return f"flood_wait_{int(e.seconds)}", None, "invite", None, invite_hash
+            except ChannelsTooMuchError:
+                log.warning("ensure_join(invite): CHANNELS_TOO_MUCH invite=%s", invite_hash)
+                return "too_many", None, "invite", None, invite_hash
 
             chats = getattr(updates, "chats", None)
             if not chats:

@@ -172,7 +172,14 @@ def init() -> None:
             source_url TEXT,
             created_by BIGINT,
             created_via TEXT,
-            project TEXT
+            project TEXT,
+            admin_id INTEGER,
+            network_id INTEGER,
+            posted_at TEXT,
+            views_at_post INTEGER,
+            subs_at_post INTEGER,
+            cpm_at_post FLOAT,
+            price_at_post FLOAT
         )
         """
     )
@@ -185,7 +192,9 @@ def init() -> None:
             title TEXT,
             created_by BIGINT,
             created_via TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            admin_id INTEGER,
+            network_id INTEGER
         )
         """
     )
@@ -204,6 +213,33 @@ def init() -> None:
 
     if not _has_column(_conn, "watch_posts", "project"):
         _conn.execute("ALTER TABLE watch_posts ADD COLUMN project TEXT")
+
+    if not _has_column(_conn, "watch_posts", "admin_id"):
+        _conn.execute("ALTER TABLE watch_posts ADD COLUMN admin_id INTEGER")
+
+    if not _has_column(_conn, "watch_posts", "network_id"):
+        _conn.execute("ALTER TABLE watch_posts ADD COLUMN network_id INTEGER")
+
+    if not _has_column(_conn, "watch_posts", "posted_at"):
+        _conn.execute("ALTER TABLE watch_posts ADD COLUMN posted_at TEXT")
+
+    if not _has_column(_conn, "watch_posts", "views_at_post"):
+        _conn.execute("ALTER TABLE watch_posts ADD COLUMN views_at_post INTEGER")
+
+    if not _has_column(_conn, "watch_posts", "subs_at_post"):
+        _conn.execute("ALTER TABLE watch_posts ADD COLUMN subs_at_post INTEGER")
+
+    if not _has_column(_conn, "watch_posts", "cpm_at_post"):
+        _conn.execute("ALTER TABLE watch_posts ADD COLUMN cpm_at_post FLOAT")
+
+    if not _has_column(_conn, "watch_posts", "price_at_post"):
+        _conn.execute("ALTER TABLE watch_posts ADD COLUMN price_at_post FLOAT")
+
+    if not _has_column(_conn, "watch_groups", "admin_id"):
+        _conn.execute("ALTER TABLE watch_groups ADD COLUMN admin_id INTEGER")
+
+    if not _has_column(_conn, "watch_groups", "network_id"):
+        _conn.execute("ALTER TABLE watch_groups ADD COLUMN network_id INTEGER")
 
     _conn.execute(
         """
@@ -242,6 +278,9 @@ def init() -> None:
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_wp_matched_session ON watch_posts(matched_session)")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_wp_created_by ON watch_posts(created_by)")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_wp_group ON watch_posts(group_id)")
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_wp_posted_at ON watch_posts(posted_at)")
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_wp_admin ON watch_posts(admin_id)")
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_wp_network ON watch_posts(network_id)")
 
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_we_sent_at ON watch_events(sent_at)")
     _conn.execute("CREATE INDEX IF NOT EXISTS idx_we_unsent ON watch_events(sent_at, id)")
@@ -258,6 +297,8 @@ def init() -> None:
         WHERE status IN ('pending','matched')
         """
     )
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_wg_admin ON watch_groups(admin_id)")
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_wg_network ON watch_groups(network_id)")
 
     if not _has_column(_conn, "watch_candidates", "text_hash"):
         _conn.execute("ALTER TABLE watch_candidates ADD COLUMN text_hash TEXT")

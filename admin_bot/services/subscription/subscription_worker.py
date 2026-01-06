@@ -540,6 +540,8 @@ async def process_batch(
                     backoff_seconds = max(backoff_seconds, secs)
             elif status == "too_many":
                 mark_limit(client)
+                # не перевіряємо цей URL заново найближчим часом — сесія засинає
+                backoff_seconds = max(backoff_seconds, 86400)
             else:
                 bump_cooldown(client, 1)
 

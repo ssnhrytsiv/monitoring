@@ -75,6 +75,8 @@ class WatchGroup(Base):
     created_by = Column(BigInteger, nullable=True)
     created_via = Column(Text, nullable=True)
     created_at = Column(Text, nullable=False)
+    admin_id = Column(Integer, nullable=True)
+    network_id = Column(Integer, nullable=True)
 
 
 class WatchPost(Base):
@@ -103,6 +105,13 @@ class WatchPost(Base):
     created_via = Column(Text, nullable=True)
     project = Column(Text, nullable=True)
     group_id = Column(BigInteger, nullable=True)
+    admin_id = Column(Integer, nullable=True)
+    network_id = Column(Integer, nullable=True)
+    posted_at = Column(Text, nullable=True)
+    views_at_post = Column(Integer, nullable=True)
+    subs_at_post = Column(Integer, nullable=True)
+    cpm_at_post = Column(Float, nullable=True)
+    price_at_post = Column(Float, nullable=True)
 
     __table_args__ = (
         Index("idx_wp_channel", "channel_id"),
@@ -111,6 +120,9 @@ class WatchPost(Base):
         Index("idx_wp_matched_session", "matched_session"),
         Index("idx_wp_created_by", "created_by"),
         Index("idx_wp_group", "group_id"),
+        Index("idx_wp_posted_at", "posted_at"),
+        Index("idx_wp_admin", "admin_id"),
+        Index("idx_wp_network", "network_id"),
         Index(
             "uq_active_watch",
             "channel_id",
