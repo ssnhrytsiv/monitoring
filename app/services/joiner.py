@@ -1,7 +1,7 @@
 # app/services/joiner.py
 import logging
 
-from app.utils.throttle import throttle_probe, throttle_invite, throttle_public
+from app.utils.throttle import throttle_probe, throttle_invite, throttle_public, throttle_invite_peek
 from telethon.errors.rpcerrorlist import InviteRequestSentError
 
 from telethon.errors import (
@@ -23,7 +23,7 @@ from app.services.membership_db import (
 )
 from app.utils.tg_links import sanitize_link
 from app.services import channel_db
-from app.services.account_pool import is_already_subscribed
+from app.services.account_pool import is_already_subscribed, session_name
 
 log = logging.getLogger("services.joiner")
 
@@ -325,6 +325,60 @@ async def ensure_join(client, url: str):
                 return st_norm, (title_known or None), "invite", (int(cid_known) if cid_known else None), invite_hash
 
             # --- КРОК 1: реальна спроба приєднатися
+            # Спершу легка перевірка інвайта без join: якщо вже є фінальний статус по channel_id,
+            # не робимо ImportChatInviteRequest і не підписуємо іншу сесію.
+            if invite_hash:
+                sess_name = None
+                try:
+                    sess_name = session_name(client)
+                except Exception:
+                    _log_exc("ensure_join: session_name peek")
+                try:
+                    await throttle_invite_peek()
+                    peek = await client(CheckChatInviteRequest(invite_hash))
+                    chat = getattr(peek, "chat", None)
+                    cid_peek = int(getattr(chat, "id", 0) or 0) if chat else None
+                    title_peek = getattr(chat, "title", None)
+                    if cid_peek:
+                        try:
+                            map_invite_set(invite_hash, cid_peek, title_peek or None)
+                            log.debug(
+                                "ensure_join(invite): peek map_invite_set invite=%s cid=%s title=%r sess=%s",
+                                invite_hash,
+                                cid_peek,
+                                title_peek,
+                                sess_name,
+                            )
+                        except Exception:
+                            _log_exc("ensure_join: map_invite_set peek")
+                        try:
+                            final_peek = _final_from_cache(any_final_for_channel(cid_peek))
+                        except Exception:
+                            final_peek = None
+                        if final_peek:
+                            try:
+                                # кешуємо фінальний статус для інвайта (включно з joined/already)
+                                invite_status_put(invite_hash, final_peek)
+                            except Exception:
+                                _log_exc("ensure_join: invite_status_put peek")
+                            log.info(
+                                "ensure_join(invite): peek final=%s cid=%s title=%r sess=%s -> skip join",
+                                final_peek,
+                                cid_peek,
+                                title_peek,
+                                sess_name,
+                            )
+                            return final_peek, (title_peek or None), "invite", cid_peek, invite_hash
+                except FloodWaitError as e:
+                    log.warning("ensure_join(invite): CheckChatInviteRequest flood %ss invite=%s", e.seconds, invite_hash)
+                    return f"flood_wait_{int(e.seconds)}", None, "invite", None, invite_hash
+                except (InviteHashInvalidError, InviteHashExpiredError):
+                    log.debug("ensure_join(invite): peek invalid invite=%s", invite_hash)
+                    invite_status_put(invite_hash, "invalid")
+                    return "invalid", None, "invite", None, invite_hash
+                except Exception:
+                    _log_exc("ensure_join: CheckChatInviteRequest peek")
+
             log.debug("ensure_join(invite): ImportChatInviteRequest invite=%s (network)", invite_hash)
             if not invite_hash:
                 log.debug("ensure_join(invite): empty invite_hash -> invalid url=%s", url)

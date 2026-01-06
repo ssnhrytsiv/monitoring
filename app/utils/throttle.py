@@ -32,10 +32,13 @@ LINK_DELAY_INVITE_MIN = _f("LINK_DELAY_INVITE_MIN", "35")
 LINK_DELAY_INVITE_MAX = _f("LINK_DELAY_INVITE_MAX", "50")
 LINK_DELAY_BOT_MIN = _f("LINK_DELAY_BOT_MIN", "5")
 LINK_DELAY_BOT_MAX = _f("LINK_DELAY_BOT_MAX", "8")
+# окремий троттл для CheckChatInviteRequest (peek)
+INVITE_PEEK_DELAY = _f("INVITE_PEEK_DELAY", "30")
 
 PROBE_DELAY_MIN, PROBE_DELAY_MAX = _clamp_pair(PROBE_DELAY_MIN, PROBE_DELAY_MAX)
 LINK_DELAY_PUBLIC_MIN, LINK_DELAY_PUBLIC_MAX = _clamp_pair(LINK_DELAY_PUBLIC_MIN, LINK_DELAY_PUBLIC_MAX)
 LINK_DELAY_INVITE_MIN, LINK_DELAY_INVITE_MAX = _clamp_pair(LINK_DELAY_INVITE_MIN, LINK_DELAY_INVITE_MAX)
+INVITE_PEEK_DELAY = max(0.0, INVITE_PEEK_DELAY)
 
 
 def _log_caller(kind: str, url: str = "") -> None:
@@ -118,4 +121,14 @@ async def throttle_between_links(kind: str | None, url: str = "") -> None:
         log.debug("throttle(%s): sleep %.2fs  url=%s", label, delay, url)
     else:
         log.debug("throttle(%s): sleep %.2fs", label, delay)
+    await asyncio.sleep(delay)
+
+
+async def throttle_invite_peek() -> None:
+    """
+    Пауза перед CheckChatInviteRequest (peek). Окремо від ImportChatInviteRequest.
+    """
+    delay = INVITE_PEEK_DELAY
+    _log_caller("invite_peek")
+    log.debug("throttle(invite_peek): sleep %.2fs", delay)
     await asyncio.sleep(delay)
