@@ -26,7 +26,7 @@ log = logging.getLogger("services.posts_watch_result_models")
 DB_PATH = (
     os.environ.get("POSTS_WATCH_RESULT_DB_PATH")
     or os.environ.get("DB_PATH")
-    or "posts_watch_result.sqlite3"
+    or "post_watchdog.sqlite3"
 )
 
 

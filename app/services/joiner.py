@@ -154,6 +154,24 @@ async def ensure_join(client, url: str):
             return "already"
         return st
 
+    def _known_status_by_cid(cid: int | None) -> str | None:
+        """Повертає already/known, якщо канал уже є в базі/мембершипі."""
+        if not cid:
+            return None
+        try:
+            final = _final_from_cache(any_final_for_channel(int(cid)))
+        except Exception:
+            _log_exc("ensure_join: any_final_for_channel known")
+            final = None
+        if final:
+            return final
+        try:
+            if channel_db.find_channel(int(cid)):
+                return "already"
+        except Exception:
+            _log_exc("ensure_join: channel_db.find_channel known")
+        return None
+
     invite_hash = _extract_invite_hash(url)
     is_invite = bool(invite_hash)
     requested_limit = 2
@@ -355,6 +373,8 @@ async def ensure_join(client, url: str):
                             final_peek = _final_from_cache(any_final_for_channel(cid_peek))
                         except Exception:
                             final_peek = None
+                        if not final_peek:
+                            final_peek = _known_status_by_cid(cid_peek)
                         if final_peek:
                             try:
                                 # кешуємо фінальний статус для інвайта (включно з joined/already)
@@ -408,16 +428,29 @@ async def ensure_join(client, url: str):
             title = getattr(ch, "title", "?") if ch else "?"
 
             if invite_hash and cid:
+                try:
+                    map_invite_set(invite_hash, cid, title or None)
+                    log.debug(
+                        "ensure_join(invite): map_invite_set invite=%s cid=%s title=%r (joined)",
+                        invite_hash,
+                        cid,
+                        title,
+                    )
+                except Exception:
+                    _log_exc("ensure_join: map_invite_set joined")
+                known = _known_status_by_cid(cid)
+                if known:
                     try:
-                        map_invite_set(invite_hash, cid, title or None)
-                        log.debug(
-                            "ensure_join(invite): map_invite_set invite=%s cid=%s title=%r (joined)",
-                            invite_hash,
-                            cid,
-                            title,
-                        )
+                        invite_status_put(invite_hash, known)
                     except Exception:
-                        _log_exc("ensure_join: map_invite_set joined")
+                        _log_exc("ensure_join: invite_status_put known joined")
+                    log.info(
+                        "ensure_join(invite): known channel cid=%s status=%s title=%r (no rejoin)",
+                        cid,
+                        known,
+                        title,
+                    )
+                    return known, (title or None), "invite", cid, invite_hash
             log.info("ensure_join(invite): joined invite=%s cid=%s title=%r", invite_hash, cid, title)
             try:
                 if cleaned_url:
@@ -431,7 +464,17 @@ async def ensure_join(client, url: str):
         # тож пропускаємо додаткові public-затримки, щоб не дублювати очікування
         if not is_invite:
             await throttle_public()
-        ent = await client.get_entity(url)
+        try:
+            ent = await client.get_entity(url)
+        except (UsernameNotOccupiedError, ValueError):
+            log.debug("ensure_join(public): username not occupied url=%s", url)
+            return "invalid", None, "public", None, invite_hash
+        except ChannelPrivateError:
+            log.debug("ensure_join(public): channel private url=%s", url)
+            return "private", None, "public", None, invite_hash
+        except Exception:
+            _log_exc("ensure_join: get_entity")
+            return "invalid", None, "public", None, invite_hash
 
         if not is_invite:
             await throttle_public()

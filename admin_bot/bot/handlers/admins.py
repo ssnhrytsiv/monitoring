@@ -59,8 +59,8 @@ def _clean_urls(urls: list[str]) -> list[str]:
 
     cleaned: list[str] = []
     seen: set[str] = set()
-    # Шукаємо t.me інвайти (+hash), bot-юзернейми (_bot/bot) або канал за username.
-    tg_pattern = re.compile(r"^(?:https?://)?t\.me/\+[A-Za-z0-9_-]{8,}$")
+    # Шукаємо t.me інвайти (+hash або joinchat/hash), bot-юзернейми (_bot/bot) або канал за username.
+    invite_pattern = re.compile(r"^(?:https?://)?t\.me/(?:\+|joinchat/)[A-Za-z0-9_-]{5,128}$")
     channel_pattern = re.compile(r"^(?:https?://)?t\.me/[A-Za-z0-9_]{3,}$")
     for u in urls:
         try:
@@ -71,7 +71,7 @@ def _clean_urls(urls: list[str]) -> list[str]:
         # Вирізаємо зайві хвости
         c = re.sub(r"[^\w\-./:?&=#%+]+$", "", c)
         c = c.rstrip(").,;'\"<>[]{}")
-        is_invite = bool(tg_pattern.match(c))
+        is_invite = bool(invite_pattern.match(c))
         bot_username = extract_bot_username(c)
         is_channel_username = bool(channel_pattern.match(c))
         if not is_invite and not bot_username and not is_channel_username:
