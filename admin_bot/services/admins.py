@@ -18,7 +18,7 @@ _ADMIN_SCHEMA_PATCHED = False
 
 def ensure_admin_schema(db: Session) -> None:
     """
-    Додає відсутні колонки для admins (is_new), щоб уникнути помилок select.
+    Додає відсутні колонки для admins (is_new, cpm, price, subscribers), щоб уникнути помилок select.
     """
     global _ADMIN_SCHEMA_PATCHED
     if _ADMIN_SCHEMA_PATCHED:
@@ -27,6 +27,15 @@ def ensure_admin_schema(db: Session) -> None:
         cols = [r[1] for r in db.execute(text("PRAGMA table_info(admins)")).fetchall()]
         if "is_new" not in cols:
             db.execute(text("ALTER TABLE admins ADD COLUMN is_new INTEGER DEFAULT 0"))
+            db.commit()
+        if "cpm" not in cols:
+            db.execute(text("ALTER TABLE admins ADD COLUMN cpm FLOAT"))
+            db.commit()
+        if "price" not in cols:
+            db.execute(text("ALTER TABLE admins ADD COLUMN price FLOAT"))
+            db.commit()
+        if "subscribers" not in cols:
+            db.execute(text("ALTER TABLE admins ADD COLUMN subscribers INTEGER"))
             db.commit()
         _ADMIN_SCHEMA_PATCHED = True
     except Exception:
@@ -168,6 +177,29 @@ def toggle_admin_new(db: Session, admin_id: int) -> Optional[m.Admin]:
         return None
     current = getattr(admin, "is_new", 0) or 0
     admin.is_new = 0 if current else 1
+    db.commit()
+    db.refresh(admin)
+    return admin
+
+
+def update_admin_params(
+    db: Session,
+    admin_id: int,
+    *,
+    cpm: Optional[float] = None,
+    price: Optional[float] = None,
+    subscribers: Optional[int] = None,
+) -> Optional[m.Admin]:
+    ensure_admin_schema(db)
+    admin = db.execute(select(m.Admin).where(m.Admin.id == admin_id)).scalar_one_or_none()
+    if not admin:
+        return None
+    if cpm is not None:
+        admin.cpm = float(cpm)
+    if price is not None:
+        admin.price = float(price)
+    if subscribers is not None:
+        admin.subscribers = int(subscribers)
     db.commit()
     db.refresh(admin)
     return admin

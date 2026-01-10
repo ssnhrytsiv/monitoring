@@ -3,6 +3,7 @@ import os
 import re
 import logging
 import json
+import math
 
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -11,6 +12,7 @@ from aiogram.exceptions import TelegramBadRequest
 
 from app.bot.states import CreateWatch
 from app.services import channel_db
+from app.services import post_watch_db
 from app.sheet_bot.services import gsheets_writer as gsw
 from app.sheet_bot.services import gsheets_buffer as gsb
 from app.bot.keyboards import main_menu_kb, back_to_menu_kb, yes_no_kb
@@ -18,11 +20,18 @@ from app.notificator_bot.db.posts_watch_result_db import create_watch, create_wa
 from app.services.time_utils import msk_now
 from app.bot.services.channels_repo import resolve_cid_by_target, normalize_target_link, get_links_by_channel_ids
 from app.utils.tg_links import sanitize_link
+from admin_bot.services import admins as svc_admins
+from admin_bot.services import networks as svc_networks
+from admin_bot.services.networks import channel_hyperlink
+from admin_bot.db.session import SessionLocal as AdminSession
+from admin_bot.db import models as adm_models
 
 router = Router()
 log = logging.getLogger("bot_create_watch")
 
 _LINK_RE = re.compile(r'(?i)\b((?:https?://|tg://|t\.me/)[^\s<>"\'\]\)]+)')
+_ADMINS_PER_ROW = 2
+_ADMINS_PER_PAGE = 36
 
 
 def _try_int(s: str) -> Optional[int]:
@@ -40,6 +49,130 @@ def _control_chat_id() -> Optional[int]:
         return int(str(raw).strip())
     except Exception:
         return None
+
+
+def _admin_session():
+    db = AdminSession()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def _load_template(template_id: int) -> Optional[dict]:
+    """
+    Завантажує шаблон із SQLite (post_template) і повертає словник із HTML та links_json.
+    """
+    try:
+        tpl = post_watch_db.get_template_by_id(int(template_id))
+        if not tpl:
+            return None
+        _, tpl_html, tpl_mode, tpl_thr, created_at, tpl_title, tpl_links_json = tpl
+        return {
+            "html": tpl_html,
+            "links_json": tpl_links_json,
+            "mode": tpl_mode,
+            "threshold": tpl_thr,
+            "title": tpl_title,
+            "created_at": created_at,
+        }
+    except Exception:
+        log.warning("watch_net: failed to load template id=%s", template_id, exc_info=True)
+        return None
+
+
+def _admins_kb(page: int = 0):
+    db = next(_admin_session())
+    admins = svc_admins.list_admins(db)
+    admins = sorted(admins, key=lambda a: (a.display or a.username or f"{a.id}"))
+    total_pages = max(1, math.ceil(len(admins) / _ADMINS_PER_PAGE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * _ADMINS_PER_PAGE
+    end = start + _ADMINS_PER_PAGE
+    admins_page = admins[start:end]
+    rows = []
+    row = []
+    for a in admins_page:
+        label = a.display or a.username or f"id={a.id}"
+        row.append(InlineKeyboardButton(text=label, callback_data=f"watchnet:admin:{a.id}"))
+        if len(row) == _ADMINS_PER_ROW:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    nav = []
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"watchnet:page:{(page-1)%total_pages}"))
+        nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"watchnet:page:{(page+1)%total_pages}"))
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _networks_kb(admin_id: int):
+    db = next(_admin_session())
+    nets = svc_networks.list_networks_by_admin(db, admin_id)
+    nets = sorted(nets, key=lambda n: (n.name or ""))
+    rows = []
+    row = []
+    for n in nets:
+        row.append(InlineKeyboardButton(text=n.name, callback_data=f"watchnet:net:{admin_id}:{n.id}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="⬅️ Адміни", callback_data="menu:add_watch_net")])
+    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _targets_from_network(net_id: int) -> List[str]:
+    db = next(_admin_session())
+    rows = (
+        db.query(adm_models.Channel)
+        .join(adm_models.NetworkChannel, adm_models.NetworkChannel.channel_id == adm_models.Channel.channel_id)
+        .filter(adm_models.NetworkChannel.network_id == net_id)
+        .order_by(adm_models.Channel.title)
+        .all()
+    )
+    targets: List[str] = []
+    seen = set()
+    for ch in rows:
+        if ch.username:
+            t = f"@{ch.username}"
+        else:
+            t = str(ch.channel_id)
+        if t not in seen:
+            seen.add(t)
+            targets.append(t)
+    return targets
+
+
+def _network_channels_preview(net_id: int) -> tuple[list[str], list[str]]:
+    db = next(_admin_session())
+    rows = (
+        db.query(adm_models.Channel)
+        .join(adm_models.NetworkChannel, adm_models.NetworkChannel.channel_id == adm_models.Channel.channel_id)
+        .filter(adm_models.NetworkChannel.network_id == net_id)
+        .order_by(adm_models.Channel.title)
+        .all()
+    )
+    seen = set()
+    targets: List[str] = []
+    lines: List[str] = []
+    for ch in rows:
+        if ch.username:
+            target = f"@{ch.username}"
+        else:
+            target = str(ch.channel_id)
+        if target in seen:
+            continue
+        seen.add(target)
+        targets.append(target)
+        lines.append(f"• {channel_hyperlink(db, ch)}")
+    return targets, lines
 
 
 def _project_kb(prefix: str):
@@ -255,12 +388,14 @@ async def _create_template_from_source(src: Message) -> Optional[int]:
     text_for_template = (html_text or plain_text or "").strip()
 
     if not text_for_template:
+        log.info("create_template: empty text_for_template (message_id=%s)", getattr(src, "message_id", None))
         return None
 
     try:
         parsed_links = _collect_links_from_aiogram(src, plain_text)
         links_json = json.dumps(parsed_links, ensure_ascii=False) if parsed_links else None
     except Exception:
+        log.warning("create_template: failed to parse links (message_id=%s)", getattr(src, "message_id", None), exc_info=True)
         links_json = None
 
     title = _first_line_title(plain_text or text_for_template)
@@ -273,36 +408,43 @@ async def _create_template_from_source(src: Message) -> Optional[int]:
 
     fn: Optional[Callable[..., Any]] = getattr(pdb, "add_template", None)
     if not fn:
+        log.warning("create_template: add_template not found in post_watch_db")
         return None
 
     try:
         res = fn(text=text_for_template, title=title, mode="exact", links=links_json)
         tid = _parse_template_id(res)
         if tid:
+            log.info("create_template: created template id=%s title=%s", tid, title)
             return tid
     except TypeError:
         try:
             res = fn(text=text_for_template, title=title, links=links_json)
             tid = _parse_template_id(res)
             if tid:
+                log.info("create_template: created template id=%s title=%s (fallback no mode)", tid, title)
                 return tid
         except TypeError:
             try:
                 res = fn(text=text_for_template, title=title)
                 tid = _parse_template_id(res)
                 if tid:
+                    log.info("create_template: created template id=%s title=%s (fallback no links)", tid, title)
                     return tid
             except TypeError:
                 try:
                     res = fn(text_for_template)
                     tid = _parse_template_id(res)
                     if tid:
+                        log.info("create_template: created template id=%s (legacy signature)", tid)
                         return tid
                 except Exception:
+                    log.exception("create_template: add_template failed (legacy)")
                     return None
     except Exception:
+        log.exception("create_template: add_template failed (main)")
         return None
-
+    log.warning("create_template: failed to create template (message_id=%s)", getattr(src, "message_id", None))
     return None
 
 
@@ -491,6 +633,75 @@ async def menu_add_watch(cb: CallbackQuery, state: FSMContext):
     )
 
 
+@router.callback_query(F.data == "menu:add_watch_net")
+async def menu_add_watch_net(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(CreateWatch.admin_pick)
+    log.info("watch_net: start admin pick")
+    await cb.message.edit_text(
+        "Оберіть адміна для вотчу:",
+        reply_markup=_admins_kb(),
+        disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(CreateWatch.admin_pick, F.data.startswith("watchnet:admin:"))
+async def pick_admin_for_watch(cb: CallbackQuery, state: FSMContext):
+    try:
+        admin_id = int(cb.data.split(":", 2)[2])
+    except Exception:
+        await cb.answer()
+        return
+    log.info("watch_net: admin picked id=%s by user=%s", admin_id, cb.from_user.id if cb.from_user else None)
+    await state.update_data(admin_id=admin_id)
+    await state.set_state(CreateWatch.network_pick)
+    await cb.message.edit_text(
+        "Оберіть сітку:",
+        reply_markup=_networks_kb(admin_id),
+        disable_web_page_preview=True,
+    )
+    await cb.answer()
+
+@router.callback_query(CreateWatch.admin_pick, F.data.startswith("watchnet:page:"))
+async def paginate_admins(cb: CallbackQuery):
+    try:
+        page = int(cb.data.split(":", 2)[2])
+    except Exception:
+        await cb.answer()
+        return
+    await cb.message.edit_text(
+        "Оберіть адміна для вотчу:",
+        reply_markup=_admins_kb(page),
+        disable_web_page_preview=True,
+    )
+    log.info("watch_net: admin page=%s", page)
+    await cb.answer()
+
+
+@router.callback_query(CreateWatch.network_pick, F.data.startswith("watchnet:net:"))
+async def pick_network_for_watch(cb: CallbackQuery, state: FSMContext):
+    try:
+        _, _, admin_id, net_id = cb.data.split(":", 3)
+        admin_id = int(admin_id)
+        net_id = int(net_id)
+    except Exception:
+        await cb.answer()
+        return
+    targets, lines = _network_channels_preview(net_id)
+    if not targets:
+        await cb.answer("У сітки немає каналів", show_alert=True)
+        return
+    await state.update_data(admin_id=admin_id, network_id=net_id, targets=targets)
+    await state.set_state(CreateWatch.template_pick)
+    log.info("watch_net: network picked admin=%s net=%s targets=%s", admin_id, net_id, targets)
+    targets_txt = "\n".join(lines)
+    await cb.message.edit_text(
+        f"Знайдено {len(targets)} каналів у сітці.\n\n{targets_txt}\n\nНадішли ID шаблону або пост для шаблону.",
+        reply_markup=back_to_menu_kb(),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    await cb.answer()
+
 
 
 @router.message(CreateWatch.channel_input)
@@ -613,6 +824,8 @@ async def pick_project(cb: CallbackQuery, state: FSMContext):
     mins = int(data["mins"])
     tid = data.get("template_id")
     targets: List[str] = data.get("targets") or []
+    admin_id = data.get("admin_id")
+    net_id = data.get("network_id")
     tw_end = data.get("time_window_end")
     proj_txt = proj
     targets_txt = "\n".join(f"• {t}" for t in targets)
@@ -623,6 +836,8 @@ async def pick_project(cb: CallbackQuery, state: FSMContext):
         f"вікно: {mins} хв\n"
         f"до: {tw_end}\n"
         f"проєкт: {proj_txt}\n"
+        + (f"адмін: {admin_id}\n" if admin_id else "")
+        + (f"сітка: {net_id}\n" if net_id else "")
     )
     await state.set_state(CreateWatch.confirm)
     await cb.message.edit_text(
@@ -645,36 +860,67 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
     tid = data.get("template_id")
     targets: List[str] = data.get("targets") or []
     project = data.get("project")
+    admin_id = data.get("admin_id")
+    net_id = data.get("network_id")
+    log.info(
+        "watch_net: confirm_yes admin=%s net=%s tid=%s mins=%s targets=%s project=%s",
+        admin_id, net_id, tid, mins, targets, project,
+    )
+
+    if not tid:
+        log.warning("watch_net: confirm_yes without template_id, state=%s", await state.get_data())
 
     created: List[str] = []
     failed: List[str] = []
 
+    # Підготуємо нормалізовані посилання для control chat і fallback
+    cids: List[int] = []
+    for t in targets:
+        cid = resolve_cid_by_target(t)
+        if cid:
+            cids.append(cid)
+    links_map = get_links_by_channel_ids(cids)
+    targets_links: List[str] = []
+    for t in targets:
+        cid = resolve_cid_by_target(t)
+        norm = normalize_target_link(t)
+        if norm:
+            targets_links.append(norm)
+    targets_links = _unique_preserve(targets_links)
+    log.info(
+        "watch_net: normalized targets links=%s raw=%s links_map=%s",
+        targets_links, targets, links_map,
+    )
+
     control_id = _control_chat_id()
+    # для сіткового флоу вимикаємо control chat, щоб одразу ставити локально
+    if net_id:
+        control_id = None
 
     sent_ok = False
     if control_id and tid:
-        sent_ok = await _send_watch_from_links_batch_bot(cb.bot, targets, mins, int(tid), project)
+        control_targets = targets_links if targets_links else targets
+        log.info("watch_net: sending to control chat=%s targets=%s", control_id, control_targets)
+        sent_ok = await _send_watch_from_links_batch_bot(cb.bot, control_targets, mins, int(tid), project)
         if sent_ok:
-            created.extend(targets)
+            created.extend(control_targets)
         else:
-            failed.extend(targets)
+            failed.extend(control_targets)
 
     if (not control_id) or (control_id and not sent_ok):
-        cids: List[int] = []
-        for t in targets:
-            cid = resolve_cid_by_target(t)
-            if cid:
-                cids.append(cid)
-        links_map = get_links_by_channel_ids(cids)
-        targets_links: List[str] = []
-        for t in targets:
-            cid = resolve_cid_by_target(t)
-            link = links_map.get(cid) if cid else None
-            norm = normalize_target_link(t, link)
-            if norm:
-                targets_links.append(norm)
-        targets_links = _unique_preserve(targets_links)
-        channels_links_json = json.dumps(targets_links, ensure_ascii=False) if targets_links else None
+        tpl_html = None
+        tpl_links_json = None
+        if tid:
+            tpl_meta = _load_template(int(tid))
+            if not tpl_meta:
+                log.warning("watch_net: template not found id=%s", tid)
+                await cb.message.edit_text(f"Не знайшов шаблон #{tid}. Спробуй надіслати інший шаблон або ID.", reply_markup=main_menu_kb())
+                await state.clear()
+                return
+            tpl_html = tpl_meta.get("html")
+            tpl_links_json = tpl_meta.get("links_json")
+            if not tpl_html:
+                log.warning("watch_net: template id=%s has empty html", tid)
 
         group_id = None
         try:
@@ -683,6 +929,8 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                 title=None,
                 created_by=cb.from_user.id if cb.from_user else None,
                 created_via="bot_fallback",
+                admin_id=admin_id,
+                network_id=net_id,
             )
         except Exception:
             log.warning("create_watch_group (fallback) failed", exc_info=True)
@@ -690,21 +938,23 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
         for t in targets:
             cid = resolve_cid_by_target(t)
             if not cid or not tid:
-                failed.append(t)
+                failed.append(f"{t} (cid not found or no template)")
                 continue
             try:
                 wid = create_watch(
                     channel_id=int(cid),
                     template_id=int(tid),
-                    expected_text_hash=None,
-                    expected_text_norm_len=None,
-                    expected_links_json=channels_links_json,
+                    expected_text_hash=tpl_html,
+                    expected_text_norm_len=len(tpl_html or "") if tpl_html else None,
+                    expected_links_json=tpl_links_json,
                     expected_media_fingerprint=None,
                     time_window_start=data.get("time_window_start"),
                     time_window_end=data.get("time_window_end"),
                     source_url=links_map.get(int(cid)),
                     created_by=None,
                     project=project,
+                    admin_id=admin_id,
+                    network_id=net_id,
                     group_id=group_id,
                 )
                 try:
@@ -724,15 +974,18 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                     wid = create_watch(
                         channel_id=int(cid),
                         template_id=int(tid),
-                        expected_text_hash=None,
-                        expected_text_norm_len=None,
-                        expected_links_json=channels_links_json,
+                        expected_text_hash=tpl_html,
+                        expected_text_norm_len=len(tpl_html or "") if tpl_html else None,
+                        expected_links_json=tpl_links_json,
                         expected_media_fingerprint=None,
                         time_window_start=data.get("time_window_start"),
                         time_window_end=data.get("time_window_end"),
                         source_url=links_map.get(int(cid)),
                         created_by=None,
                         project=project,
+                        admin_id=admin_id,
+                        network_id=net_id,
+                        group_id=group_id,
                     )
                     created.append(f"{t} (fallback wid={wid})")
                 except Exception:

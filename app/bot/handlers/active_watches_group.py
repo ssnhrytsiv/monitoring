@@ -42,6 +42,10 @@ from app.notificator_bot.db.posts_watch_result_db import (
     get_watch_expected_links,
     get_watch_expected_text,
 )
+try:
+    from app.sheet_bot.services import gsheets_buffer as gsb
+except Exception:
+    gsb = None
 from app.services.post_matcher import normalize_text, extract_links_norm
 from app.bot.utils.active_watches_formatters import (
     fmt_tw_end_human,
@@ -553,6 +557,21 @@ async def watch_similar_accept(cb: CallbackQuery):
     if not ok:
         await cb.answer("не вдалось заметчити", show_alert=True)
         return
+    # Після прийняття кандидата — пишемо в таблицю (для всіх accepted з цим hash)
+    if gsb:
+        try:
+            text_hash = cand.get("text_hash") or ""
+            accepted = list_candidates_by_hash(text_hash, status="accepted") if text_hash else []
+            target_wids = {c.get("watch_id") for c in accepted if c.get("watch_id")}
+            if not target_wids and cand.get("watch_id"):
+                target_wids = {cand.get("watch_id")}
+            for wid in target_wids:
+                try:
+                    gsb.record_matched(int(wid))
+                except Exception:
+                    log.exception("watch_similar_accept: gsheets record_matched failed wid=%s", wid)
+        except Exception:
+            log.exception("watch_similar_accept: gsheets sync failed")
     await cb.answer("Готово, поставлено matched")
     back_wid = cand.get("watch_id")
     kb = InlineKeyboardBuilder()

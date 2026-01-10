@@ -46,6 +46,7 @@ _GC_SA = None
 _SH_CACHE: Dict[str, Any] = {}
 _WS_CACHE: Dict[str, Dict[str, Any]] = {}
 _SHEETS_WITH_HEADER: set[Tuple[str, str]] = set()
+_SHARE_ATTEMPTED: set[str] = set()
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 GSHEET_DRIVE_ID = os.getenv("GSHEET_DRIVE_ID")
@@ -233,6 +234,56 @@ def create_spreadsheet(title: str) -> Optional[Dict[str, str]]:
         return None
 
 
+def _share_existing_with_sa(spreadsheet_id: str) -> bool:
+    """
+    Додає сервісний акаунт як writer до існуючої таблиці через OAuth-токен користувача.
+    Викликаємо лише раз на кожний spreadsheet_id, щоб не плодити зайві запити.
+    """
+    if not spreadsheet_id or spreadsheet_id in _SHARE_ATTEMPTED:
+        return False
+    _SHARE_ATTEMPTED.add(spreadsheet_id)
+
+    sa_email = _SA_EMAIL
+    if not sa_email and GSHEET_CREDS_FILE and os.path.exists(GSHEET_CREDS_FILE):
+        try:
+            with open(GSHEET_CREDS_FILE, "r", encoding="utf-8") as f:
+                sa_email = json.load(f).get("client_email")
+        except Exception:
+            sa_email = None
+    if not sa_email:
+        return False
+
+    token_path = os.getenv("GSHEET_OAUTH_TOKEN_FILE", "token.json")
+    if not os.path.exists(token_path) or UserCredentials is None or build is None:
+        return False
+    try:
+        scopes = [
+            "https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/drive.file",
+        ]
+        creds_user = UserCredentials.from_authorized_user_file(token_path, scopes=scopes)
+        if creds_user and creds_user.expired and creds_user.refresh_token and Request is not None:
+            creds_user.refresh(Request())
+            with open(token_path, "w", encoding="utf-8") as f:
+                f.write(creds_user.to_json())
+        drive = build("drive", "v3", credentials=creds_user)
+        drive.permissions().create(
+            fileId=spreadsheet_id,
+            supportsAllDrives=True,
+            body={
+                "type": "user",
+                "role": "writer",
+                "emailAddress": sa_email,
+            },
+            sendNotificationEmail=False,
+        ).execute()
+        log.info("gsheets: auto-shared spreadsheet %s with service account %s", spreadsheet_id, sa_email)
+        return True
+    except Exception as e:
+        _print_err(f"Failed to auto-share spreadsheet {spreadsheet_id} with SA {sa_email}", e)
+        return False
+
+
 def _open_spreadsheet(spreadsheet_id: Optional[str] = None):
     try:
         key = spreadsheet_id or GSHEET_SPREADSHEET_ID
@@ -252,6 +303,11 @@ def _open_spreadsheet(spreadsheet_id: Optional[str] = None):
         _print_err(f"Failed to open spreadsheet by key {spreadsheet_id or GSHEET_SPREADSHEET_ID}", e)
         if spreadsheet_id and spreadsheet_id in _SH_CACHE:
             _SH_CACHE.pop(spreadsheet_id, None)
+        sid = spreadsheet_id or GSHEET_SPREADSHEET_ID
+        # Якщо бракує прав – спробуємо разово розшарити на сервісний акаунт через OAuth і повторити
+        if sid and _share_existing_with_sa(sid):
+            log.info("gsheets: retrying open after auto-share sid=%s", sid)
+            return _open_spreadsheet(spreadsheet_id)
         return None
 
 

@@ -11,6 +11,7 @@ __all__ = [
     "upsert_channel",
     "add_link",
     "find_channel_by_link",
+    "get_network_for_channel",
     "get_channels_by_owner",
     "find_channel",
     "recent_links",
@@ -175,6 +176,31 @@ def _extract_username_from_url(raw_url: str) -> Optional[str]:
     if not cand:
         return None
     return cand
+
+
+def get_network_for_channel(channel_id: int) -> Optional[Tuple[int, Optional[int]]]:
+    """
+    Повертає (network_id, admin_id) для каналу, якщо він прив'язаний до сітки.
+    Якщо запису немає — повертає None.
+    """
+    conn = _ensure_conn()
+    with _lock:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT nc.network_id, n.admin_id
+            FROM network_channels AS nc
+            LEFT JOIN networks AS n ON n.id = nc.network_id
+            WHERE nc.channel_id = ?
+            LIMIT 1
+            """,
+            (int(channel_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        net_id, adm_id = row[0], row[1]
+        return int(net_id) if net_id is not None else None, int(adm_id) if adm_id is not None else None
 
 
 def upsert_channel(

@@ -3,26 +3,36 @@ from __future__ import annotations
 import math
 import logging
 from typing import List, Dict, Any
+from types import SimpleNamespace
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
-from sqlalchemy import select, func
+from sqlalchemy import select, func, exists
 
 from admin_bot.db import models as m
 from admin_bot.db.session import SessionLocal
 from admin_bot.services import admins as svc_admins
 from admin_bot.services import networks as svc_networks
 from admin_bot.bot.keyboards import page_kb
-from admin_bot.bot.states import NetworkFlow
+from admin_bot.bot.states import NetworkFlow, AdminParamsFlow, AdminResultsFlow
 from admin_bot.utils.messages import extract_links_from_message
 from admin_bot.services.networks import channel_hyperlink
 from app.services import account_pool
 from app.services import channel_db
+from app.notificator_bot.db import posts_watch_result_db as pwdb
+from app.notificator_bot.db.posts_watch_result_models import WatchGroup, WatchPost
+from datetime import datetime, timedelta
 from telethon.tl.functions.contacts import BlockRequest
 from telethon.tl.functions.messages import DeleteHistoryRequest
 from admin_bot.bot.keyboards import main_menu_kb
 from app.services import channel_db
+
+PARAM_FIELDS = {
+    "cpm": "CPM",
+    "price": "Базова ціна",
+    "subscribers": "Підписники",
+}
 
 router = Router()
 log = logging.getLogger("admin_bot.bot.admins_menu")
@@ -58,7 +68,7 @@ def _admin_label(a) -> str:
     return (f"{disp} {uname}".strip()) or f"id={a.id}"
 
 
-def _render_admin_view(msg, admin, nets, stats):
+async def _render_admin_view(msg, admin, nets, stats):
     label_new = "<code>[NEW]</code>" if getattr(admin, "is_new", 0) else ""
     bots = channel_db.list_bot_links(owner_display=admin.display, owner_username=admin.username)
     bots_count = len(bots)
@@ -67,14 +77,39 @@ def _render_admin_view(msg, admin, nets, stats):
     total_channels = 0
     if nets:
         db = next(_db())
-        counts = {}
         for n in nets:
             cnt = db.execute(
                 select(func.count(m.NetworkChannel.id)).where(m.NetworkChannel.network_id == n.id)
             ).scalar() or 0
-            counts[n.id] = cnt
             total_channels += cnt
+            # домовлені
+            neg_cpm = getattr(n, "cpm_negotiated", None)
+            neg_price = getattr(n, "price_negotiated", None)
+            # фактичні
+            act_cpm = getattr(n, "actual_cpm", None)
+            act_price = getattr(n, "actual_price", None)
+            act_views = getattr(n, "actual_views", None)
+            # фактична ціна за підписника за 30д: сумарні actual_price груп / суму subscribers груп
+            fact_price_per_sub = None
+            subs_30d = _sum_subscribers_for_network(n.id, days=30)
+            spend_30d = _sum_actual_price_for_network(n.id, days=30)
+            if subs_30d > 0:
+                try:
+                    fact_price_per_sub = spend_30d / float(subs_30d)
+                except Exception:
+                    fact_price_per_sub = None
             net_lines.append(f"• {n.name} ({cnt})")
+            neg_line = f"  Домовлено: CPM {neg_cpm:.0f}" if neg_cpm is not None else "  Домовлено: CPM —"
+            neg_line += f", Ціна {neg_price:.2f}" if neg_price is not None else ", Ціна —"
+            net_lines.append(neg_line)
+            act_line = f"  Факт: CPM {act_cpm:.0f}" if act_cpm is not None else "  Факт: CPM —"
+            act_line += f", Ціна {act_price:.2f}" if act_price is not None else ", Ціна —"
+            act_line += f", Перегляди {act_views}" if act_views is not None else ", Перегляди —"
+            if fact_price_per_sub is not None:
+                act_line += f", Ціна/підп {fact_price_per_sub:.4f}"
+            else:
+                act_line += ", Ціна/підп —"
+            net_lines.append(act_line)
         if len(nets) > 1:
             net_lines.append(f"Сумарно: {total_channels}")
 
@@ -82,7 +117,7 @@ def _render_admin_view(msg, admin, nets, stats):
         f"Адмін: {_admin_label(admin)}{' ' + label_new if label_new else ''}",
         f"Сіток: {len(nets)}",
         f"Боти: {bots_count}",
-        f"Сумарна ціна: {stats['price_sum']:.2f}" if stats["price_sum"] is not None else "Сумарна ціна: —",
+        f"Сумарна ціна: {stats['price_sum']:.2f}" if stats['price_sum'] is not None else "Сумарна ціна: —",
         f"Середні перегляди (сума 30д): {stats['avg_views_30d_sum'] or 0}",
     ]
     if nets:
@@ -102,6 +137,7 @@ def _render_admin_view(msg, admin, nets, stats):
                 InlineKeyboardButton(text="Посмотреть каналы", callback_data=f"admin_net_edit:{admin.id}"),
                 InlineKeyboardButton(text="Посмотреть ботов", callback_data=f"admin_bots:{admin.id}"),
             ],
+            [InlineKeyboardButton(text="Результати", callback_data=f"admin_results:{admin.id}")],
             [InlineKeyboardButton(text="Оновити список каналів", callback_data=f"refresh_channels:{admin.id}")],
             [InlineKeyboardButton(text="Задати параметри", callback_data=f"admin_set_params:{admin.id}")],
             [InlineKeyboardButton(text=toggle_text, callback_data=f"admin_toggle_new:{admin.id}")],
@@ -113,7 +149,14 @@ def _render_admin_view(msg, admin, nets, stats):
         ]
     )
     text = "\n".join([ln for ln in lines if ln.strip()])
-    return msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    try:
+        return await msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message can't be edited" in str(e):
+            return await msg.answer(text, reply_markup=kb, parse_mode="HTML")
+        raise
+    except Exception:
+        return await msg.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
 ADMINS_PER_PAGE = 30
@@ -385,6 +428,434 @@ async def cb_admin_item(cb: CallbackQuery):
     await cb.answer()
 
 
+def _params_kb(admin_id: int, net_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="CPM", callback_data=f"admin_param:{admin_id}:{net_id}:cpm"),
+                InlineKeyboardButton(text="Ціна", callback_data=f"admin_param:{admin_id}:{net_id}:price"),
+                InlineKeyboardButton(text="Підписники", callback_data=f"admin_param:{admin_id}:{net_id}:subscribers"),
+            ],
+            [InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin_id}")],
+            [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
+        ]
+    )
+
+
+def _net_select_kb(admin_id: int, nets: List[m.Network]) -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for n in nets:
+        row.append(InlineKeyboardButton(text=n.name, callback_data=f"admin_param_net:{admin_id}:{n.id}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin_id}")])
+    rows.append([InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _result_groups_for_admin(admin_id: int) -> tuple[list[WatchGroup], list[int]]:
+    """Повертає групи вотчів, прив'язані до адміна (admin_id або його сітки)."""
+    db = next(_db())
+    nets = svc_networks.list_networks_by_admin(db, admin_id)
+    net_ids = [n.id for n in nets]
+    with pwdb.session_scope() as session:
+        q = session.query(WatchGroup).filter(
+            exists().where(
+                (WatchPost.group_id == WatchGroup.id) & (WatchPost.status != "cancelled")
+            )
+        )
+        if net_ids:
+            q = q.filter((WatchGroup.admin_id == admin_id) | (WatchGroup.network_id.in_(net_ids)))
+        else:
+            q = q.filter(WatchGroup.admin_id == admin_id)
+        rows = q.order_by(WatchGroup.id.desc()).all()
+        groups = [
+            SimpleNamespace(
+                id=int(g.id),
+                title=g.title,
+                created_at=g.created_at,
+                actual_cpm=g.actual_cpm,
+                actual_price=g.actual_price,
+                actual_views=g.actual_views,
+                subscribers=g.subscribers,
+            )
+            for g in rows
+        ]
+    return groups, net_ids
+
+
+def _group_label(g: WatchGroup) -> str:
+    if g.title:
+        return g.title
+    if g.created_at:
+        return str(g.created_at).split()[0]
+    return f"ID {g.id}"
+
+
+def _build_results_text(admin, groups: list[WatchGroup]) -> str:
+    lines = [f"Результати для {_admin_label(admin)}:"]
+    if not groups:
+        lines.append("Груп немає.")
+    for g in groups:
+        line = f"• {_group_label(g)} — CPMф: {g.actual_cpm:.0f}" if g.actual_cpm is not None else f"• {_group_label(g)} — CPMф: —"
+        line += f", Цінаф: {g.actual_price:.2f}" if g.actual_price is not None else ", Цінаф: —"
+        line += f", Перегляди: {g.actual_views}" if g.actual_views is not None else ", Перегляди: —"
+        line += f", Підписники: {g.subscribers}" if g.subscribers is not None else ", Підписники: —"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _sum_actual_price_for_network(net_id: int, days: int = 30) -> float:
+    """Сумує actual_price груп для сітки за останні days."""
+    try:
+        cutoff = datetime.now() - timedelta(days=days)
+    except Exception:
+        return 0.0
+    total = 0.0
+    with pwdb.session_scope() as session:
+        q = session.query(WatchGroup.actual_price, WatchGroup.created_at).filter(WatchGroup.network_id == net_id)
+        for price, created_at in q.all():
+            try:
+                if created_at and datetime.fromisoformat(str(created_at)) < cutoff:
+                    continue
+            except Exception:
+                # якщо не парситься дата, беремо все
+                pass
+            try:
+                if price is not None:
+                    total += float(price)
+            except Exception:
+                continue
+    return total
+
+
+def _sum_subscribers_for_network(net_id: int, days: int = 30) -> int:
+    """Сумує subscribers груп для сітки за останні days."""
+    try:
+        cutoff = datetime.now() - timedelta(days=days)
+    except Exception:
+        return 0
+    subs_total = 0
+    with pwdb.session_scope() as session:
+        q = session.query(WatchGroup.subscribers, WatchGroup.created_at).filter(WatchGroup.network_id == net_id)
+        for subs, created_at in q.all():
+            try:
+                if created_at and datetime.fromisoformat(str(created_at)) < cutoff:
+                    continue
+            except Exception:
+                pass
+            try:
+                if subs is not None:
+                    subs_total += int(subs)
+            except Exception:
+                continue
+    return subs_total
+
+
+def _results_kb(admin_id: int, groups: list[WatchGroup]) -> InlineKeyboardMarkup:
+    rows = []
+    for g in groups:
+        rows.append([InlineKeyboardButton(text=_group_label(g), callback_data=f"admin_result_group:{admin_id}:{g.id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin_id}")])
+    rows.append([InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _render_group_detail(admin_id: int, group_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    with pwdb.session_scope() as session:
+        g = session.query(WatchGroup).filter(WatchGroup.id == group_id).one_or_none()
+        posts = (
+            session.query(WatchPost)
+            .filter(WatchPost.group_id == group_id, WatchPost.status != "cancelled")
+            .order_by(WatchPost.id.desc())
+            .all()
+        )
+        if g:
+            g = SimpleNamespace(
+                id=int(g.id),
+                title=g.title,
+                created_at=g.created_at,
+                actual_cpm=g.actual_cpm,
+                actual_price=g.actual_price,
+                actual_views=g.actual_views,
+                subscribers=g.subscribers,
+            )
+        posts = [
+            SimpleNamespace(
+                id=int(p.id),
+                final_views=p.final_views,
+                views_at_post=p.views_at_post,
+                price_at_post=p.price_at_post,
+                cpm_at_post=p.cpm_at_post,
+            )
+            for p in posts
+        ]
+    if not g:
+        return "Групу не знайдено.", InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Результати", callback_data=f"admin_results:{admin_id}")],
+                [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
+            ]
+        )
+    subs = g.subscribers
+    text_lines = [
+        f"Реклама: {_group_label(g)}",
+        f"CPM факт: {g.actual_cpm:.0f}" if g.actual_cpm is not None else "CPM факт: —",
+        f"Ціна факт: {g.actual_price:.2f}" if g.actual_price is not None else "Ціна факт: —",
+        f"Перегляди факт: {g.actual_views}" if g.actual_views is not None else "Перегляди факт: —",
+        f"Підписники: {subs if subs is not None else '—'}",
+        "Пости:",
+    ]
+    if not posts:
+        text_lines.append("• Пости відсутні.")
+    else:
+        for p in posts:
+            views = p.final_views or p.views_at_post or 0
+            price = None
+            if p.price_at_post is not None:
+                price = float(p.price_at_post)
+            elif p.cpm_at_post is not None and views:
+                price = float(p.cpm_at_post) * views / 1000.0
+            cpm = None
+            if price is not None and views > 0:
+                cpm = price * 1000.0 / views
+            elif p.cpm_at_post is not None:
+                cpm = p.cpm_at_post
+            price_per_sub = None
+            if subs:
+                try:
+                    price_per_sub = price / subs if price is not None else None
+                except Exception:
+                    price_per_sub = None
+            line = f"• Post {p.id}: "
+            line += f"CPM {cpm:.0f}" if cpm is not None else "CPM —"
+            line += f", Перегляди {views}"
+            line += f", Ціна {price:.2f}" if price is not None else ", Ціна —"
+            line += f", Ціна/підп {price_per_sub:.4f}" if price_per_sub is not None else ", Ціна/підп —"
+            text_lines.append(line)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Вказати підписників", callback_data=f"admin_group_subs:{admin_id}:{group_id}")],
+            [InlineKeyboardButton(text="⬅️ Результати", callback_data=f"admin_results:{admin_id}")],
+            [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
+        ]
+    )
+    return "\n".join(text_lines), kb
+
+
+@router.callback_query(F.data.startswith("admin_set_params:"))
+async def cb_admin_set_params(cb: CallbackQuery):
+    try:
+        admin_id = int(cb.data.split(":", 1)[1])
+    except Exception:
+        await cb.answer()
+        return
+    db = next(_db())
+    nets = svc_networks.list_networks_by_admin(db, admin_id)
+    if not nets:
+        await cb.answer("У адміна немає сіток", show_alert=True)
+        return
+    if len(nets) == 1:
+        await cb.message.edit_text(
+            f"Сітка: {nets[0].name}. Обери параметр для редагування:",
+            reply_markup=_params_kb(admin_id, nets[0].id),
+        )
+    else:
+        await cb.message.edit_text(
+            "Оберіть сітку для редагування параметрів:",
+            reply_markup=_net_select_kb(admin_id, nets),
+        )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("admin_param_net:"))
+async def cb_admin_param_net(cb: CallbackQuery):
+    try:
+        _, admin_id, net_id = cb.data.split(":", 2)
+        admin_id = int(admin_id)
+    except Exception:
+        await cb.answer()
+        return
+    db = next(_db())
+    nets = svc_networks.list_networks_by_admin(db, admin_id)
+    net = next((n for n in nets if n.id == int(net_id)), None)
+    if not net:
+        await cb.answer("Сітку не знайдено", show_alert=True)
+        return
+    await cb.message.edit_text(
+        f"Сітка: {net.name}. Обери параметр:",
+        reply_markup=_params_kb(admin_id, net.id),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("admin_param:"))
+async def cb_admin_param(cb: CallbackQuery, state: FSMContext):
+    try:
+        _, admin_id, net_id, field = cb.data.split(":", 3)
+        admin_id = int(admin_id)
+        net_id = int(net_id)
+    except Exception:
+        await cb.answer()
+        return
+    if field not in PARAM_FIELDS:
+        await cb.answer()
+        return
+    db = next(_db())
+    net = db.execute(select(m.Network).where(m.Network.id == net_id)).scalar_one_or_none()
+    if not net:
+        await cb.answer("Сітку не знайдено", show_alert=True)
+        return
+    current = getattr(net, field, None)
+    label = PARAM_FIELDS[field]
+    await state.update_data(param_admin_id=admin_id, param_net_id=net_id, param_field=field)
+    await state.set_state(AdminParamsFlow.waiting_value)
+    await cb.message.edit_text(
+        f"Сітка: {net.name}\n{label}: введи значення.\nПоточне: {current if current is not None else '—'}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_set_params:{admin_id}")],
+                [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
+            ]
+        ),
+    )
+    await cb.answer()
+
+
+@router.message(AdminParamsFlow.waiting_value)
+async def on_param_value(m, state: FSMContext):
+    data = await state.get_data()
+    admin_id = data.get("param_admin_id")
+    net_id = data.get("param_net_id")
+    field = data.get("param_field")
+    if not admin_id or not net_id or field not in PARAM_FIELDS:
+        await m.answer("Сесія втрачена, відкрий адміна знову.")
+        await state.clear()
+        return
+    raw = (m.text or "").strip()
+    if not raw:
+        await m.answer("Значення не може бути порожнім. Введи число.")
+        return
+    try:
+        if field == "subscribers":
+            val = int(float(raw))
+        else:
+            val = float(raw)
+    except Exception:
+        await m.answer("Не вдалося розпізнати число, спробуй ще раз.")
+        return
+    db = next(_db())
+    net = svc_networks.update_network_params(
+        db,
+        net_id,
+        cpm=val if field == "cpm" else None,
+        price=val if field == "price" else None,
+        subscribers=val if field == "subscribers" else None,
+    )
+    await state.clear()
+    if not net:
+        await m.answer("Сітку не знайдено.")
+        return
+    nets = svc_networks.list_networks_by_admin(db, admin_id)
+    stats = svc_networks.stats_for_admin(db, admin_id)
+    await m.answer(
+        f"{PARAM_FIELDS[field]} оновлено: {val}",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin_id}")],
+                [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
+            ]
+        ),
+    )
+    # Оновимо картку адміна окремим повідомленням
+    await _render_admin_view(m, svc_admins.get_admin_by_id(db, admin_id), nets, stats)
+
+
+@router.callback_query(F.data.startswith("admin_results:"))
+async def cb_admin_results(cb: CallbackQuery):
+    try:
+        admin_id = int(cb.data.split(":", 1)[1])
+    except Exception:
+        await cb.answer()
+        return
+    db = next(_db())
+    admin = svc_admins.get_admin_by_id(db, admin_id)
+    if not admin:
+        await cb.answer("Адміна не знайдено", show_alert=True)
+        return
+    groups, _ = _result_groups_for_admin(admin_id)
+    text = _build_results_text(admin, groups)
+    kb = _results_kb(admin_id, groups)
+    await _edit_text_safe(cb, text, kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("admin_result_group:"))
+async def cb_admin_result_group(cb: CallbackQuery):
+    try:
+        _, admin_id, gid = cb.data.split(":", 2)
+        admin_id = int(admin_id)
+        gid = int(gid)
+    except Exception:
+        await cb.answer()
+        return
+    text, kb = _render_group_detail(admin_id, gid)
+    await _edit_text_safe(cb, text, kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("admin_group_subs:"))
+async def cb_admin_group_subs(cb: CallbackQuery, state: FSMContext):
+    try:
+        _, admin_id, gid = cb.data.split(":", 2)
+        admin_id = int(admin_id)
+        gid = int(gid)
+    except Exception:
+        await cb.answer()
+        return
+    await state.update_data(result_admin_id=admin_id, result_group_id=gid)
+    await state.set_state(AdminResultsFlow.waiting_group_subs)
+    await cb.message.edit_text(
+        "Введи кількість підписників для цієї реклами.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Результати", callback_data=f"admin_results:{admin_id}")],
+                [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
+            ]
+        ),
+    )
+    await cb.answer()
+
+
+@router.message(AdminResultsFlow.waiting_group_subs)
+async def on_group_subs(m, state: FSMContext):
+    data = await state.get_data()
+    admin_id = data.get("result_admin_id")
+    gid = data.get("result_group_id")
+    if not admin_id or not gid:
+        await m.answer("Сесія втрачена, відкрий адміна знову.")
+        await state.clear()
+        return
+    raw = (m.text or "").strip()
+    try:
+        subs = int(float(raw))
+    except Exception:
+        await m.answer("Не вдалося розпізнати число, спробуй ще раз.")
+        return
+    pwdb.set_watch_group_subscribers(int(gid), subs)
+    await state.clear()
+    text, kb = _render_group_detail(int(admin_id), int(gid))
+    await m.answer(f"Підписників встановлено: {subs}", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Результати", callback_data=f"admin_results:{admin_id}")],
+            [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
+        ]
+    ))
+    await m.answer(text, reply_markup=kb)
 def _net_nav_keyboard(admin_id: int, page: int, total_pages: int):
     nav = page_kb(page, total_pages, prefix="admin_net_page")
     add_net = InlineKeyboardButton(text="Додати сітку", callback_data=f"admin_net_add:{admin_id}")

@@ -6,6 +6,8 @@ class JoinChannels(StatesGroup):
     owner_input = State()
 
 class CreateWatch(StatesGroup):
+    admin_pick = State()
+    network_pick = State()
     channel_input = State()
     template_pick = State()
     time_window = State()

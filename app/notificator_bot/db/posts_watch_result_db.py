@@ -8,6 +8,7 @@ import json
 import hashlib
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timedelta
+import time
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, update, func, case
@@ -16,6 +17,8 @@ from sqlalchemy.exc import IntegrityError
 
 from app.services import channel_db
 from app.services.membership_db import get_any_session_for_channel
+from app.services.channel_db import get_network_for_channel
+from admin_bot.db import models as m
 from app.notificator_bot.db.posts_watch_result_models import (
     Base,
     get_engine,
@@ -194,7 +197,11 @@ def init() -> None:
             created_via TEXT,
             created_at TEXT NOT NULL,
             admin_id INTEGER,
-            network_id INTEGER
+            network_id INTEGER,
+            actual_views INTEGER,
+            actual_price FLOAT,
+            actual_cpm FLOAT,
+            subscribers INTEGER
         )
         """
     )
@@ -240,6 +247,18 @@ def init() -> None:
 
     if not _has_column(_conn, "watch_groups", "network_id"):
         _conn.execute("ALTER TABLE watch_groups ADD COLUMN network_id INTEGER")
+
+    if not _has_column(_conn, "watch_groups", "actual_views"):
+        _conn.execute("ALTER TABLE watch_groups ADD COLUMN actual_views INTEGER")
+
+    if not _has_column(_conn, "watch_groups", "actual_price"):
+        _conn.execute("ALTER TABLE watch_groups ADD COLUMN actual_price FLOAT")
+
+    if not _has_column(_conn, "watch_groups", "actual_cpm"):
+        _conn.execute("ALTER TABLE watch_groups ADD COLUMN actual_cpm FLOAT")
+
+    if not _has_column(_conn, "watch_groups", "subscribers"):
+        _conn.execute("ALTER TABLE watch_groups ADD COLUMN subscribers INTEGER")
 
     _conn.execute(
         """
@@ -316,6 +335,8 @@ def create_watch_group(
     title: Optional[str] = None,
     created_by: Optional[int] = None,
     created_via: Optional[str] = None,
+    admin_id: Optional[int] = None,
+    network_id: Optional[int] = None,
 ) -> int:
     now = _now()
     with session_scope() as session:
@@ -325,13 +346,15 @@ def create_watch_group(
             created_by=created_by,
             created_via=created_via,
             created_at=now,
+            admin_id=admin_id,
+            network_id=network_id,
         )
         session.add(obj)
         session.flush()
         gid = int(obj.id)
     log.debug(
-        "[posts_watch_result_db.create_watch_group] group_id=%s project=%s title=%s created_by=%s via=%s",
-        gid, project, title, created_by, created_via,
+        "[posts_watch_result_db.create_watch_group] group_id=%s project=%s title=%s created_by=%s via=%s admin_id=%s network_id=%s",
+        gid, project, title, created_by, created_via, admin_id, network_id,
     )
     return gid
 
@@ -350,8 +373,27 @@ def create_watch(
     created_by: Optional[int] = None,
     created_via: Optional[str] = None,
     project: Optional[str] = None,
+    admin_id: Optional[int] = None,
+    network_id: Optional[int] = None,
+    posted_at: Optional[str] = None,
+    views_at_post: Optional[int] = None,
+    subs_at_post: Optional[int] = None,
+    cpm_at_post: Optional[float] = None,
+    price_at_post: Optional[float] = None,
 ) -> int:
     now = _now()
+    # Якщо не передали admin/network, спробуємо визначити за каналом через network_channels
+    if admin_id is None or network_id is None:
+        try:
+            net = get_network_for_channel(channel_id)
+            if net:
+                net_id, adm_id = net
+                if network_id is None:
+                    network_id = net_id
+                if admin_id is None:
+                    admin_id = adm_id
+        except Exception:
+            log.debug("create_watch: get_network_for_channel failed", exc_info=True)
     try:
         with session_scope() as session:
             obj = WatchPost(
@@ -371,6 +413,13 @@ def create_watch(
                 created_by=created_by,
                 created_via=created_via,
                 project=project,
+                admin_id=admin_id,
+                network_id=network_id,
+                posted_at=posted_at,
+                views_at_post=views_at_post,
+                subs_at_post=subs_at_post,
+                cpm_at_post=cpm_at_post,
+                price_at_post=price_at_post,
             )
             session.add(obj)
             session.flush()
@@ -912,12 +961,109 @@ def mark_matched(
 def mark_done_views(watch_id: int, final_views: Optional[int]) -> None:
     now = _now()
     with session_scope() as session:
+        wp = session.execute(
+            select(WatchPost.network_id, WatchPost.admin_id, WatchPost.group_id).where(WatchPost.id == watch_id).limit(1)
+        ).first()
         session.execute(
             update(WatchPost)
             .where(WatchPost.id == watch_id, WatchPost.status == "matched")
             .values(final_views=final_views, status="done", updated_at=now)
         )
+        # оновлюємо фактичні метрики сітки, якщо відомий network_id
+        if wp and wp[0]:
+            net_id = int(wp[0])
+            views_sum, spent_sum = session.execute(
+                select(
+                    func.sum(
+                        func.coalesce(WatchPost.final_views, WatchPost.views_at_post, 0)
+                    ),
+                    func.sum(
+                        func.coalesce(
+                            WatchPost.price_at_post,
+                            func.coalesce(
+                                WatchPost.cpm_at_post, 0
+                            )
+                            * func.coalesce(WatchPost.final_views, WatchPost.views_at_post, 0)
+                            / 1000.0,
+                        )
+                    ),
+                ).where(
+                    WatchPost.network_id == net_id,
+                    WatchPost.status == "done",
+                )
+            ).first()
+            try:
+                views_sum = int(views_sum or 0)
+            except Exception:
+                views_sum = 0
+            try:
+                spent_sum = float(spent_sum or 0.0)
+            except Exception:
+                spent_sum = 0.0
+            actual_cpm = None
+            if views_sum > 0:
+                actual_cpm = spent_sum * 1000.0 / float(views_sum)
+            session.execute(
+                update(m.Network)
+                .where(m.Network.id == net_id)
+                .values(
+                    actual_views=views_sum,
+                    actual_price=spent_sum,
+                    actual_cpm=actual_cpm,
+                    updated_at=int(time.time()),
+                )
+            )
+        # оновлюємо фактичні метрики по групі вотчу (реклама)
+        if wp and wp[2]:
+            gid = int(wp[2])
+            g_views, g_spent = session.execute(
+                select(
+                    func.sum(func.coalesce(WatchPost.final_views, WatchPost.views_at_post, 0)),
+                    func.sum(
+                        func.coalesce(
+                            WatchPost.price_at_post,
+                            func.coalesce(WatchPost.cpm_at_post, 0)
+                            * func.coalesce(WatchPost.final_views, WatchPost.views_at_post, 0)
+                            / 1000.0,
+                        )
+                    ),
+                ).where(
+                    WatchPost.group_id == gid,
+                    WatchPost.status == "done",
+                )
+            ).first()
+            try:
+                g_views = int(g_views or 0)
+            except Exception:
+                g_views = 0
+            try:
+                g_spent = float(g_spent or 0.0)
+            except Exception:
+                g_spent = 0.0
+            g_cpm = None
+            if g_views > 0:
+                g_cpm = g_spent * 1000.0 / float(g_views)
+            session.execute(
+                update(WatchGroup)
+                .where(WatchGroup.id == gid)
+                .values(
+                    actual_views=g_views,
+                    actual_price=g_spent,
+                    actual_cpm=g_cpm,
+                )
+            )
     log.info("[posts_watch_result_db.mark_done_views] watch_id=%s final_views=%s status=done", watch_id, final_views)
+
+
+def set_watch_group_subscribers(group_id: int, subscribers: int) -> None:
+    """Задає manual subscribers для групи (реклами)."""
+    with session_scope() as session:
+        session.execute(
+            update(WatchGroup)
+            .where(WatchGroup.id == group_id)
+            .values(subscribers=int(subscribers))
+        )
+    log.info("set_watch_group_subscribers group_id=%s subscribers=%s", group_id, subscribers)
 
 
 def mark_done_deleted(watch_id: int) -> Optional[str]:

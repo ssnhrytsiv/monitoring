@@ -77,6 +77,10 @@ class WatchGroup(Base):
     created_at = Column(Text, nullable=False)
     admin_id = Column(Integer, nullable=True)
     network_id = Column(Integer, nullable=True)
+    actual_views = Column(Integer, nullable=True)
+    actual_price = Column(Float, nullable=True)
+    actual_cpm = Column(Float, nullable=True)
+    subscribers = Column(Integer, nullable=True)
 
 
 class WatchPost(Base):

@@ -5,15 +5,48 @@ import time
 import html
 from typing import List, Optional
 
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 from sqlalchemy.orm import Session
 
 from admin_bot.db import models as m
 from app.utils.tg_links import sanitize_link
 
+_NETWORK_SCHEMA_PATCHED = False
+
+
+def ensure_network_schema(db: Session) -> None:
+    global _NETWORK_SCHEMA_PATCHED
+    if _NETWORK_SCHEMA_PATCHED:
+        return
+    try:
+        cols = [r[1] for r in db.execute(text("PRAGMA table_info(networks)")).fetchall()]
+        if "subscribers" not in cols:
+            db.execute(text("ALTER TABLE networks ADD COLUMN subscribers INTEGER"))
+            db.commit()
+        if "price_negotiated" not in cols:
+            db.execute(text("ALTER TABLE networks ADD COLUMN price_negotiated FLOAT"))
+            db.commit()
+        if "cpm_negotiated" not in cols:
+            db.execute(text("ALTER TABLE networks ADD COLUMN cpm_negotiated FLOAT"))
+            db.commit()
+        if "actual_price" not in cols:
+            db.execute(text("ALTER TABLE networks ADD COLUMN actual_price FLOAT"))
+            db.commit()
+        if "actual_cpm" not in cols:
+            db.execute(text("ALTER TABLE networks ADD COLUMN actual_cpm FLOAT"))
+            db.commit()
+        if "actual_views" not in cols:
+            db.execute(text("ALTER TABLE networks ADD COLUMN actual_views INTEGER"))
+            db.commit()
+        _NETWORK_SCHEMA_PATCHED = True
+    except Exception:
+        db.rollback()
+        _NETWORK_SCHEMA_PATCHED = False
+
 
 def list_networks_by_admin(db: Session, admin_id: int) -> List[m.Network]:
     # гарантуємо наявність базової сітки
+    ensure_network_schema(db)
     ensure_primary_network(db, admin_id)
     return list(
         db.execute(
@@ -23,6 +56,7 @@ def list_networks_by_admin(db: Session, admin_id: int) -> List[m.Network]:
 
 
 def stats_for_admin(db: Session, admin_id: int) -> dict:
+    ensure_network_schema(db)
     q = (
         select(
             func.sum(m.NetworkChannel.price),
@@ -41,6 +75,7 @@ def stats_for_admin(db: Session, admin_id: int) -> dict:
 
 
 def create_network(db: Session, admin_id: int, name: str, description: Optional[str] = None) -> m.Network:
+    ensure_network_schema(db)
     existing = db.execute(
         select(m.Network).where(m.Network.admin_id == admin_id, m.Network.name == name)
     ).scalar_one_or_none()
@@ -97,6 +132,7 @@ def add_channels_to_network(
     - якщо admin_id заданий, канал має бути прив'язаний до цього адміна (admin_channels), інакше не додаємо;
     - якщо move_existing=True: якщо канал уже є в іншій сітці того ж адміна – переносимо в цільову.
     """
+    ensure_network_schema(db)
     net = db.execute(select(m.Network).where(m.Network.id == network_id)).scalar_one_or_none()
     if not net:
         return {"added": 0, "not_found": len(urls), "moved": 0}
@@ -159,6 +195,7 @@ def add_channels_to_network(
 
 
 def networks_with_channels(db: Session, admin_id: int) -> list[dict]:
+    ensure_network_schema(db)
     nets = list_networks_by_admin(db, admin_id)
     results = []
     for n in nets:
@@ -174,6 +211,7 @@ def networks_with_channels(db: Session, admin_id: int) -> list[dict]:
 
 
 def admin_channels_without_network(db: Session, admin_id: int) -> List[m.Channel]:
+    ensure_network_schema(db)
     # канали, прив'язані до адміна, але не мають запису в network_channels
     admin = db.execute(select(m.Admin).where(m.Admin.id == admin_id)).scalar_one_or_none()
     if not admin or not admin.channels:
@@ -235,6 +273,7 @@ def delete_network(db: Session, network_id: int) -> dict:
 
 
 def ensure_primary_network(db: Session, admin_id: int, name: str = "Основные каналы") -> m.Network:
+    ensure_network_schema(db)
     net = db.execute(
         select(m.Network).where(m.Network.admin_id == admin_id, m.Network.name == name)
     ).scalar_one_or_none()
@@ -254,6 +293,7 @@ def ensure_primary_network(db: Session, admin_id: int, name: str = "Основн
 
 def move_orphans_to_primary(db: Session, admin_id: int) -> int:
     """Переносить канали адміна без сіток у сітку 'Основные каналы'. Повертає кількість перенесених."""
+    ensure_network_schema(db)
     primary = ensure_primary_network(db, admin_id)
     orphan = admin_channels_without_network(db, admin_id)
     if not orphan:
@@ -279,6 +319,30 @@ def move_orphans_to_primary(db: Session, admin_id: int) -> int:
         moved += 1
     db.commit()
     return moved
+
+
+def update_network_params(
+    db: Session,
+    net_id: int,
+    *,
+    price: Optional[float] = None,
+    cpm: Optional[float] = None,
+    subscribers: Optional[int] = None,
+) -> Optional[m.Network]:
+    ensure_network_schema(db)
+    net = db.execute(select(m.Network).where(m.Network.id == net_id)).scalar_one_or_none()
+    if not net:
+        return None
+    if price is not None:
+        net.price_negotiated = float(price)
+    if cpm is not None:
+        net.cpm_negotiated = float(cpm)
+    if subscribers is not None:
+        net.subscribers = int(subscribers)
+    net.updated_at = int(time.time())
+    db.commit()
+    db.refresh(net)
+    return net
 
 
 def channel_hyperlink(db: Session, ch: m.Channel) -> str:

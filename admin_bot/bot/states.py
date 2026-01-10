@@ -13,3 +13,11 @@ class NetworkFlow(StatesGroup):
 
 class RefreshChannelsFlow(StatesGroup):
     waiting_links = State()
+
+
+class AdminParamsFlow(StatesGroup):
+    waiting_value = State()
+
+
+class AdminResultsFlow(StatesGroup):
+    waiting_group_subs = State()

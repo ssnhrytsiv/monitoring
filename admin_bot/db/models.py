@@ -141,6 +141,9 @@ class Admin(Base):
     username = Column(String)
     display = Column(String)
     is_new = Column(Integer, default=0)
+    cpm = Column(Float)
+    price = Column(Float)
+    subscribers = Column(Integer)
 
     channels = relationship(
         "AdminChannel",
@@ -170,6 +173,12 @@ class Network(Base):
     description = Column(Text)
     created_at = Column(Integer)
     updated_at = Column(Integer)
+    subscribers = Column(Integer)
+    price_negotiated = Column(Float)
+    cpm_negotiated = Column(Float)
+    actual_price = Column(Float)
+    actual_cpm = Column(Float)
+    actual_views = Column(Integer)
 
 
 class NetworkChannel(Base):

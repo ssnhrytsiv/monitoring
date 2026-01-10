@@ -149,3 +149,34 @@ def list_templates_full(limit: int = 50) -> List[Tuple[int, str, str, float, int
                 r[6],              # links (JSON)
             ))
         return out
+
+
+def get_template_by_id(template_id: int) -> Optional[Tuple[int, str, str, float, int, Optional[str], Optional[str]]]:
+    """
+    Повертає один шаблон за id у тому ж форматі, що й list_templates_full.
+    Якщо шаблон не знайдено – None.
+    """
+    with _conn() as c:
+        has_title = _column_exists(c, "post_template", "title")
+        has_links = _column_exists(c, "post_template", "links")
+
+        cols = "id, text, mode, threshold, created_at"
+        cols += ", title" if has_title else ", NULL as title"
+        cols += ", links" if has_links else ", NULL as links"
+
+        cur = c.execute(
+            f"SELECT {cols} FROM post_template WHERE id = ? LIMIT 1",
+            (int(template_id),)
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return (
+            int(row[0]),         # id
+            row[1],              # text
+            row[2],              # mode
+            float(row[3]),       # threshold
+            int(row[4]),         # created_at
+            row[5],              # title
+            row[6],              # links (JSON)
+        )
