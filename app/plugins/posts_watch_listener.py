@@ -8,35 +8,29 @@ from typing import Callable, Optional, Dict, Any
 from zoneinfo import ZoneInfo
 import re
 from difflib import SequenceMatcher
+import json
+
+from sqlalchemy import update
 
 from telethon import events
 from telethon.tl.types import Message
 
 from app.telethon_client import client as MAIN_CLIENT
 from app.logging_json import get_logger
-from app.notificator_bot.db.posts_watch_result_db import (
-    list_active_channels,
-    get_pending_by_channel,
-    mark_matched,
-    list_due_coverage,
-    mark_done_views,
-    mark_done_deleted,
-    find_matched_by_message,
-    list_due_pending_expire,
-    mark_expired,
-    raw_connection,
-    insert_watch_event,
-    insert_watch_candidate,
-    calc_text_hash,
-)
+from app.DAL import watch_posts_operations as watch_posts_db
+from app.DAL import watch_events_operations as watch_events_db
+from app.DAL import watch_processing_operations as watch_proc_db
+from app.DAL import watch_candidates_operations as watch_candidates_db
 from app.services.html_match import exact_html_equal
 from app.services.account_pool import iter_pool_clients, session_name
 from app.services.post_matcher import normalize_text, extract_links_norm
+from app.admin_bot.db import models as m
+from app.admin_bot.db.session import SessionLocal
 from app import config
 import html as _html_mod
 
 try:
-    from app.services.post_watch_db import list_templates_full
+    from app.DAL.post_templates_operations import list_templates_full
 except Exception:
     list_templates_full = None  # type: ignore
 
@@ -140,27 +134,16 @@ _init_html_renderer()
 
 def _db_get_watch_core(wid: int) -> Optional[Dict[str, Any]]:
     try:
-        conn = raw_connection()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT channel_id, template_id, expected_text_hash, expected_links_json,
-                   time_window_start, time_window_end
-            FROM watch_posts
-            WHERE id = ?
-            """,
-            (wid,),
-        )
-        row = cur.fetchone()
-        if not row:
+        info = watch_posts_db.get_watch_info(wid)
+        if not info:
             return None
         return {
-            "channel_id": int(row[0]),
-            "template_id": int(row[1]) if row[1] is not None else None,
-            "expected_text_hash": row[2],
-            "expected_links_json": row[3],
-            "time_window_start": row[4],
-            "time_window_end": row[5],
+            "channel_id": int(info["channel_id"]),
+            "template_id": int(info["template_id"]) if info.get("template_id") is not None else None,
+            "expected_text_hash": info.get("expected_text_hash"),
+            "expected_links_json": info.get("expected_links_json"),
+            "time_window_start": info.get("time_window_start"),
+            "time_window_end": info.get("time_window_end"),
         }
     except Exception:
         _pylog.exception("_db_get_watch_core failed (wid=%s)", wid)
@@ -322,49 +305,81 @@ async def _views_worker():
             pool_map = {session_name(s.client): s.client for s in slots}
             any_cli = next(iter(pool_map.values()))
 
-            due = list_due_coverage()
+            due = watch_proc_db.list_due_coverage()
             for watch_id, channel_id, msg_id, matched_session in due:
                 cli = pool_map.get(matched_session) if matched_session else None
                 if cli is None:
                     cli = any_cli
+                msg: Message | None = None
                 try:
-                    msg: Message | None = await cli.get_messages(entity=channel_id, ids=msg_id)
+                    msg = await cli.get_messages(entity=channel_id, ids=msg_id)
                 except Exception as e:
                     _pylog.exception("views: get_messages failed (wid=%s cid=%s mid=%s): %s", watch_id, channel_id,
                                      msg_id, e)
-                    # якщо не можемо отримати entity — вважаємо покритим, щоб не зациклитись
+                    # Спроба підвантажити entity через source_url (username/інвайт)
+                    fallback_url: str | None = None
                     try:
-                        mark_done_views(watch_id, 0)
-                        insert_watch_event(
-                            watch_id,
-                            "views",
-                            {
-                                "watch_id": watch_id,
-                                "channel_id": channel_id,
-                                "message_id": msg_id,
-                                "views": 0,
-                                "status": "entity_miss",
-                            },
-                        )
+                        fallback_url = watch_posts_db.get_watch_source_url(watch_id)
                     except Exception:
-                        _pylog.exception("views: mark_done_views failed (wid=%s) after entity miss", watch_id)
-                    msg = None
+                        _pylog.exception("views: get_watch_source_url failed (wid=%s)", watch_id)
+
+                    if fallback_url:
+                        try:
+                            ent = await cli.get_entity(fallback_url)
+                            msg = await cli.get_messages(entity=ent, ids=msg_id)
+                            _pylog.info(
+                                "views: resolved entity via source_url (wid=%s cid=%s url=%s)",
+                                watch_id,
+                                channel_id,
+                                fallback_url,
+                            )
+                        except Exception as e2:
+                            _pylog.exception(
+                                "views: fallback get_messages failed (wid=%s cid=%s url=%s): %s",
+                                watch_id,
+                                channel_id,
+                                fallback_url,
+                                e2,
+                            )
+
+                    # якщо не змогли отримати entity — вважаємо покритим, щоб не зациклитись
+                    if msg is None:
+                        try:
+                            watch_proc_db.mark_done_views(watch_id, 0)
+                            watch_events_db.insert_watch_event(
+                                watch_id,
+                                "views",
+                                json.dumps(
+                                    {
+                                        "watch_id": watch_id,
+                                        "channel_id": channel_id,
+                                        "message_id": msg_id,
+                                        "views": 0,
+                                        "status": "entity_miss",
+                                    }
+                                ),
+                            )
+                        except Exception:
+                            _pylog.exception("views: mark_done_views failed (wid=%s) after entity miss", watch_id)
+                        msg = None
 
                 if msg is None:
                     continue
 
                 views = int(getattr(msg, "views", 0) or 0)
                 try:
-                    mark_done_views(watch_id, views)
-                    insert_watch_event(
+                    watch_proc_db.mark_done_views(watch_id, views)
+                    watch_events_db.insert_watch_event(
                         watch_id,
                         "views",
-                        {
-                            "watch_id": watch_id,
-                            "channel_id": channel_id,
-                            "message_id": msg_id,
-                            "views": views,
-                        },
+                        json.dumps(
+                            {
+                                "watch_id": watch_id,
+                                "channel_id": channel_id,
+                                "message_id": msg_id,
+                                "views": views,
+                            }
+                        ),
                     )
                     log.info("views: wid=%s views=%s -> done", watch_id, views)
                 except Exception:
@@ -389,11 +404,15 @@ async def _pending_expire_worker():
     log.info("posts_watch_listener: pending-expire worker started (tick=%ss)", COVERAGE_POLL_TICK_SEC)
     while True:
         try:
-            due_ids = list_due_pending_expire()
+            due_ids = watch_proc_db.list_due_pending_expire()
             for wid in due_ids:
                 try:
-                    mark_expired(wid)
-                    insert_watch_event(wid, "expired", {"watch_id": wid})
+                    watch_proc_db.mark_expired(wid)
+                    watch_events_db.insert_watch_event(
+                        wid,
+                        "expired",
+                        json.dumps({"watch_id": wid}),
+                    )
                     log.info("expire: wid=%s -> expired", wid)
                 except Exception:
                     _pylog.exception("expire: mark_expired failed (wid=%s)", wid)
@@ -416,19 +435,27 @@ async def _pending_expire_worker():
 def _mark_done_edited_other(wid: int) -> str:
     now_str = _human(datetime.now(MOSCOW_TZ))
     try:
-        conn = raw_connection()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE watch_posts
-            SET status='edited', updated_at=?
-            WHERE id=? AND status IN ('matched','done','edited')
-            """,
-            (now_str, int(wid)),
-        )
-        conn.commit()
+        db = SessionLocal()
+        try:
+            db.execute(
+                update(m.WatchPost)
+                .where(
+                    m.WatchPost.id == int(wid),
+                    m.WatchPost.status.in_(["matched", "done", "edited"]),
+                )
+                .values(status="edited", updated_at=now_str)
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
     except Exception:
         _pylog.exception("mark edited-other failed (wid=%s)", wid)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
     return now_str
 
 
@@ -461,7 +488,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
         #_pylog.info("listen: NEW_MESSAGE cid=%s mid=%s session=%s", cid, mid, tag)
 
         try:
-            pending = get_pending_by_channel(cid)
+            pending = watch_proc_db.get_pending_by_channel(cid)
         except Exception:
             _pylog.exception("listen: get_pending_by_channel failed (cid=%s)", cid)
             return
@@ -488,6 +515,8 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 continue
             msg_html_norm = msg_html
             expected_html_norm = expected_html
+            ratio = 0.0
+            ratio_text = 0.0
 
             try:
                 # РОЗШИРЕНА нормалізація:
@@ -499,6 +528,15 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             except Exception:
                 _pylog.exception("listen: exact_html_equal failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                 ok = False
+            log.debug(
+                "similar_check: wid=%s cid=%s mid=%s ok=%s ratio=%.3f ratio_text=%.3f",
+                wid,
+                cid,
+                mid,
+                ok,
+                ratio,
+                ratio_text,
+            )
 
             if not ok:
                 # Фаззі-перевірка схожості (якщо дуже схоже, додаємо в кандидати)
@@ -529,16 +567,32 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                             pass
                     cand_links = _collect_links_from_html(msg_html_norm)
 
+                    links_mismatch = False
                     if exp_links and cand_links and sorted(exp_links) != sorted(cand_links):
+                        links_mismatch = True
+                    elif not exp_links and cand_links:
+                        # якщо очікуваних лінків немає, а у фактичному повідомленні вони є — теж вважаємо mismatch
+                        links_mismatch = True
+                    log.debug(
+                        "links_compare: wid=%s cid=%s mid=%s exp=%d msg=%d mismatch=%s",
+                        wid,
+                        cid,
+                        mid,
+                        len(exp_links),
+                        len(cand_links),
+                        links_mismatch,
+                    )
+
+                    if links_mismatch:
                         try:
-                            insert_watch_candidate(
+                            watch_proc_db.insert_watch_candidate(
                                 watch_id=wid,
                                 channel_id=cid,
                                 message_id=mid,
                                 similarity=ratio,
                                 message_text=msg_html,
+                                text_hash="",
                                 ttl_days=1.0,
-                                expires_at=row.get("time_window_end"),
                                 status="foreign",
                             )
                             log.info("similar: wid=%s cid=%s mid=%s ratio=%.3f -> foreign (links mismatch)", wid, cid, mid, ratio)
@@ -547,55 +601,55 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                         continue
 
                     text_hash_input = msg_plain or msg_html_norm
-                    text_hash = calc_text_hash(text_hash_input)
+                    text_hash = watch_proc_db.calc_text_hash(text_hash_input)
                     key = (wid, text_hash)
                     now_m = _now_monotonic()
                     last_seen = _GLOBAL_CANDIDATE_SEEN.get(key)
                     if last_seen is None or (now_m - last_seen) >= CANDIDATE_SEEN_TTL:
                         _GLOBAL_CANDIDATE_SEEN[key] = now_m
                         try:
-                            insert_watch_candidate(
+                            watch_proc_db.insert_watch_candidate(
                                 watch_id=wid,
                                 channel_id=cid,
                                 message_id=mid,
                                 similarity=ratio,
                                 message_text=msg_html,
+                                text_hash=text_hash,
                                 ttl_days=1.0,
-                                expires_at=row.get("time_window_end"),
                             )
                             log.info("similar: wid=%s cid=%s mid=%s ratio=%.3f -> candidate", wid, cid, mid, ratio)
                         except Exception:
                             _pylog.exception("similar: insert_watch_candidate failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                 continue
 
+            # exact match пройшов — фіксуємо matched
             coverage_at = _calc_coverage_at()
             matched_session = tag
+            matched_ok = True
             try:
-                mark_matched(wid, mid, coverage_at, matched_session=matched_session)
-                insert_watch_event(
+                watch_proc_db.mark_matched(wid, mid, coverage_at, matched_session=matched_session)
+                watch_events_db.insert_watch_event(
                     wid,
                     "matched",
-                    {
-                        "watch_id": wid,
-                        "channel_id": cid,
-                        "message_id": mid,
-                        "session": matched_session,
-                    },
+                    json.dumps(
+                        {
+                            "watch_id": wid,
+                            "channel_id": cid,
+                            "message_id": mid,
+                            "session": matched_session,
+                        }
+                    ),
                 )
-                matched_any = True
-                #log.info("listen: MATCH wid=%s cid=%s mid=%s session=%s", wid, cid, mid, matched_session)
             except Exception:
-                #_pylog.exception("listen: mark_matched failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
-                continue
+                matched_ok = False
 
-            if SHEETS_OK and gsheets_buffer:
-                try:
-                    gsheets_buffer.record_matched(wid)
-                except Exception:
-                    _pylog.exception("gsheets_buffer.record_matched failed (wid=%s)", wid)
-
-        if not matched_any:
-            return
+            if matched_ok:
+                matched_any = True
+                if SHEETS_OK and gsheets_buffer:
+                    try:
+                        gsheets_buffer.record_matched(wid)
+                    except Exception:
+                        _pylog.exception("gsheets_buffer.record_matched failed (wid=%s)", wid)
 
     @cli.on(events.MessageEdited())
     async def _on_edited(ev: events.MessageEdited.Event):
@@ -618,7 +672,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             return
 
         try:
-            wids = find_matched_by_message(cid, mid)
+            wids = watch_proc_db.find_matched_by_message(cid, mid)
         except Exception:
             _pylog.exception("edited: find_matched_by_message failed (cid=%s mid=%s)", cid, mid)
             return
@@ -653,15 +707,17 @@ def _attach_listener_for_client(tag: str, cli) -> None:
 
             now_str = _mark_done_edited_other(int(wid))
             try:
-                insert_watch_event(
+                watch_events_db.insert_watch_event(
                     int(wid),
                     "edited_other",
-                    {
-                        "watch_id": int(wid),
-                        "channel_id": cid,
-                        "message_id": mid,
-                        "edited_at": now_str,
-                    },
+                    json.dumps(
+                        {
+                            "watch_id": int(wid),
+                            "channel_id": cid,
+                            "message_id": mid,
+                            "edited_at": now_str,
+                        }
+                    ),
                 )
             except Exception:
                 pass
@@ -700,7 +756,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
 
         for mid in (ev.deleted_ids or []):
             try:
-                wids = find_matched_by_message(cid, int(mid))
+                wids = watch_proc_db.find_matched_by_message(cid, int(mid))
             except Exception:
                 _pylog.exception("deleted: DB lookup failed (cid=%s mid=%s)", cid, mid)
                 continue
@@ -717,7 +773,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 _GLOBAL_DELETED_SEEN[wid] = now_m
 
                 try:
-                    prev_status = mark_done_deleted(wid)
+                    prev_status = watch_proc_db.mark_done_deleted(wid)
                 except Exception:
                     _pylog.exception("deleted: mark_done_deleted failed (wid=%s)", wid)
                     continue
@@ -728,14 +784,16 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                     continue
 
                 try:
-                    insert_watch_event(
+                    watch_events_db.insert_watch_event(
                         wid,
                         "deleted",
-                        {
-                            "watch_id": wid,
-                            "channel_id": cid,
-                            "message_id": int(mid),
-                        },
+                        json.dumps(
+                            {
+                                "watch_id": wid,
+                                "channel_id": cid,
+                                "message_id": int(mid),
+                            }
+                        ),
                     )
                     log.info("deleted: wid=%s cid=%s mid=%s -> deleted", wid, cid, mid)
                 except Exception:
@@ -752,7 +810,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
 
 
 def setup(client=None, control_peer=None, monitor_buffer=None, **_):
-    active_channels = set(list_active_channels())
+    active_channels = set(watch_proc_db.list_active_channels())
     log.info("posts_watch_listener: active_channels=%s", len(active_channels))
 
     if SHEETS_OK and gsheets_buffer:

@@ -11,20 +11,22 @@ from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
 
 from app.bot.states import CreateWatch
-from app.services import channel_db
-from app.services import post_watch_db
+from app.DAL import SessionLocal
+from app.DAL import sheet_projects_operations as spo
+from app.DAL import post_templates_operations as post_watch_db
+from app.DAL import watch_posts_operations as watch_posts_db
+from app.DAL import watch_events_operations as watch_events_db
 from app.sheet_bot.services import gsheets_writer as gsw
 from app.sheet_bot.services import gsheets_buffer as gsb
 from app.bot.keyboards import main_menu_kb, back_to_menu_kb, yes_no_kb
-from app.notificator_bot.db.posts_watch_result_db import create_watch, create_watch_group, insert_watch_event
 from app.services.time_utils import msk_now
 from app.bot.services.channels_repo import resolve_cid_by_target, normalize_target_link, get_links_by_channel_ids
-from app.utils.tg_links import sanitize_link
-from admin_bot.services import admins as svc_admins
-from admin_bot.services import networks as svc_networks
-from admin_bot.services.networks import channel_hyperlink
-from admin_bot.db.session import SessionLocal as AdminSession
-from admin_bot.db import models as adm_models
+from app.utils.link_parser import sanitize_link
+from app.admin_bot.services import admins as svc_admins
+from app.admin_bot.services import networks as svc_networks
+from app.admin_bot.services.networks import channel_hyperlink
+from app.admin_bot.db.session import SessionLocal as AdminSession
+from app.admin_bot.db import models as adm_models
 
 router = Router()
 log = logging.getLogger("bot_create_watch")
@@ -401,14 +403,14 @@ async def _create_template_from_source(src: Message) -> Optional[int]:
     title = _first_line_title(plain_text or text_for_template)
 
     try:
-        from app.services import post_watch_db as pdb
+        from app.DAL import post_templates_operations as pdb
     except Exception as e:
         log.exception(f"create_template import failed: {e}")
         return None
 
     fn: Optional[Callable[..., Any]] = getattr(pdb, "add_template", None)
     if not fn:
-        log.warning("create_template: add_template not found in post_watch_db")
+        log.warning("create_template: add_template not found in post_templates_operations")
         return None
 
     try:
@@ -524,7 +526,19 @@ async def sheet_create_project(cb: CallbackQuery, state: FSMContext):
     proj = cb.data.split("sheet:create_proj:", 1)[1]
     title = _sheet_title(proj)
     # Якщо вже є активна таблиця з цим самим місяцем/назвою — просто показуємо її
-    existing = channel_db.get_active_sheet(proj)
+    db = SessionLocal()
+    try:
+        existing = None
+        rec = spo.get_active_sheet(db, proj)
+        if rec:
+            existing = {
+                "project": rec.project,
+                "spreadsheet_id": rec.active_spreadsheet_id,
+                "title": rec.active_title,
+                "updated_at": rec.updated_at,
+            }
+    finally:
+        db.close()
     if existing and (existing.get("title") == title):
         ssid = existing.get("spreadsheet_id")
         url = f"https://docs.google.com/spreadsheets/d/{ssid}"
@@ -540,7 +554,11 @@ async def sheet_create_project(cb: CallbackQuery, state: FSMContext):
         if not res or not res.get("spreadsheet_id"):
             raise RuntimeError("create_spreadsheet returned no id")
         ssid = res["spreadsheet_id"]
-        channel_db.set_active_sheet(proj, ssid, title)
+        db = SessionLocal()
+        try:
+            spo.set_active_sheet(db, proj, ssid, title)
+        finally:
+            db.close()
         url = f"https://docs.google.com/spreadsheets/d/{ssid}"
         await cb.message.edit_text(
             f"Таблиця створена і встановлена як активна для {proj}:\n{title}\n{url}",
@@ -557,7 +575,11 @@ async def sheet_create_project(cb: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "sheet:archive")
 async def sheet_archive(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    projects = channel_db.list_sheet_projects()
+    db = SessionLocal()
+    try:
+        projects = sorted(set(spo.list_projects(db) or []))
+    finally:
+        db.close()
     if not projects:
         await cb.message.edit_text(
             "Архів порожній.",
@@ -578,7 +600,11 @@ async def sheet_archive(cb: CallbackQuery, state: FSMContext):
 async def sheet_archive_project(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     proj = cb.data.split("sheet:archive_proj:", 1)[1]
-    rows = channel_db.list_archived_sheets(project=proj)
+    db = SessionLocal()
+    try:
+        rows = spo.list_archives(db, project=proj)
+    finally:
+        db.close()
     if not rows:
         txt = f"Архів порожній для проєкту {proj}."
         kb = InlineKeyboardMarkup(
@@ -924,7 +950,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
 
         group_id = None
         try:
-            group_id = create_watch_group(
+            group_id = watch_posts_db.create_watch_group(
                 project=project,
                 title=None,
                 created_by=cb.from_user.id if cb.from_user else None,
@@ -941,7 +967,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                 failed.append(f"{t} (cid not found or no template)")
                 continue
             try:
-                wid = create_watch(
+                wid = watch_posts_db.create_watch(
                     channel_id=int(cid),
                     template_id=int(tid),
                     expected_text_hash=tpl_html,
@@ -958,38 +984,32 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                     group_id=group_id,
                 )
                 try:
-                    insert_watch_event(wid, "created", {"via": "bot_fallback"})
+                    watch_events_db.insert_watch_event(
+                        wid,
+                        "created",
+                        json.dumps({"via": "bot_fallback"}),
+                    )
                 except Exception:
                     pass
                 if project:
                     try:
-                        sheet = channel_db.get_active_sheet(project)
-                        if sheet and sheet.get("spreadsheet_id"):
-                            log.info("watch %s bound to project %s sheet=%s", wid, project, sheet.get("spreadsheet_id"))
+                        db = SessionLocal()
+                        try:
+                            sheet = spo.get_active_sheet(db, project)
+                        finally:
+                            db.close()
+                        if sheet and getattr(sheet, "active_spreadsheet_id", None):
+                            log.info(
+                                "watch %s bound to project %s sheet=%s",
+                                wid,
+                                project,
+                                getattr(sheet, "active_spreadsheet_id", None),
+                            )
                     except Exception:
                         log.exception("bind watch to project failed")
                 created.append(f"{t} (fallback wid={wid})")
             except TypeError:
-                try:
-                    wid = create_watch(
-                        channel_id=int(cid),
-                        template_id=int(tid),
-                        expected_text_hash=tpl_html,
-                        expected_text_norm_len=len(tpl_html or "") if tpl_html else None,
-                        expected_links_json=tpl_links_json,
-                        expected_media_fingerprint=None,
-                        time_window_start=data.get("time_window_start"),
-                        time_window_end=data.get("time_window_end"),
-                        source_url=links_map.get(int(cid)),
-                        created_by=None,
-                        project=project,
-                        admin_id=admin_id,
-                        network_id=net_id,
-                        group_id=group_id,
-                    )
-                    created.append(f"{t} (fallback wid={wid})")
-                except Exception:
-                    failed.append(t)
+                failed.append(t)
             except Exception:
                 failed.append(t)
 

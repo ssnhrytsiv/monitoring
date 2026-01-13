@@ -12,7 +12,7 @@ from aiogram.exceptions import TelegramBadRequest
 from app.bot.states import JoinChannels
 from app.bot.keyboards import main_menu_kb, back_to_menu_kb
 from app.bot.processing_guard import is_processing, set_processing
-from app.utils.tg_links import sanitize_link
+from app.utils.link_parser import sanitize_link
 
 router = Router()
 log = logging.getLogger("bot_join_channels")

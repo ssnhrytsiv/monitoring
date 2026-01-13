@@ -1,6 +1,7 @@
 from __future__ import annotations
 import re
 from typing import Iterable, List, Optional, Union
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 try:
     # Імпортимо типи тільки якщо є telethon (щоб утиліта жила і без нього)
@@ -72,6 +73,123 @@ def normalize(url: str) -> str:
         return f"https://{url}"
 
     return url
+
+
+def sanitize_link(u: str) -> str:
+    """
+    Нормалізує/«лікує» URL:
+      - виправляє типові опечатки у схемі: tps://, htps://, https//, http//
+      - tg://resolve?domain=foo  ->  https://t.me/foo
+      - @username                ->  https://t.me/username
+      - t.me/... без схеми       ->  https://t.me/...
+      - прибирає «подвійну схему»: https://https://t.me/...
+      - для t.me завжди ставить HTTPS
+    Повертає стабільний рядок. Якщо не вдалось розпарсити — повертає виправлене «як є».
+    """
+    s = (u or "").strip()
+    if not s:
+        return s
+
+    low = s.lower()
+
+    # 1) tg://resolve?domain=foo -> https://t.me/foo
+    if low.startswith("tg://resolve?domain="):
+        name = s.split("=", 1)[-1].split("&", 1)[0].lstrip("@").strip()
+        if name:
+            s = f"https://t.me/{name}"
+            low = s.lower()
+
+    # 2) @username -> https://t.me/username
+    if s.startswith("@"):
+        s = f"https://t.me/{s[1:].strip()}"
+        low = s.lower()
+
+    # 3) Найчастіші опечатки/усічення схеми на початку
+    fixes = (
+        ("https//", "https://"),
+        ("http//", "http://"),
+        ("tps://", "https://"),
+        ("htps://", "https://"),
+        ("ttps://", "https://"),
+        ("ps://", "https://"),
+        ("s://", "https://"),
+    )
+    for bad, good in fixes:
+        if s.startswith(bad):
+            s = good + s[len(bad):]
+            low = s.lower()
+            break
+
+    # 4) t.me/... без схеми -> https://t.me/...
+    if low.startswith("t.me/"):
+        s = "https://" + s
+        low = s.lower()
+
+    # 5) Прибрати «подвійну схему»: https://https://t.me/...
+    m = re.match(r"^([a-zA-Z][a-zA-Z0-9+\-.]*://)(.+)$", s)
+    if m:
+        scheme = m.group(1)
+        rest = re.sub(r"^[a-zA-Z][a-zA-Z0-9+\-.]*://", "", m.group(2))
+        s = scheme + rest
+        low = s.lower()
+
+    # 6) Розбір URL та фінальне доведення до ладу
+    try:
+        p = urlsplit(s)
+    except Exception:
+        return s  # як є, якщо дуже криво
+
+    if not p.scheme:
+        s = "https://" + s.lstrip("/")
+        p = urlsplit(s)
+
+    if not p.netloc and p.path.startswith("t.me/"):
+        s = "https://" + p.path
+        p = urlsplit(s)
+
+    if p.netloc.lower() == "t.me" and p.scheme != "https":
+        p = SplitResult("https", p.netloc, p.path, p.query, p.fragment)
+
+    return urlunsplit(p)
+
+
+def extract_bot_username(u: str) -> str | None:
+    """
+    Витягує username бота, якщо посилання/рядок веде на бот (закінчується на bot/_bot).
+    Повертає None, якщо не схоже на бота.
+    """
+    s = (u or "").strip()
+    if not s:
+        return None
+
+    try:
+        norm = sanitize_link(s)
+    except Exception:
+        norm = s
+
+    if norm.startswith("@"):
+        username = norm.lstrip("@")
+    else:
+        try:
+            p = urlsplit(norm)
+        except Exception:
+            p = None
+        if p and p.netloc.lower() in ("t.me", "telegram.me", "telegram.dog"):
+            username = p.path.lstrip("/").split("?", 1)[0]
+        else:
+            username = None
+
+    if not username:
+        return None
+
+    username = username.strip().strip(".,;:)]}>\"'")
+    if not username:
+        return None
+
+    low = username.lower()
+    if low.endswith("bot") or low.endswith("_bot"):
+        return username
+    return None
 
 
 def is_invite(url: str) -> bool:

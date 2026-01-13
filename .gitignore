@@ -64,7 +64,6 @@ Thumbs.db
 /post_watchdog.sqlite3-wal
 /db_dump/db_schema_dump.zip
 /tg_monitor_clean.zip
-/app/services/feature_seed.zip
 /imports.txt
 /posts_watch_result.sqlite3-shm
 /app_deps.txt
@@ -72,6 +71,5 @@ Thumbs.db
 /Oops.rej.orig
 /posts_watch_result.sqlite3-wal
 /app/flows/batch_links/process_links.py.orig
-/seed_feature.zip
 /tg_monitor_release_clean_fixed_makefile.zip
 /post_watchdog.sqlite3.bak

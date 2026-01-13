@@ -9,7 +9,7 @@ from aiogram.exceptions import TelegramBadRequest
 from app.bot.keyboards import main_menu_kb
 from app.bot.services.templates_repo import load_templates_map
 from app.bot.services.channels_repo import get_owners_by_channel_ids
-from app.bot.services.watches_repo import list_active_watches, group_active
+from app.DAL.watch_posts_operations import list_active_watches, group_active
 
 router = Router()
 log = logging.getLogger("bot_active_watches.menu")
@@ -46,7 +46,7 @@ def _short_title(title: Any, tid: int | None) -> str:
 
 def _fmt_tw_end(s: str | None) -> str:
     """
-    Форматування часу вікна, який уже приходить з watches_repo/group_active
+    Форматування часу вікна, який уже приходить з watch_posts_operations/group_active
     у вигляді рядка 'YYYY-MM-DD HH:MM:SS' або None.
     Тут можемо виводити скорочено (дата+час) або як є.
     """

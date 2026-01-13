@@ -40,14 +40,11 @@
 │   │   ├── channel_facts.py
 │   │   ├── channel_maps.py
 │   │   ├── db
-│   │   ├── feature
-│   │   ├── feature_seed.zip
 │   │   ├── gsheets.py
 │   │   ├── gsheets_buffer.py
 │   │   ├── gsheets_writer.py
 │   │   ├── html_match.py
 │   │   ├── html_render.py
-│   │   ├── join_scheduler.py
 │   │   ├── joiner.py
 │   │   ├── link_queue.py
 │   │   ├── membership_db.py
@@ -67,11 +64,7 @@
 │   └── utils
 │       ├── __init__.py
 │       ├── __pycache__
-│       ├── formatting.py
 │       ├── link_parser.py
-│       ├── notices.py
-│       ├── text_norm.py
-│       ├── tg_links.py
 │       └── throttle.py
 ├── app_deps.txt
 ├── apply_anchored_patch.py
@@ -116,8 +109,6 @@
 ├── safe_apply_patch.py
 ├── scripts
 │   └── generate-project-map.sh
-├── seed_channels.sqlite3
-├── seed_feature.zip
 ├── service_account.json
 ├── tg_monitor_clean.zip
 ├── tg_monitor_release_clean_fixed_makefile.zip

@@ -6,10 +6,13 @@ from typing import Dict, List, Tuple, Any, Optional
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from app.notificator_bot.db.posts_watch_result_db import raw_connection
-from app.services import channel_db
-from app.utils.tg_links import extract_bot_username
+from app.utils.link_parser import extract_bot_username
 from app.sheet_bot.services import gsheets_writer as gw
+from app.DAL import SessionLocal
+from app.DAL import bot_links_operations as blo
+from app.DAL import sheet_projects_operations as spo
+from app.DAL import watch_posts_operations as watch_posts_db
+from app.DAL import channels_operations as channels_db
 import logging
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -84,50 +87,24 @@ def _mk_key(sheet: str, ssid: Optional[str]) -> Tuple[str, str]:
 
 
 def _db_get_watch_core(wid: int):
-    try:
-        conn = raw_connection()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT channel_id, template_id, expected_links_json,
-                   time_window_start, matched_at, deleted_at,
-                   source_url,
-                   project
-            FROM watch_posts
-            WHERE id = ?
-            """,
-            (wid,),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        return {
-            "channel_id": int(row[0]),
-            "template_id": int(row[1]) if row[1] is not None else None,
-            "expected_links_json": row[2],
-            "time_window_start": row[3],
-            "matched_at": row[4],
-            "deleted_at": row[5],
-            "source_url": row[6] if row[6] else None,
-            "project": row[7] if len(row) > 7 else None,
-        }
-    except Exception:
+    info = watch_posts_db.get_watch_info(int(wid))
+    if not info:
         return None
+    return {
+        "channel_id": int(info.get("channel_id") or 0),
+        "template_id": int(info.get("template_id")) if info.get("template_id") is not None else None,
+        "expected_links_json": info.get("expected_links_json"),
+        "time_window_start": info.get("time_window_start"),
+        "matched_at": info.get("matched_at"),
+        "deleted_at": info.get("deleted_at"),
+        "source_url": info.get("source_url") or None,
+        "project": info.get("project"),
+    }
 
 
 def _db_get_channel_title_and_owner(channel_id: int):
     try:
-        conn = raw_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT title, owner_display FROM channels WHERE channel_id = ? LIMIT 1",
-            (int(channel_id),),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None, None
-        title, owner_display = row[0], row[1]
-        return (str(title) if title else None, str(owner_display) if owner_display else None)
+        return channels_db.get_channel_title_and_owner(int(channel_id))
     except Exception:
         return None, None
 
@@ -142,11 +119,15 @@ def _resolve_title_and_owner(channel_id: int, source_url: str | None):
 
     username = extract_bot_username(source_url or "")
     if username:
-        bot = channel_db.get_bot_link_by_username(username)
-        if bot:
-            title = bot.get("title") or username
-            owner = bot.get("owner_display") or bot.get("owner_username")
-            return title, owner
+        db = SessionLocal()
+        try:
+            bot = blo.get_bot_link_by_username(db, username)
+            if bot:
+                title = bot.get("title") or username
+                owner = bot.get("owner_display") or bot.get("owner_username")
+                return title, owner
+        finally:
+            db.close()
     return ch_title, owner_display
 
 
@@ -192,10 +173,11 @@ def _select_sheet_for_watch(wc: dict) -> Tuple[Optional[str], Optional[str]]:
     ssid_override = None
     project = wc.get("project")
     if project:
+        db = SessionLocal()
         try:
-            proj_info = channel_db.get_active_sheet(project)
-            if proj_info and proj_info.get("spreadsheet_id"):
-                ssid_override = proj_info["spreadsheet_id"]
+            rec = spo.get_active_sheet(db, project)
+            if rec and rec.active_spreadsheet_id:
+                ssid_override = rec.active_spreadsheet_id
                 log.info(
                     "sheet_select: project=%s -> spreadsheet=%s",
                     project,
@@ -203,6 +185,8 @@ def _select_sheet_for_watch(wc: dict) -> Tuple[Optional[str], Optional[str]]:
                 )
         except Exception:
             ssid_override = None
+        finally:
+            db.close()
     return sheet_title_override, ssid_override
 
 

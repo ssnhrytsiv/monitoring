@@ -7,7 +7,7 @@
 - `handlers/active_watches_menu.py`
 - `handlers/active_watches_group.py`
 - `services/active_watches_service.py`
-- `services/watches_repo.py`
+- `DAL/watch_posts_operations.py`
 - `services/channels_repo.py`
 - `services/templates_repo.py`
 - `utils/active_watches_formatters.py`

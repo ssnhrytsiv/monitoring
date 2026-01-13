@@ -22,10 +22,9 @@ from telethon import TelegramClient, types
 from sqlalchemy import delete, select
 
 from app.config import API_HASH, API_ID
-from app.services import channel_db
 from app.services.account_pool import iter_pool_clients, session_name, start_pool, stop_pool
-from admin_bot.db.session import SessionLocal
-from admin_bot.db import models as m
+from app.admin_bot.db.session import SessionLocal
+from app.admin_bot.db import models as m
 
 DEFAULT_SESSIONS = [
     "tg_session.session",
@@ -35,9 +34,11 @@ DEFAULT_SESSIONS = [
 
 
 def _known_channel_ids() -> Set[int]:
-    conn = channel_db.raw_connection()
-    cur = conn.execute("SELECT channel_id FROM channels WHERE channel_id IS NOT NULL")
-    return {int(r[0]) for r in cur.fetchall() if r and r[0] is not None}
+    db = SessionLocal()
+    try:
+        return {int(cid) for cid, in db.query(m.Channel.id).filter(m.Channel.id.isnot(None)).all()}
+    finally:
+        db.close()
 
 
 async def _collect_session_channels(client) -> Set[int]:
@@ -111,12 +112,15 @@ def _report(known: Set[int], per_session: Dict[str, Set[int]]) -> None:
     if not missing:
         return
 
-    conn = channel_db.raw_connection()
-    placeholders = ",".join("?" for _ in missing)
-    rows = conn.execute(
-        f"SELECT channel_id, title, owner_display, owner_username FROM channels WHERE channel_id IN ({placeholders})",
-        tuple(missing),
-    ).fetchall()
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(m.Channel.id, m.Channel.title, m.Channel.owner_display, m.Channel.owner_username)
+            .filter(m.Channel.id.in_(missing))
+            .all()
+        )
+    finally:
+        db.close()
     print("Details (cid, title, owner):")
     for cid, title, od, ou in rows:
         owner = od or (f"@{ou}" if ou else "—")
@@ -179,7 +183,6 @@ def _purge_channels(missing_ids: List[int]) -> None:
 
 
 async def main():
-    channel_db.init()
     known = _known_channel_ids()
 
     target_sessions: List[str] = []

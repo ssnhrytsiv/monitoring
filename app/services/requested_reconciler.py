@@ -8,17 +8,20 @@ import random
 from enum import Enum
 from collections import defaultdict, deque
 from typing import List, Optional, Tuple, Any
+from contextlib import contextmanager
 
 from telethon import errors
 from telethon.tl import types
 from telethon.tl.functions.messages import CheckChatInviteRequest
 from telethon.tl.functions.channels import GetParticipantRequest
 
-from app.services import requested_reconciler_db as rdb
-from app.services import membership_db
+from app.DAL import requested_operations as rdb
 from app.services import link_queue
 from app.services.account_pool import iter_pool_clients, session_name
-from app.services import channel_db  # NEW: for sticky owner from invite
+from app.DAL import SessionLocal
+from app.DAL import channels_operations as cho
+from app.DAL import invite_owners_operations as ioo
+from app.DAL.membership_operations import MembershipDAO
 
 log = logging.getLogger("services.requested_reconciler")
 
@@ -57,6 +60,43 @@ FLOOD_MAX_WAIT_SEC = int(os.getenv("REQUESTED_RECONCILER_FLOOD_MAX_WAIT", "3600"
 FAIR_INVITES_FETCH = os.getenv("REQUESTED_RECONCILER_FAIR_INVITES_FETCH", "1") not in ("0", "false", "False")
 # Діагностика rate-limiter'ів
 RL_DEBUG = os.getenv("REQUESTED_RECONCILER_RL_DEBUG", "0").lower() not in ("0", "false", "")
+
+
+def _db_session():
+    return SessionLocal()
+
+
+@contextmanager
+def _membership_db():
+    db = SessionLocal()
+    try:
+        yield MembershipDAO(db)
+    finally:
+        db.close()
+
+
+def _get_invite_owner(invite_hash: str):
+    db = _db_session()
+    try:
+        return ioo.get_invite_owner(db, invite_hash)
+    finally:
+        db.close()
+
+
+def _find_channel(cid: int):
+    db = _db_session()
+    try:
+        return cho.find_channel(db, cid)
+    finally:
+        db.close()
+
+
+def _upsert_channel(cid: int, username, title, owner_display, owner_username, last_status):
+    db = _db_session()
+    try:
+        cho.upsert_channel(db, cid, username, title, owner_display, owner_username, last_status)
+    finally:
+        db.close()
 
 
 class InviteCheckStatus(Enum):
@@ -383,27 +423,21 @@ async def run_requested_reconciler() -> None:
                         cid = int(ch_obj.id)
                         title = getattr(ch_obj, "title", None)
                         try:
-                            membership_db.map_invite_set(invite_hash, cid, title)
-                        except Exception:
-                            pass
-                        try:
-                            membership_db.upsert_membership(sess, cid, "already")
-                        except Exception:
-                            pass
-                        # Знімаємо статус "requested" для інвайта, якщо він уже видимий
-                        try:
-                            membership_db.invite_status_put(invite_hash, "already")
+                            with _membership_db() as membership_db:
+                                membership_db.map_invite_set(invite_hash, cid, title)
+                                membership_db.upsert_membership(sess, cid, "already")
+                                membership_db.invite_status_put(invite_hash, "already")
                         except Exception:
                             pass
 
                         # NEW: sticky owner from invite -> channel if channel has no owner yet
                         try:
-                            inv_row = channel_db.get_invite_owner(str(invite_hash))
+                            inv_row = _get_invite_owner(str(invite_hash))
                         except Exception:
                             inv_row = None
                         if inv_row:
                             try:
-                                ch_row = channel_db.find_channel(cid)
+                                ch_row = _find_channel(cid)
                             except Exception:
                                 ch_row = None
                             ex_disp = (ch_row or {}).get("owner_display") if ch_row else None
@@ -413,7 +447,7 @@ async def run_requested_reconciler() -> None:
                                 ou = inv_row.get("owner_username")
                                 if od or ou:
                                     try:
-                                        channel_db.upsert_channel(cid, None, title, od, ou, "already")
+                                        _upsert_channel(cid, None, title, od, ou, "already")
                                         log.debug("[reconciler.invites] set owner from invite (cid=%s invite=%s owner=%s/%s)",
                                                   cid, invite_hash, od, ou)
                                     except Exception as e:
@@ -442,84 +476,85 @@ async def run_requested_reconciler() -> None:
                     req_by_sess[row.session].append(row)
 
             for sess, rows in req_by_sess.items():
-                client = _client_by_session(sess)
-                if client is None:
-                    log.warning("[reconciler.requested] no client for session=%s; skipping batch", sess)
-                    try:
-                        rdb.bulk_defer_session_requested(sess, time.time() + 300)
-                    except Exception:
-                        pass
-                    continue
-
-                if _in_flood_cooldown(sess):
-                    log.debug("[reconciler.requested] session=%s in FLOOD cooldown; skip %d requested rows",
-                              sess, len(rows))
-                    continue
-
-                for row in rows:
-                    cid = row.channel_id
-                    st = membership_db.get_membership(sess, cid)
-                    if st in ("joined", "already", "invalid", "private", "blocked", "too_many"):
-                        rdb.clear(sess, cid)
-                        log.debug("[reconciler.requested] finalized via membership(%s,%s)=%s -> cleared", sess, cid, st)
-                        await asyncio.sleep(_sleep_delay(INTER_DELAY_REQ))
+                with _membership_db() as membership_db:
+                    client = _client_by_session(sess)
+                    if client is None:
+                        log.warning("[reconciler.requested] no client for session=%s; skipping batch", sess)
+                        try:
+                            rdb.bulk_defer_session_requested(sess, time.time() + 300)
+                        except Exception:
+                            pass
                         continue
 
-                    mstat = await _is_member(client, cid)
+                    if _in_flood_cooldown(sess):
+                        log.debug("[reconciler.requested] session=%s in FLOOD cooldown; skip %d requested rows",
+                                  sess, len(rows))
+                        continue
 
-                    if mstat is MemberStatus.MEMBER:
-                        try:
-                            membership_db.upsert_membership(sess, cid, "already")
-                        except Exception:
-                            pass
-                        try:
-                            membership_db.invite_status_put_for_channel(cid, "already")
-                        except Exception:
-                            pass
-                        rdb.clear(sess, cid)
-                        log.debug("[reconciler.requested] accepted -> already (sess=%s, cid=%s) -> cleared", sess, cid)
+                    for row in rows:
+                        cid = row.channel_id
+                        st = membership_db.get_membership(sess, cid)
+                        if st in ("joined", "already", "invalid", "private", "blocked", "too_many"):
+                            rdb.clear(sess, cid)
+                            log.debug("[reconciler.requested] finalized via membership(%s,%s)=%s -> cleared", sess, cid, st)
+                            await asyncio.sleep(_sleep_delay(INTER_DELAY_REQ))
+                            continue
 
-                    elif mstat is MemberStatus.NOT_MEMBER:
-                        rdb.backoff_miss(sess, cid)
-                        log.debug("[reconciler.requested] pending; backoff sess=%s cid=%s", sess, cid)
+                        mstat = await _is_member(client, cid)
 
-                    elif mstat is MemberStatus.TRANSIENT:
-                        if not _in_flood_cooldown(sess):
+                        if mstat is MemberStatus.MEMBER:
+                            try:
+                                membership_db.upsert_membership(sess, cid, "already")
+                            except Exception:
+                                pass
+                            try:
+                                membership_db.invite_status_put_for_channel(cid, "already")
+                            except Exception:
+                                pass
+                            rdb.clear(sess, cid)
+                            log.debug("[reconciler.requested] accepted -> already (sess=%s, cid=%s) -> cleared", sess, cid)
+
+                        elif mstat is MemberStatus.NOT_MEMBER:
                             rdb.backoff_miss(sess, cid)
-                            log.debug("[reconciler.requested] transient(backoff); sess=%s cid=%s", sess, cid)
+                            log.debug("[reconciler.requested] pending; backoff sess=%s cid=%s", sess, cid)
+
+                        elif mstat is MemberStatus.TRANSIENT:
+                            if not _in_flood_cooldown(sess):
+                                rdb.backoff_miss(sess, cid)
+                                log.debug("[reconciler.requested] transient(backoff); sess=%s cid=%s", sess, cid)
+                            else:
+                                log.debug("[reconciler.requested] transient(cooldown); skip backoff sess=%s cid=%s",
+                                          sess, cid)
+
+                        elif mstat is MemberStatus.PRIVATE:
+                            try:
+                                membership_db.upsert_membership(sess, cid, "private")
+                            except Exception:
+                                pass
+                            rdb.clear(sess, cid)
+                            log.debug("[reconciler.requested] terminal -> private; cleared (sess=%s, cid=%s)", sess, cid)
+
+                        elif mstat is MemberStatus.BLOCKED:
+                            try:
+                                membership_db.upsert_membership(sess, cid, "blocked")
+                            except Exception:
+                                pass
+                            rdb.clear(sess, cid)
+                            log.debug("[reconciler.requested] terminal -> blocked; cleared (sess=%s, cid=%s)", sess, cid)
+
+                        elif mstat is MemberStatus.TOO_MANY:
+                            try:
+                                membership_db.upsert_membership(sess, cid, "too_many")
+                            except Exception:
+                                pass
+                            rdb.clear(sess, cid)
+                            log.debug("[reconciler.requested] terminal -> too_many; cleared (sess=%s, cid=%s)", sess, cid)
+
                         else:
-                            log.debug("[reconciler.requested] transient(cooldown); skip backoff sess=%s cid=%s",
-                                      sess, cid)
+                            rdb.backoff_miss(sess, cid)
+                            log.debug("[reconciler.requested] unknown/missed; backoff sess=%s cid=%s", sess, cid)
 
-                    elif mstat is MemberStatus.PRIVATE:
-                        try:
-                            membership_db.upsert_membership(sess, cid, "private")
-                        except Exception:
-                            pass
-                        rdb.clear(sess, cid)
-                        log.debug("[reconciler.requested] terminal -> private; cleared (sess=%s, cid=%s)", sess, cid)
-
-                    elif mstat is MemberStatus.BLOCKED:
-                        try:
-                            membership_db.upsert_membership(sess, cid, "blocked")
-                        except Exception:
-                            pass
-                        rdb.clear(sess, cid)
-                        log.debug("[reconciler.requested] terminal -> blocked; cleared (sess=%s, cid=%s)", sess, cid)
-
-                    elif mstat is MemberStatus.TOO_MANY:
-                        try:
-                            membership_db.upsert_membership(sess, cid, "too_many")
-                        except Exception:
-                            pass
-                        rdb.clear(sess, cid)
-                        log.debug("[reconciler.requested] terminal -> too_many; cleared (sess=%s, cid=%s)", sess, cid)
-
-                    else:
-                        rdb.backoff_miss(sess, cid)
-                        log.debug("[reconciler.requested] unknown/missed; backoff sess=%s cid=%s", sess, cid)
-
-                    await asyncio.sleep(_sleep_delay(INTER_DELAY_REQ))
+                        await asyncio.sleep(_sleep_delay(INTER_DELAY_REQ))
 
             await asyncio.sleep(TICK_SEC)
 

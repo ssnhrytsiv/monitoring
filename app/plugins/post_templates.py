@@ -7,7 +7,7 @@ from telethon import events
 from telethon.tl import types as ttypes
 from telethon.utils import add_surrogate, del_surrogate
 
-from app.services.post_watch_db import init as pt_init, add_template, list_templates
+from app.DAL.post_templates_operations import add_template, list_templates
 
 log = logging.getLogger("plugin.post_templates")
 
@@ -270,7 +270,6 @@ def setup(client, control_peer=None, **kwargs):
     global _CONTROL_PEER_ID
     _CONTROL_PEER_ID = control_peer
 
-    pt_init()
     log.info("post_templates: setup(control_peer=%s)", control_peer)
 
     @client.on(events.NewMessage(pattern=r'^/add_post_template(?:\s+(.*))?$'))

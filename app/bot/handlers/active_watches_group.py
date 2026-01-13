@@ -32,7 +32,7 @@ from app.bot.services.edit_watch_service import (
     update_watch_time_window,
     manual_match_watch_from_message,
 )
-from app.notificator_bot.db.posts_watch_result_db import (
+from app.DAL.watch_candidates_operations import (
     list_watch_candidates,
     list_group_watch_candidates,
     list_candidates_by_hash,

@@ -4,21 +4,17 @@ import asyncio
 import time
 import os
 
+from dotenv import load_dotenv
+
+# Load env before importing modules that read os.getenv at import time
+load_dotenv()
+
 from app.telethon_client import client, load_plugins
 from app.services.account_pool import start_pool, stop_pool
 from app.logging_json import configure_logging, get_logger
-from app.services.post_watch_db import init as postwatch_init
-from app.services import channel_db
-from app.services import channel_maps
 from app.services.requested_reconciler import run_requested_reconciler
-from app.services import requested_reconciler_db as reqdb
 from app.services.models import init_db as orm_init_db
 from app.services.owner_conflict_guard import init as owner_guard_init
-from app.notificator_bot.db.posts_watch_result_db import init as posts_result_init
-from dotenv import load_dotenv
-
-load_dotenv()
-
 
 from app.services.googlesheets.channels_export_service import (
     start_channels_exporter,
@@ -26,8 +22,8 @@ from app.services.googlesheets.channels_export_service import (
 )
 
 from app.bot.run import run_bot
-from admin_bot.run import run_admin_bot
-from admin_bot.config import ADMIN_BOT_TOKEN
+from app.admin_bot.run import run_admin_bot
+from app.admin_bot.config import ADMIN_BOT_TOKEN
 from scripts.forward_bot import start_forward_bot
 from app.notificator_bot.run import start_notificator_bot
 
@@ -61,11 +57,6 @@ async def _main():
     log.info("Ініціалізую БД…")
     t0 = time.perf_counter()
     try:
-        postwatch_init()
-        posts_result_init()
-        channel_db.init()
-        await channel_maps.init()
-        reqdb.init()
         orm_init_db()
         owner_guard_init()
         log.debug("DB init complete")
@@ -132,9 +123,6 @@ async def _main():
     log.info("Завантажую плагіни…")
     t0 = time.perf_counter()
     try:
-        from app.settings import MONITOR_LINKS_V2
-        if MONITOR_LINKS_V2:
-            import app.plugins.monitor_links
         await load_plugins()
         log.debug("Plugins loaded")
     except Exception:

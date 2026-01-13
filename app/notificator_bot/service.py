@@ -12,16 +12,17 @@ from aiogram.exceptions import TelegramAPIError
 
 from app.notificator_bot import formatter
 from app.notificator_bot.config import NOTIFIER_TARGET_IDS
-from app.notificator_bot.db import db_session
 from app.notificator_bot.models import NotifierMessage
-from app.services import channel_db
-from app.notificator_bot.db.posts_watch_result_db import (
-    fetch_watches_by_group,
+from app.DAL import SessionLocal
+from app.DAL import channels_operations as cho
+from app.DAL import bot_links_operations as blo
+from app.DAL import admins_operations as ao
+from app.DAL.watch_events_operations import (
     fetch_unsent_events,
     mark_event_sent,
-    raw_connection,
 )
-from app.utils.tg_links import extract_bot_username
+from app.DAL import watch_posts_operations as watch_posts_db
+from app.utils.link_parser import extract_bot_username
 
 log = logging.getLogger("notificator.service")
 
@@ -43,33 +44,32 @@ def _safe_payload(payload_json: str) -> dict:
         return {}
 
 
-def _get_watch_info(conn, watch_id: int) -> dict:
-    cur = conn.execute(
-        """
-        SELECT channel_id, project, matched_session, created_by, created_via,
-               source_url, status, matched_at, deleted_at, updated_at, group_id, final_views
-        FROM watch_posts
-        WHERE id=? LIMIT 1
-        """,
-        (watch_id,),
-    )
-    row = cur.fetchone()
+def _fetch_channel(channel_id: int) -> dict | None:
+    db = SessionLocal()
+    try:
+        return cho.find_channel(db, channel_id)
+    except Exception:
+        return None
+    finally:
+        db.close()
+
+
+def _admin_label(admin_id: int | None) -> str | None:
+    if admin_id is None:
+        return None
+    row = ao.get_admin_label(None, admin_id)
     if not row:
-        return {}
-    return {
-        "channel_id": row[0],
-        "project": row[1],
-        "matched_session": row[2],
-        "created_by": row[3],
-        "created_via": row[4],
-        "source_url": row[5],
-        "status": row[6],
-        "matched_at": row[7],
-        "deleted_at": row[8],
-        "updated_at": row[9],
-        "group_id": row[10],
-        "final_views": row[11],
-    }
+        return str(admin_id)
+    display, username = row
+    if display:
+        return str(display)
+    if username:
+        return str(username)
+    return str(admin_id)
+
+
+def _get_watch_info(watch_id: int) -> dict:
+    return watch_posts_db.get_watch_info(watch_id)
 
 
 def _channel_meta(channel_id: int, fallback_url: str | None) -> Tuple[str, str]:
@@ -79,10 +79,13 @@ def _channel_meta(channel_id: int, fallback_url: str | None) -> Tuple[str, str]:
     title = f"cid={channel_id}"
     link = fallback_url or ""
     # 1) спробуємо звичайний канал
+    db = SessionLocal()
     try:
-        info = channel_db.find_channel(channel_id)
+        info = cho.find_channel(db, channel_id)
     except Exception:
         info = None
+    finally:
+        db.close()
     if info:
         if info.get("title"):
             title = info["title"]
@@ -94,10 +97,13 @@ def _channel_meta(channel_id: int, fallback_url: str | None) -> Tuple[str, str]:
     if (not info or not info.get("title")) and fallback_url:
         bot_username = extract_bot_username(fallback_url)
         if bot_username:
+            db = SessionLocal()
             try:
-                bot_row = channel_db.get_bot_link_by_username(bot_username)
+                bot_row = blo.get_bot_link_by_username(db, bot_username)
             except Exception:
                 bot_row = None
+            finally:
+                db.close()
             if bot_row:
                 if bot_row.get("title"):
                     title = bot_row["title"]
@@ -118,6 +124,11 @@ def _channel_meta(channel_id: int, fallback_url: str | None) -> Tuple[str, str]:
 
 
 def _admin_name(channel_info: dict | None, watch_info: dict) -> str:
+    admin_id = watch_info.get("admin_id")
+    label = _admin_label(admin_id) if admin_id is not None else None
+    if label:
+        return label
+
     if channel_info:
         if channel_info.get("owner_display"):
             return channel_info["owner_display"]
@@ -127,10 +138,13 @@ def _admin_name(channel_info: dict | None, watch_info: dict) -> str:
     # Якщо це бот – пробуємо взяти owner з bot_links
     bot_username = extract_bot_username(watch_info.get("source_url") or "")
     if bot_username:
+        db = SessionLocal()
         try:
-            bot_row = channel_db.get_bot_link_by_username(bot_username)
+            bot_row = blo.get_bot_link_by_username(db, bot_username)
         except Exception:
             bot_row = None
+        finally:
+            db.close()
         if bot_row:
             if bot_row.get("owner_display"):
                 return bot_row["owner_display"]
@@ -227,7 +241,6 @@ def collect_grouped_events(
         log.debug("notificator: no unsent events")
         return {}, []
 
-    conn = raw_connection()
     grouped: Dict[Tuple[str, str, int], Dict[int, dict]] = {}
     processed_ids: List[int] = []
     pending_groups: Dict[Tuple[str, str, int], set] = {}
@@ -235,7 +248,7 @@ def collect_grouped_events(
     for ev_id, watch_id, ev_type, payload_json, created_at in events:
         if exclude_ids and ev_id in exclude_ids:
             continue
-        watch_info = _get_watch_info(conn, watch_id)
+        watch_info = _get_watch_info(watch_id)
         project = watch_info.get("project") or "UNKNOWN"
         channel_id = watch_info.get("channel_id")
         if not channel_id:
@@ -243,7 +256,7 @@ def collect_grouped_events(
             continue
 
         payload = _safe_payload(payload_json)
-        chan_info = channel_db.find_channel(channel_id)
+        chan_info = _fetch_channel(channel_id)
         title, link = _channel_meta(channel_id, watch_info.get("source_url") or payload.get("source_url"))
         admin = _admin_name(chan_info, watch_info)
         gid = watch_info.get("group_id") or 0
@@ -278,7 +291,7 @@ def collect_grouped_events(
         project, admin, _ = key
         for gid in gids:
             try:
-                rows = fetch_watches_by_group(gid)
+                rows = watch_posts_db.fetch_watches_by_group(gid)
             except Exception as e:
                 log.error("notificator: fetch_watches_by_group failed gid=%s: %s", gid, e)
                 continue
@@ -301,7 +314,7 @@ def collect_grouped_events(
                     # done після переглядів показуємо як “Отстоял просмотры”
                     "done": "views",
                 }.get(status, "pending")
-                chan_info = channel_db.find_channel(chan_id)
+                chan_info = _fetch_channel(chan_id)
                 title, link = _channel_meta(chan_id, row.get("source_url"))
                 views_val = None
                 if ev_type == "views":
@@ -340,9 +353,10 @@ def collect_grouped_events(
 
 
 def _get_prev_message(chat_id: int, project: str, admin: str, group_id: int) -> int | None:
-    with db_session() as session:
+    db = SessionLocal()
+    try:
         row = (
-            session.query(NotifierMessage.message_id)
+            db.query(NotifierMessage.message_id)
             .filter(
                 NotifierMessage.chat_id == chat_id,
                 NotifierMessage.project == project,
@@ -352,13 +366,16 @@ def _get_prev_message(chat_id: int, project: str, admin: str, group_id: int) -> 
             .one_or_none()
         )
         return row[0] if row else None
+    finally:
+        db.close()
 
 
 def _upsert_message(chat_id: int, project: str, admin: str, group_id: int, message_id: int) -> None:
     now_ts = int(time.time())
-    with db_session() as session:
+    db = SessionLocal()
+    try:
         obj = (
-            session.query(NotifierMessage)
+            db.query(NotifierMessage)
             .filter(
                 NotifierMessage.chat_id == chat_id,
                 NotifierMessage.project == project,
@@ -379,7 +396,13 @@ def _upsert_message(chat_id: int, project: str, admin: str, group_id: int, messa
                 message_id=message_id,
                 updated_at=now_ts,
             )
-            session.add(obj)
+            db.add(obj)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 async def send_notifications(bot: Bot, debounce_sec: int = 60) -> None:

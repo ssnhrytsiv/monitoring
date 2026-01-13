@@ -2,25 +2,38 @@
 from typing import Dict, Any, Optional
 import logging
 
+from app.DAL.post_templates_operations import list_templates_full
+
 log = logging.getLogger("templates_repo")
 
+
 def load_templates_map() -> Dict[int, Dict[str, Any]]:
+    """
+    Повертає dict {template_id: {"title": str|None, "links_json": str|None}}.
+    Використовує DAL list_templates_full і не звертається до полів через індекси.
+    """
     try:
-        from app.services import post_watch_db as pdb
-        fn = getattr(pdb, "list_templates_full", None)
-        if not fn:
-            return {}
-        rows = fn()
-        mp: Dict[int, Dict[str, Any]] = {}
-        for r in rows:
-            try:
-                tid = int(r[0])
-                title = r[5] if len(r) > 5 else None
-                links_json = r[6] if len(r) > 6 else None
-                mp[tid] = {"title": title, "links_json": links_json}
-            except Exception:
-                continue
-        return mp
+        rows = list_templates_full()
     except Exception as e:
-        log.exception(f"load_templates_map failed: {e}")
+        log.exception("load_templates_map failed: %s", e)
         return {}
+
+    templates: Dict[int, Dict[str, Any]] = {}
+    for row in rows:
+        try:
+            (
+                template_id,
+                _text,
+                _mode,
+                _threshold,
+                _created_at,
+                title,
+                links_json,
+            ) = row
+            templates[int(template_id)] = {
+                "title": title,
+                "links_json": links_json,
+            }
+        except Exception:
+            continue
+    return templates

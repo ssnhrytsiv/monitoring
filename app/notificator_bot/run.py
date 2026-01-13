@@ -9,7 +9,7 @@ from aiogram.client.default import DefaultBotProperties
 from app.notificator_bot.config import NOTIFIER_BOT_TOKEN, NOTIFIER_POLL_INTERVAL_SEC, NOTIFIER_TARGET_IDS
 from app.notificator_bot.service import send_notifications
 from app.notificator_bot.models import ensure_tables
-from app.notificator_bot.db import posts_watch_result_db
+
 
 log = logging.getLogger("notificator.run")
 
@@ -30,13 +30,6 @@ async def start_notificator_bot():
         return
 
     log.info("Notifier config: targets=%s interval=%s", NOTIFIER_TARGET_IDS, NOTIFIER_POLL_INTERVAL_SEC)
-
-    # Ініціалізуємо джерело подій
-    try:
-        posts_watch_result_db.init()
-    except Exception:
-        log.exception("posts_watch_result_db.init failed")
-        return
 
     bot = Bot(token=NOTIFIER_BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()

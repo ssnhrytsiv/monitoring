@@ -3,10 +3,28 @@ from __future__ import annotations
 import logging
 from logging.config import fileConfig
 
+import os
+import sys
+from pathlib import Path
+
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-from app.notificator_bot.db import posts_watch_result_models as models
+# Ensure project root is on sys.path when running Alembic directly (before imports)
+BASE_DIR = Path(__file__).resolve().parents[1]
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+"""
+Alembic env configured to use the shared ORM Base.
+We point target_metadata to app.admin_bot.db.models.Base, which now includes
+all common tables (channels, links, networks, sheet_projects, etc.) and
+additional service-specific models (InviteCheck, RequestedCheck) via
+app.services.models.
+"""
+
+from app.admin_bot.db import models as shared_models
+from app.services import models as service_models
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -17,11 +35,20 @@ if config.config_file_name:
     fileConfig(config.config_file_name)
 log = logging.getLogger(__name__)
 
-target_metadata = models.Base.metadata
+target_metadata = shared_models.Base.metadata
 
 
 def get_url() -> str:
-    return models.SQLALCHEMY_DATABASE_URI
+    # Shared engine/database URL comes from admin_bot config
+    try:
+        from app.admin_bot.config import SQLALCHEMY_DATABASE_URL
+        return SQLALCHEMY_DATABASE_URL
+    except Exception:
+        # Fallback to service models engine URL if needed
+        try:
+            return service_models.get_engine().url
+        except Exception:
+            raise
 
 
 def run_migrations_offline() -> None:

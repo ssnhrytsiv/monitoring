@@ -72,14 +72,6 @@
 │   │   ├── channel_maps.py
 │   │   ├── db
 │   │   │   └── bad_invites.py
-│   │   ├── feature
-│   │   │   ├── __init__.py
-│   │   │   ├── channel_seed.py
-│   │   │   ├── seed.py
-│   │   │   ├── seed_creator.py
-│   │   │   ├── seed_db.py
-│   │   │   ├── seed_post_db.py
-│   │   │   └── seed_posts.py
 │   │   ├── googlesheets
 │   │   │   ├── channels_export_service.py
 │   │   │   ├── channels_table.sql
@@ -89,7 +81,6 @@
 │   │   ├── gsheets_writer.py
 │   │   ├── html_match.py
 │   │   ├── html_render.py
-│   │   ├── join_scheduler.py
 │   │   ├── joiner.py
 │   │   ├── link_queue.py
 │   │   ├── membership_db.py
@@ -108,11 +99,7 @@
 │   ├── telethon_client.py
 │   └── utils
 │       ├── __init__.py
-│       ├── formatting.py
 │       ├── link_parser.py
-│       ├── notices.py
-│       ├── text_norm.py
-│       ├── tg_links.py
 │       └── throttle.py
 ├── apply_anchored_patch.py
 ├── bot_create_watch.py
@@ -131,7 +118,6 @@
 ├── schema_dump.txt
 ├── scripts
 │   └── generate-project-map.sh
-├── seed_channels.sqlite3
 └── tree.txt
 
 19 directories, 108 files
@@ -163,15 +149,9 @@ BULK_THRESHOLD_EVENTS variable     16 app/services/gsheets_buffer.py BULK_THRESH
 Base             class        46 app/services/requested_reconciler_db.py class Base(DeclarativeBase):
 Base             variable     67 app/services/models.py Base = declarative_base()
 CASE_SENSITIVE   variable     20 app/config.py    CASE_SENSITIVE = os.getenv("CASE_SENSITIVE", "false").lower() in ("1", "true", "yes")
-CFG_API_HASH     unknown      24 app/services/feature/seed_creator.py from app.config import API_ID as CFG_API_ID, API_HASH as CFG_API_HASH
-CFG_API_HASH     variable     27 app/services/feature/seed_creator.py CFG_API_HASH = None
-CFG_API_ID       unknown      24 app/services/feature/seed_creator.py from app.config import API_ID as CFG_API_ID, API_HASH as CFG_API_HASH
-CFG_API_ID       variable     26 app/services/feature/seed_creator.py CFG_API_ID = None
 CONTROL_PEER     variable     10 app/config.py    CONTROL_PEER = os.getenv("CONTROL_CHAT", "")
 COVERAGE_POLL_TICK_SEC variable     51 app/plugins/posts_watch_listener.py COVERAGE_POLL_TICK_SEC = 30
 CREATE_TABLE_SQL variable      9 app/services/link_queue.py CREATE_TABLE_SQL = """
-CREATOR_SESSION_NAME variable     10 app/settings.py  CREATOR_SESSION_NAME = os.getenv('CREATOR_SESSION_NAME', 'tg_session_3')
-CREATOR_SESSION_NAME variable     57 app/services/feature/seed_creator.py CREATOR_SESSION_NAME = getattr(settings, "CREATOR_SESSION_NAME", "tg_session_3")
 ClientSlot       class        46 app/services/account_pool.py class ClientSlot:
 ClientSlot.busy  variable     50 app/services/account_pool.py busy: bool = False
 ClientSlot.lock  variable     51 app/services/account_pool.py lock: asyncio.Lock = asyncio.Lock()
@@ -184,20 +164,16 @@ CreateWatch.template_pick variable     10 app/bot/states.py template_pick = Stat
 CreateWatch.time_window variable     11 app/bot/states.py time_window = State()
 Credentials      variable     11 app/services/gsheets.py Credentials = None
 Credentials      variable     20 app/services/gsheets_writer.py Credentials = None # type: ignore
-DB_PATH          variable      6 app/services/feature/seed_post_db.py DB_PATH = Path("./seed_posts.sqlite3")
 DB_PATH          variable      6 app/services/link_queue.py DB_PATH = os.getenv("DB_PATH", "post_watchdog.sqlite3")
 DB_PATH          variable      6 app/services/post_watch_db.py DB_PATH = os.getenv("DB_PATH", "post_watchdog.sqlite3")
 DB_PATH          variable      8 app/services/membership_db.py DB_PATH = os.getenv("DB_PATH", "post_watchdog.sqlite3")
-DB_PATH          variable      9 app/services/feature/seed_db.py DB_PATH = Path("./seed_channels.sqlite3")
 DB_PATH          variable     20 app/services/channel_facts.py DB_PATH = Path("./channels_meta.sqlite3")
 DB_PATH          variable     21 app/services/requested_reconciler_db.py DB_PATH = os.getenv("DB_PATH", "post_watchdog.sqlite3")
 DB_PATH          variable     23 app/config.py    DB_PATH = os.getenv("DB_PATH", "post_watchdog.sqlite3")
 DB_PATH          variable     32 app/services/models.py DB_PATH = os.getenv("DB_PATH", "post_watchdog.sqlite3")
 DB_PATH_DEFAULT  variable     17 app/services/googlesheets/export_channels_table.py DB_PATH_DEFAULT = "post_watchdog.sqlite3"
-DDL              variable      8 app/services/feature/seed_post_db.py DDL = r"""
 DDL              variable      8 app/services/post_watch_db.py DDL = """
 DDL              variable     10 app/services/membership_db.py DDL = """
-DDL              variable     11 app/services/feature/seed_db.py DDL = r"""
 DDL              variable     22 app/services/channel_facts.py DDL = r"""
 DDL              variable     24 app/services/channel_maps.py DDL = r"""
 DEFAULT_COVERAGE_HOURS variable     79 app/plugins/posts_watch_listener.py DEFAULT_COVERAGE_HOURS: float = _read_default_coverage_hours()
@@ -210,8 +186,6 @@ DEFAULT_FUZZ     variable     19 app/config.py    DEFAULT_FUZZ = int(os.getenv("
 DEFAULT_MODE     variable     18 app/config.py    DEFAULT_MODE = os.getenv("DEFAULT_MODE", "exact_strict")
 DEFAULT_MON_INTERVAL variable     14 app/config.py    DEFAULT_MON_INTERVAL = os.getenv("DEFAULT_MON_INTERVAL", "1h")
 DEFAULT_MON_WINDOW variable     16 app/config.py    DEFAULT_MON_WINDOW = os.getenv("DEFAULT_MON_WINDOW", "24h")
-DELAY_BETWEEN_BATCHES variable     62 app/services/feature/seed_creator.py DELAY_BETWEEN_BATCHES = float(getattr(settings, "SEED_DELAY_BETWEEN_BATCHES", 20.0))
-DELAY_BETWEEN_CREATES variable     61 app/services/feature/seed_creator.py DELAY_BETWEEN_CREATES = float(getattr(settings, "SEED_DELAY_BETWEEN_CREATES", 7.0))
 Data/Control flow section      12 docs/ARCHITECTURE.md ## Data/Control flow
 DebouncedProgress class        10 app/plugins/progress_live.py class DebouncedProgress:
 DebouncedProgress._bar member      133 app/plugins/progress_live.py def _bar(done: int, total: int, width: int = 20) -> str:
@@ -263,7 +237,6 @@ GroupItem        variable      7 app/bot/utils/active_watches_pagination.py Grou
 GroupItem        variable     11 app/bot/services/active_watches_service.py GroupItem = Tuple[int, int, str, str, int]
 HEADER           variable     25 app/services/gsheets_writer.py HEADER = [
 HEADERS          variable     28 app/services/googlesheets/export_channels_table.py HEADERS = [
-HELP_TEXT        variable     26 app/services/feature/channel_seed.py HELP_TEXT = (
 HELP_TEXT_MD     variable      4 app/plugins/help_and_ping.py HELP_TEXT_MD = """\
 HTML_CHANNEL     variable     18 app/debug/test_normalize_html_links_tony_bet.py HTML_CHANNEL = """
 HTML_DB          variable      5 app/debug/test_normalize_html_links_tony_bet.py HTML_DB = """
@@ -318,23 +291,6 @@ InviteStatus.__tablename__ variable    130 app/services/models.py __tablename__ 
 InviteStatus.invite_hash variable    132 app/services/models.py invite_hash = Column(Text, primary_key=True)
 InviteStatus.status variable    133 app/services/models.py status = Column(Text, nullable=False)
 InviteStatus.ts  variable    134 app/services/models.py ts = Column(Integer, nullable=False)
-JITTER_AFTER_COOLDOWN_PCT variable     42 app/services/join_scheduler.py JITTER_AFTER_COOLDOWN_PCT: Tuple[float, float] = (0.05, 0.15) # частка від FloodWait W
-JITTER_CREATE_MAX variable     63 app/services/feature/seed_creator.py JITTER_CREATE_MIN, JITTER_CREATE_MAX = map(
-JITTER_CREATE_MIN variable     63 app/services/feature/seed_creator.py JITTER_CREATE_MIN, JITTER_CREATE_MAX = map(
-JITTER_IMMEDIATE_RANGE variable     41 app/services/join_scheduler.py JITTER_IMMEDIATE_RANGE: Tuple[float, float] = (0.0, 0.25) # сек коли токен є відразу
-JITTER_TOKEN_WAIT_RANGE variable     40 app/services/join_scheduler.py JITTER_TOKEN_WAIT_RANGE: Tuple[float, float] = (0.2, 1.3) # сек при очікуванні токена / cooldown
-JOIN_AFTER_FLOOD_HOLD_MAX variable     37 app/services/join_scheduler.py JOIN_AFTER_FLOOD_HOLD_MAX: int = int(getattr(_S, "JOIN_AFTER_FLOOD_HOLD_MAX", 300))
-JOIN_AFTER_FLOOD_HOLD_MIN variable     36 app/services/join_scheduler.py JOIN_AFTER_FLOOD_HOLD_MIN: int = int(getattr(_S, "JOIN_AFTER_FLOOD_HOLD_MIN", 10))
-JOIN_AFTER_FLOOD_HOLD_PCT variable     35 app/services/join_scheduler.py JOIN_AFTER_FLOOD_HOLD_PCT: float = float(getattr(_S, "JOIN_AFTER_FLOOD_HOLD_PCT", 0.10)) # 10% від W
-JOIN_BURST       variable     25 app/services/join_scheduler.py JOIN_BURST: int = int(getattr(_S, "JOIN_BURST", 2)) # стартовий запас токенів
-JOIN_GOOD_STREAK variable     32 app/services/join_scheduler.py JOIN_GOOD_STREAK: int = int(getattr(_S, "JOIN_GOOD_STREAK", 5))
-JOIN_LIMIT_WINDOW variable     22 app/services/join_scheduler.py JOIN_LIMIT_WINDOW: int = int(getattr(_S, "JOIN_LIMIT_WINDOW", 600)) # 10 хв
-JOIN_PRIVATE_CAP variable     24 app/services/join_scheduler.py JOIN_PRIVATE_CAP: int = int(getattr(_S, "JOIN_PRIVATE_CAP", 8)) # стартова місткість private
-JOIN_PRIVATE_MAX variable     30 app/services/join_scheduler.py JOIN_PRIVATE_MAX: int = int(getattr(_S, "JOIN_PRIVATE_MAX", 20)) # <-- як просив: MAX=20
-JOIN_PRIVATE_MIN variable     29 app/services/join_scheduler.py JOIN_PRIVATE_MIN: int = int(getattr(_S, "JOIN_PRIVATE_MIN", 3))
-JOIN_PUBLIC_CAP  variable     23 app/services/join_scheduler.py JOIN_PUBLIC_CAP: int = int(getattr(_S, "JOIN_PUBLIC_CAP", 20)) # стартова місткість public
-JOIN_PUBLIC_MAX  variable     28 app/services/join_scheduler.py JOIN_PUBLIC_MAX: int = int(getattr(_S, "JOIN_PUBLIC_MAX", 30))
-JOIN_PUBLIC_MIN  variable     27 app/services/join_scheduler.py JOIN_PUBLIC_MIN: int = int(getattr(_S, "JOIN_PUBLIC_MIN", 6))
 JSONFormatter    class         9 app/logging_json.py class JSONFormatter(logging.Formatter):
 JSONFormatter.format member       10 app/logging_json.py def format(self, record: logging.LogRecord) -> str:
 JoinChannels     class         3 app/bot/states.py class JoinChannels(StatesGroup):
@@ -351,13 +307,11 @@ LINK_DELAY_PUBLIC_MIN variable     28 app/utils/throttle.py LINK_DELAY_PUBLIC_MI
 LINK_DELAY_PUBLIC_MIN variable     34 app/utils/throttle.py LINK_DELAY_PUBLIC_MIN, LINK_DELAY_PUBLIC_MAX = _clamp_pair(LINK_DELAY_PUBLIC_MIN, LINK_DELAY_PUBLIC_MAX)
 LOG_LEVEL        variable     37 app/config.py    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 MAIN_CLIENT      unknown      14 app/plugins/posts_watch_listener.py from app.telethon_client import client as MAIN_CLIENT
-MAX_PER_10_MIN   variable     66 app/services/feature/seed_creator.py MAX_PER_10_MIN = int(getattr(settings, "SEED_MAX_PER_10_MIN", 15))
 MDV2_SPECIALS    variable     15 app/bot/utils/active_watches_formatters.py MDV2_SPECIALS = r"_*[]()~`>#+-=|{}.!\\"
 MEMBER           variable     68 app/services/requested_reconciler.py MEMBER = "member"
 MIN_FLUSH_GAP_SEC variable     15 app/services/gsheets_buffer.py MIN_FLUSH_GAP_SEC = 5.0
 MONITOR_BUFFER   variable     30 app/telethon_client.py MONITOR_BUFFER = SimpleNamespace(
 MONITOR_LINKS_SHADOW variable      8 app/settings.py  MONITOR_LINKS_SHADOW = _truthy(os.getenv("MONITOR_LINKS_SHADOW", "0"))
-MONITOR_LINKS_SHADOW variable     20 app/services/join_scheduler.py MONITOR_LINKS_SHADOW: bool = bool(getattr(_S, "MONITOR_LINKS_SHADOW", False))
 MONITOR_LINKS_SHADOW variable     65 app/plugins/monitor_links.py MONITOR_LINKS_SHADOW: bool = bool(getattr(_S, "MONITOR_LINKS_SHADOW", False))
 MONITOR_LINKS_V2 variable      7 app/settings.py  MONITOR_LINKS_V2 = _truthy(os.getenv("MONITOR_LINKS_V2", "0"))
 MOSCOW_TZ        variable     12 app/services/gsheets_buffer.py MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -392,7 +346,6 @@ PER_SESSION_INVITES variable     33 app/services/requested_reconciler.py PER_SES
 PER_SESSION_REQUESTED variable     34 app/services/requested_reconciler.py PER_SESSION_REQUESTED = int(os.getenv("REQUESTED_RECONCILER_PER_SESSION_REQUESTED", "20") or "20")
 PLUGINS_PACKAGE  variable     35 app/config.py    PLUGINS_PACKAGE = "app.plugins"
 POOL_SESSIONS    variable     42 app/services/account_pool.py POOL_SESSIONS = _parse_accounts_env()
-POST_DB_PATH     unknown      23 app/services/feature/seed_posts.py from app.services.post_watch_db import DB_PATH as POST_DB_PATH # містить post_template
 PRIMARY          variable     26 app/services/account_pool.py PRIMARY = _env("SESSION") or _env("SESSION_NAME") or "tg_session"
 PRIVATE          variable     71 app/services/requested_reconciler.py PRIVATE = "private"
 PROBE_DELAY_MAX  variable     25 app/utils/throttle.py PROBE_DELAY_MAX = _f("PROBE_DELAY_MAX", "1.10")
@@ -435,12 +388,6 @@ RequestedCheck.session variable     67 app/services/requested_reconciler_db.py s
 RequestedCheck.session variable    207 app/services/models.py session = Column(Text, nullable=False)
 RequestedCheck.tries variable     71 app/services/requested_reconciler_db.py tries: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 RequestedCheck.tries variable    211 app/services/models.py tries = Column(Integer, nullable=False, default=0)
-SEED_DELAY_BETWEEN_BATCHES variable     13 app/settings.py  SEED_DELAY_BETWEEN_BATCHES = float(os.getenv('SEED_DELAY_BETWEEN_BATCHES', '20.0'))
-SEED_DELAY_BETWEEN_CREATES variable     12 app/settings.py  SEED_DELAY_BETWEEN_CREATES = float(os.getenv('SEED_DELAY_BETWEEN_CREATES', '7.0'))
-SEED_JITTER_CREATE variable     14 app/settings.py  SEED_JITTER_CREATE = os.getenv('SEED_JITTER_CREATE', '0.3,1.2')
-SEED_MAX_PER_10_MIN variable     15 app/settings.py  SEED_MAX_PER_10_MIN = int(os.getenv('SEED_MAX_PER_10_MIN', '15'))
-SEED_TARGET      variable     11 app/settings.py  SEED_TARGET = os.getenv('SEED_TARGET', 'tg_session')
-SEED_TARGET      variable     58 app/services/feature/seed_creator.py SEED_TARGET = getattr(settings, "SEED_TARGET", "me") # дефолтно відправляємо у Saved Messages
 SESSION          variable      8 app/config.py    SESSION = os.getenv("SESSION_NAME", "tg_session")
 SHEETS_OK        variable     23 app/bot/services/edit_watch_service.py SHEETS_OK = False
 SHEETS_OK        variable     27 app/bot/services/edit_watch_service.py SHEETS_OK = True
@@ -450,13 +397,9 @@ SHEET_NAME_DEFAULT variable     19 app/services/googlesheets/export_channels_tab
 SQLALCHEMY_DATABASE_URI variable     40 app/services/models.py SQLALCHEMY_DATABASE_URI = _mk_sqlite_url(DB_PATH)
 SQLITE_URL       variable     22 app/services/requested_reconciler_db.py SQLITE_URL = f"sqlite:///{DB_PATH}"
 SQL_FILE_DEFAULT variable     18 app/services/googlesheets/export_channels_table.py SQL_FILE_DEFAULT = os.path.join(os.path.dirname(__file__), "channels_table.sql")
-STATUS_ICON      variable      5 app/utils/formatting.py STATUS_ICON = {
 STRICT_CONTROLLED_PLUGINS variable     19 app/telethon_client.py STRICT_CONTROLLED_PLUGINS = {
 SessionLocal     variable     65 app/services/models.py SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, future=True)
 SessionLocal     variable     98 app/services/requested_reconciler_db.py SessionLocal = sessionmaker(bind=engine, class_=Session, autoflush=False, autocommit=False, future=True)
-SessionState     class        89 app/services/join_scheduler.py class SessionState:
-SessionState.__init__ member      100 app/services/join_scheduler.py def __init__(self, alias: str):
-SessionState.__slots__ variable     90 app/services/join_scheduler.py __slots__ = (
 SingleWatch      variable      5 app/bot/utils/active_watches_formatters.py SingleWatch = Tuple[
 SingleWatch      variable     13 app/bot/services/active_watches_service.py SingleWatch = Tuple[int, Optional[int], str, Optional[str], Any, Optional[int], Optional[str]]
 SlidingWindowRateLimiter class       105 app/services/requested_reconciler.py class SlidingWindowRateLimiter:
@@ -479,13 +422,6 @@ Telegram Post Watchdog — v13 (Full) chapter       1 README.md        # Telegra
 TgMessage        unknown       7 app/bot/services/edit_watch_service.py from telethon.tl.types import Message as TgMessage # тип пересланого поста
 TgMessage        unknown       8 app/utils/link_parser.py from telethon.tl.custom.message import Message as TgMessage
 TgMessage        variable     11 app/utils/link_parser.py TgMessage = None # type: ignore
-TokenBucket      class        48 app/services/join_scheduler.py class TokenBucket:
-TokenBucket.__init__ member       52 app/services/join_scheduler.py def __init__(self, cap: int, window_sec: int, init_tokens: float):
-TokenBucket.__slots__ variable     50 app/services/join_scheduler.py __slots__ = ("cap", "tokens", "rate", "last_refill")
-TokenBucket._refill member       64 app/services/join_scheduler.py def _refill(self):
-TokenBucket.consume_one member       80 app/services/join_scheduler.py def consume_one(self):
-TokenBucket.need_wait_seconds_for_one member       72 app/services/join_scheduler.py def need_wait_seconds_for_one(self) -> float:
-TokenBucket.update_cap member       58 app/services/join_scheduler.py def update_cap(self, new_cap: int, window_sec: int):
 USER_PROCESSING  variable      2 app/bot/user_state.py USER_PROCESSING = {}
 UrlCache         class       140 app/services/models.py class UrlCache(Base):
 UrlCache.__repr__ member      154 app/services/models.py def __repr__(self) -> str:
@@ -493,13 +429,11 @@ UrlCache.__tablename__ variable    148 app/services/models.py __tablename__ = "u
 UrlCache.status  variable    151 app/services/models.py status = Column(Text, nullable=False)
 UrlCache.ts      variable    152 app/services/models.py ts = Column(Integer, nullable=False)
 UrlCache.url     variable    150 app/services/models.py url = Column(Text, primary_key=True)
-VERBOSE_NOTICES  variable      3 app/utils/notices.py VERBOSE_NOTICES = False # set True to see debug notices
 WATCH_VIEWS_ENABLED variable     39 app/config.py    WATCH_VIEWS_ENABLED = os.getenv("WATCH_VIEWS_ENABLED", "1").strip().lower() not in {"0","false","no","off"}
 WHOLE_WORD       variable     21 app/config.py    WHOLE_WORD = os.getenv("WHOLE_WORD", "false").lower() in ("1", "true", "yes")
 _                function     12 app/plugins/resolve_channel.py async def _(ev: events.NewMessage.Event):
 _                function    175 app/plugins/monitor_watch.py async def _(ev: events.NewMessage.Event):
 _ACTIVE          variable     56 app/plugins/monitor_links.py _ACTIVE = False
-_ALIAS_TO_IDX    variable    114 app/services/join_scheduler.py _ALIAS_TO_IDX: Dict[str, int] = {}
 _A_TAG_RE        variable    165 app/plugins/posts_watch_listener.py _A_TAG_RE = re.compile(r'<a\s+href=(?P<q1>"|\')(?P<href>.+?)(?P=q1)>(?P<body>.*?)</a>', re.DOTALL | re.IGNORECASE)
 _BATCHES         variable     13 app/services/monitor_links_bridge.py _BATCHES: Dict[int, Dict[str, int]] = {}
 _BOT             variable     18 app/services/monitor_links_bridge.py _BOT: Optional[Bot] = None
@@ -520,7 +454,6 @@ _GS_OK           variable     41 app/plugins/monitor_watch.py _GS_OK = False
 _HTML_RENDER     variable     90 app/plugins/posts_watch_listener.py _HTML_RENDER: Optional[Callable[[Message], str]] = None
 _HTML_RENDER_SRC variable     91 app/plugins/posts_watch_listener.py _HTML_RENDER_SRC = None
 _INVIS           variable     34 app/utils/link_parser.py _INVIS = ("\u200b", "\u200e", "\u200f")
-_INVITE_RE       variable     46 app/services/feature/seed_posts.py _INVITE_RE = re.compile(r"https?://t\.me/\+([A-Za-z0-9_\-]+)")
 _INV_RE          variable      9 app/bot/services/channels_repo.py _INV_RE = re.compile(r"(?:t\.me/(?:\+|joinchat/)|tg://join\?invite=)([A-Za-z0-9_-]{6,})")
 _LINK_RE         variable     22 app/bot/handlers1.py _LINK_RE = re.compile(r'(?i)\b((?:https?://|tg://|t\.me/)[^\s<>"\'\]\)]+)')
 _LINK_RE         variable     22 bot_create_watch.py _LINK_RE = re.compile(r'(?i)\b((?:https?://|tg://|t\.me/)[^\s<>"\'\]\)]+)')
@@ -534,7 +467,6 @@ _OWNER_DISPLAY   variable     62 app/plugins/monitor_links.py _OWNER_DISPLAY: Op
 _OWNER_USERNAME  variable     61 app/plugins/monitor_links.py _OWNER_USERNAME: Optional[str] = None
 _POOL            variable     53 app/services/account_pool.py _POOL: List[ClientSlot] = []
 _POOL_LOCK       variable     54 app/services/account_pool.py _POOL_LOCK = asyncio.Lock()
-_QUEUES          variable    112 app/services/join_scheduler.py _QUEUES: List[asyncio.Queue] = []
 _RESERVED        variable      7 app/logging_json.py _RESERVED = {"exc_info", "stack_info", "stacklevel", "extra"}
 _RE_WS           variable      8 app/services/html_match.py _RE_WS = re.compile(r"[ \t\r\f\v]+") # багаторазові пробіли (без \n)
 _RR              variable    103 app/flows/batch_links/process_links.py _RR = _RoundRobinOrder()
@@ -542,16 +474,11 @@ _RoundRobinOrder class        49 app/flows/batch_links/process_links.py class _R
 _RoundRobinOrder.__init__ member       58 app/flows/batch_links/process_links.py def __init__(self) -> None:
 _RoundRobinOrder._sid member       62 app/flows/batch_links/process_links.py def _sid(self, slot: Any) -> str:
 _RoundRobinOrder.pick_order member       67 app/flows/batch_links/process_links.py def pick_order(self, slots: List[Any]) -> List[Any]:
-_S               class        32 app/services/feature/seed_creator.py class _S: ...
 _S               unknown      13 app/services/channel_maps.py from app import settings as _S
-_S               unknown      13 app/services/join_scheduler.py from app import settings as _S # беремо з settings, але нижче маємо безпечні дефолти
 _S               unknown      51 app/plugins/monitor_links.py from app import settings as _S
-_SESSIONS        variable    111 app/services/join_scheduler.py _SESSIONS: List[Any] = []
 _SH              variable     39 app/services/gsheets_writer.py _SH = None
 _SHEETS_WITH_HEADER variable     41 app/services/gsheets_writer.py _SHEETS_WITH_HEADER: set[str] = set()
-_STARTED         variable    115 app/services/join_scheduler.py _STARTED = False
 _STATE           variable     12 app/services/googlesheets/channels_export_service.py _STATE = {
-_STATE           variable    113 app/services/join_scheduler.py _STATE: List[SessionState] = []
 _TAG_RE          variable     91 app/plugins/post_templates.py _TAG_RE = re.compile(r"<[^>]+>")
 _TRAIL_PUNCT     variable     35 app/utils/link_parser.py _TRAIL_PUNCT = ".,;:)]}>"
 _USER_LOCKS      variable     16 app/services/monitor_links_bridge.py _USER_LOCKS: Dict[int, bool] = {}
@@ -563,10 +490,8 @@ __all__          variable      4 app/flows/batch_links/__init__.py __all__ = ["p
 __all__          variable      4 app/services/__init__.py __all__ = ["list_templates_full"]
 __all__          variable      9 app/services/channel_db.py __all__ = [
 __all__          variable     16 app/services/posts_watch_result_db.py __all__ = [
-__init__         member       52 app/services/join_scheduler.py def __init__(self, cap: int, window_sec: int, init_tokens: float):
 __init__         member       53 app/logging_json.py def __init__(self, logger: logging.Logger, context: Optional[Dict[str, Any]] = None):
 __init__         member       58 app/flows/batch_links/process_links.py def __init__(self) -> None:
-__init__         member      100 app/services/join_scheduler.py def __init__(self, alias: str):
 __init__         member      106 app/services/requested_reconciler.py def __init__(
 __repr__         member       98 app/services/models.py def __repr__(self) -> str:
 __repr__         member      118 app/services/models.py def __repr__(self) -> str:
@@ -574,8 +499,6 @@ __repr__         member      136 app/services/models.py def __repr__(self) -> st
 __repr__         member      154 app/services/models.py def __repr__(self) -> str:
 __repr__         member      185 app/services/models.py def __repr__(self) -> str:
 __repr__         member      219 app/services/models.py def __repr__(self) -> str:
-__slots__        variable     50 app/services/join_scheduler.py __slots__ = ("cap", "tokens", "rate", "last_refill")
-__slots__        variable     90 app/services/join_scheduler.py __slots__ = (
 __table_args__   variable     58 app/services/requested_reconciler_db.py __table_args__ = (
 __table_args__   variable     73 app/services/requested_reconciler_db.py __table_args__ = (
 __table_args__   variable     92 app/services/models.py __table_args__ = (
@@ -589,7 +512,6 @@ __tablename__    variable    130 app/services/models.py __tablename__ = "invite_
 __tablename__    variable    148 app/services/models.py __tablename__ = "url_cache"
 __tablename__    variable    171 app/services/models.py __tablename__ = "invite_check"
 __tablename__    variable    205 app/services/models.py __tablename__ = "requested_check"
-_adapt_limits_and_cooldown function    329 app/services/join_scheduler.py def _adapt_limits_and_cooldown(st: SessionState, kind: str, ok: bool, flood_wait_s: Optional[int]):
 _add_tmpl        function    277 app/plugins/post_templates.py async def _add_tmpl(evt):
 _allow_note_reset function    142 app/services/requested_reconciler_db.py def _allow_note_reset(session: str, invite_hash: str, now_ts: int) -> bool:
 _already_joined  function    266 app/plugins/monitor_links.py async def _already_joined(cid: int) -> bool:
@@ -611,7 +533,6 @@ _build_full_footer._is_invalid_or_error function    148 app/flows/batch_links/pr
 _build_full_footer._is_private function    144 app/flows/batch_links/process_links.py def _is_private(status: str) -> bool:
 _build_full_footer._link_line function    155 app/flows/batch_links/process_links.py def _link_line(idx: int, url: str, title: Optional[str], status: str, tag: str = "") -> str:
 _build_full_footer._strip_conflict function    135 app/flows/batch_links/process_links.py def _strip_conflict(status: str) -> str:
-_build_parser    function     25 app/services/feature/seed.py def _build_parser() -> argparse.ArgumentParser:
 _build_row_for_edited_other function    208 app/services/gsheets_buffer.py def _build_row_for_edited_other(wid: int, when_str: str | None) -> Tuple[str, List[str]]:
 _build_row_for_expired function    184 app/services/gsheets_buffer.py def _build_row_for_expired(wid: int) -> Tuple[str, List[str]]:
 _build_row_for_matched function    158 app/services/gsheets_buffer.py def _build_row_for_matched(wid: int) -> Tuple[str, List[str]]:
@@ -623,10 +544,8 @@ _canon_url       function     30 app/services/post_matcher.py def _canon_url(u: 
 _changed         variable     35 app/plugins/progress_live.py _changed: bool = False
 _chat_allowed    function    157 app/plugins/channel_info.py def _chat_allowed(event) -> bool:
 _check_invite_with_session function    220 app/services/requested_reconciler.py async def _check_invite_with_session(client, invite_hash: str) -> Tuple["InviteCheckStatus", Optional[Any]]:
-_clamp           function    147 app/services/join_scheduler.py def _clamp(v: float, vmin: float, vmax: float) -> float:
 _clamp_pair      function     16 app/utils/throttle.py def _clamp_pair(lo: float, hi: float) -> Tuple[float, float]:
 _classify        function     76 app/plugins/monitor_links.py def _classify(url: str) -> str:
-_classify_kind   function    132 app/services/join_scheduler.py def _classify_kind(invite_or_username: Optional[str]) -> str:
 _clean           function     38 app/utils/link_parser.py def _clean(s: str) -> str:
 _cleanup_recent  function    478 app/services/gsheets_buffer.py def _cleanup_recent():
 _client          function     14 app/services/gsheets.py def _client():
@@ -647,7 +566,6 @@ _column_exists   function     25 app/services/post_watch_db.py def _column_exist
 _compare_two     function    126 app/debug/debug_post_diff_interactive.py async def _compare_two(first: MsgSnapshot, second: MsgSnapshot):
 _conflict_name   function    128 app/flows/batch_links/process_links.py def _conflict_name(status: str) -> Optional[str]:
 _conn            function     20 app/services/post_watch_db.py def _conn():
-_conn            function     30 app/services/feature/seed_post_db.py def _conn():
 _conn            function     36 app/services/link_queue.py def _conn():
 _conn            function     46 app/services/owner_conflict_guard.py def _conn() -> sqlite3.Connection:
 _conn            function     51 app/services/membership_db.py def _conn():
@@ -672,7 +590,6 @@ _db_get_watch_core function    134 app/plugins/posts_watch_listener.py def _db_g
 _debounced_edit  member       93 app/plugins/progress_live.py async def _debounced_edit(self) -> None:
 _dedup_ttl_key   function     68 app/services/gsheets_buffer.py def _dedup_ttl_key(sheet: str, wid: int, etype: str) -> bool:
 _delayed_monitor_off function    389 app/bot/handlers/join_channels.py async def _delayed_monitor_off():
-_delete_later    function     89 app/services/feature/seed_posts.py async def _delete_later(channel: Any, message_id: int, delay: int):
 _delta_minutes_msq_str function     53 app/plugins/monitor_watch.py def _delta_minutes_msq_str(minutes: int) -> str:
 _edit            member      103 app/plugins/progress_live.py async def _edit(self, final: bool) -> None:
 _edit_back_kb    function     50 app/bot/handlers/active_watches_group.py def _edit_back_kb(wid: int) -> InlineKeyboardBuilder:
@@ -700,7 +617,6 @@ _execute         function     73 app/services/channel_maps.py async def _execute
 _execute._inner  function     74 app/services/channel_maps.py def _inner():
 _executemany     function     80 app/services/channel_maps.py async def _executemany(sql: str, seq_params: list[tuple]) -> None:
 _executemany._inner function     81 app/services/channel_maps.py def _inner():
-_export_invite   function    107 app/services/feature/seed_creator.py async def _export_invite(c: TelegramClient, chat: Any, kind: str):
 _extract_args    function     44 app/plugins/channel_info.py def _extract_args(raw: str, command: str) -> str:
 _extract_from_entities function    129 app/utils/link_parser.py def _extract_from_entities(text: str, entities: Iterable) -> List[str]:
 _extract_hidden_links_from_message function    281 app/flows/batch_links/process_links.py def _extract_hidden_links_from_message(msg) -> List[str]:
@@ -737,8 +653,6 @@ _fmt_tw_end      function     30 app/bot/handlers/active_watches_menu.py def _fm
 _fmt_tw_end      function    151 app/bot/handlers1.py def _fmt_tw_end(s: Optional[str]) -> str:
 _fmt_tw_end      function    151 bot_create_watch.py def _fmt_tw_end(s: Optional[str]) -> str:
 _fmt_views       function     55 app/services/gsheets_buffer.py def _fmt_views(val: int | None) -> str:
-_get_api_credentials function     35 app/services/feature/seed_creator.py def _get_api_credentials():
-_get_conn        function     25 app/services/feature/seed_db.py def _get_conn():
 _get_conn        function     67 app/services/channel_maps.py def _get_conn() -> sqlite3.Connection:
 _get_or_create_worksheet function    248 app/services/gsheets_writer.py def _get_or_create_worksheet(sh, title: str):
 _get_pool_sessions function     91 app/plugins/monitor_links.py async def _get_pool_sessions() -> List[Any]:
@@ -748,7 +662,6 @@ _guard_begin     unknown      41 app/flows/batch_links/process_links.py from app
 _guard_end       unknown      20 app/flows/batch_links/queue_worker.py from app.services.owner_conflict_guard import begin as _guard_begin, end as _guard_end
 _guard_end       unknown      41 app/flows/batch_links/process_links.py from app.services.owner_conflict_guard import begin as _guard_begin, end as _guard_end
 _guarded         function    162 app/plugins/channel_info.py async def _guarded(handler, event):
-_handle_flood    function     88 app/services/feature/seed_creator.py async def _handle_flood(e: Exception):
 _has_active_duplicate function     97 app/plugins/monitor_watch.py def _has_active_duplicate(channel_id: int, template_id: Optional[int], expected_text_hash: Optional[str]) -> Optional[dict]:
 _has_column      function     57 app/services/membership_db.py def _has_column(c: sqlite3.Connection, table: str, col: str) -> bool:
 _has_column      function     63 app/services/posts_watch_result_db.py def _has_column(conn: sqlite3.Connection, table: str, col: str) -> bool:
@@ -789,12 +702,9 @@ _last_render     variable     37 app/plugins/progress_live.py _last_render: str 
 _late_setup      function    357 app/plugins/monitor_links.py async def _late_setup():
 _lease_ctx       function    207 app/services/account_pool.py async def _lease_ctx(slot: ClientSlot):
 _link_line       function    155 app/flows/batch_links/process_links.py def _link_line(idx: int, url: str, title: Optional[str], status: str, tag: str = "") -> str:
-_links_from_metas function     50 app/services/feature/seed.py def _links_from_metas(metas: List[Dict]) -> List[str]:
-_links_from_rows function     60 app/services/feature/seed.py def _links_from_rows(rows: List[Dict]) -> List[str]:
 _links_text_from_json function    140 app/services/gsheets_buffer.py def _links_text_from_json(links_json: str | None) -> str:
 _list            function    386 app/plugins/post_templates.py async def _list(evt):
 _load_meta       function     20 app/plugins/post_templates.py def _load_meta():
-_load_template_text function     31 app/services/feature/seed_posts.py def _load_template_text(tpl_id: int) -> Optional[str]:
 _load_templates_map function    168 app/bot/handlers1.py def _load_templates_map() -> Dict[int, Dict[str, Any]]:
 _load_templates_map.pdb unknown     170 app/bot/handlers1.py from app.services import post_watch_db as pdb
 _lock            variable     31 app/services/channel_db.py _lock = threading.Lock()
@@ -825,7 +735,6 @@ _now             function     10 app/services/owner_conflict_guard.py def _now()
 _now             function     34 app/services/channel_db.py def _now() -> str:
 _now             function     52 app/services/posts_watch_result_db.py def _now() -> str:
 _now             function    120 app/services/requested_reconciler_db.py def _now() -> int:
-_now             function    143 app/services/join_scheduler.py def _now() -> float:
 _now_monotonic   function     57 app/plugins/posts_watch_listener.py def _now_monotonic() -> float:
 _now_msq_str     function     49 app/plugins/monitor_watch.py def _now_msq_str() -> str:
 _off             function     59 app/plugins/batch_links.py async def _off(evt):
@@ -846,9 +755,7 @@ _owner_skip      function     97 app/plugins/batch_links.py async def _owner_ski
 _owner_to_str    function     69 app/services/channel_facts.py def _owner_to_str(owner_id: Optional[Any], owner_username: Optional[str], owner_display: Optional[str]) -> str:
 _parse_accounts_env function     28 app/services/account_pool.py def _parse_accounts_env() -> List[str]:
 _parse_add_args  function    206 app/plugins/post_templates.py def _parse_add_args(arg_str: str):
-_parse_flood_wait_seconds function    151 app/services/join_scheduler.py def _parse_flood_wait_seconds(err) -> Optional[int]:
 _parse_int       function     22 app/plugins/channel_info.py def _parse_int(maybe: Optional[str], default: int, min_v=1, max_v=200) -> int:
-_parse_kv        function     39 app/services/feature/channel_seed.py def _parse_kv(s: str) -> Dict[str, str]:
 _parse_links_unique function    132 app/bot/handlers1.py def _parse_links_unique(links_json: Optional[str]) -> List[str]:
 _parse_links_unique function    132 bot_create_watch.py def _parse_links_unique(links_json: Optional[str]) -> List[str]:
 _parse_owner_freeform function     23 app/plugins/owner_set.py def _parse_owner_freeform(raw: str):
@@ -861,11 +768,8 @@ _pending_appends variable     25 app/services/gsheets_buffer.py _pending_appends
 _pending_expire_worker function    317 app/plugins/posts_watch_listener.py async def _pending_expire_worker():
 _pending_updates variable     26 app/services/gsheets_buffer.py _pending_updates: Dict[str, Dict[int, Dict[str, str]]] = {}
 _persist_owner_conflict function    314 app/flows/batch_links/process_links.py def _persist_owner_conflict(channel_id: Optional[int],
-_pick_idx_by_alias function    121 app/services/join_scheduler.py def _pick_idx_by_alias(alias: Optional[str]) -> Optional[int]:
-_pick_idx_hash   function    127 app/services/join_scheduler.py def _pick_idx_hash(channel_id: int) -> int:
 _plausible_invite_hash function     48 app/services/joiner.py def _plausible_invite_hash(h: str | None) -> bool:
 _pool_sessions   function     76 app/services/requested_reconciler.py def _pool_sessions() -> List[str]:
-_post_one        function    126 app/services/feature/seed_posts.py async def _post_one(ent, link_repr: str):
 _print_diff      function    108 app/debug/debug_post_diff_interactive.py def _print_diff(label: str, a: Any, b: Any):
 _print_entities_diff function    117 app/debug/debug_post_diff_interactive.py def _print_entities_diff(a: List[dict], b: List[dict]):
 _print_err       function     46 app/services/gsheets_writer.py def _print_err(msg: str, exc: Exception | None = None):
@@ -874,13 +778,10 @@ _process_links   function    295 app/plugins/monitor_links.py async def _process
 _processing_state variable      7 app/bot/processing_guard.py _processing_state: Dict[int, Dict[str, Any]] = {}
 _pylog           variable     44 app/plugins/monitor_watch.py _pylog = logging.getLogger("plugin.monitor_watch")
 _pylog           variable     48 app/plugins/posts_watch_listener.py _pylog = logging.getLogger("plugin.posts_watch_listener")
-_rand_uniform    function    139 app/services/join_scheduler.py def _rand_uniform(a: float, b: float) -> float:
-_rate_wait_session function    180 app/services/join_scheduler.py async def _rate_wait_session(idx: int, kind: str):
 _read_default_coverage_hours function     65 app/plugins/posts_watch_listener.py def _read_default_coverage_hours() -> float:
 _read_default_coverage_hours function    131 app/bot/services/edit_watch_service.py def _read_default_coverage_hours() -> float:
 _recent_events   variable     28 app/services/gsheets_buffer.py _recent_events: Dict[Tuple[str, int, str], float] = {}
 _record_meta     function     43 app/plugins/post_templates.py def _record_meta(tid: int, chat_id: int, message_id: int, has_media: bool):
-_refill          member       64 app/services/join_scheduler.py def _refill(self):
 _render          member      117 app/plugins/progress_live.py def _render(self, header_suffix: str, final: bool = False) -> str:
 _render_html     function     56 app/debug/debug_post_diff_interactive.py def _render_html(msg: Message) -> str:
 _render_html._rh unknown      62 app/debug/debug_post_diff_interactive.py from app.plugins.post_templates import _extract_message_html as _rh # type: ignore
@@ -888,8 +789,6 @@ _render_html._rh2 unknown      69 app/debug/debug_post_diff_interactive.py from 
 _replace_a       function    225 app/plugins/posts_watch_listener.py def _replace_a(m: re.Match) -> str:
 _reply           function     34 app/plugins/channel_info.py async def _reply(msg: Message, text: str):
 _requested_rl    variable    167 app/services/requested_reconciler.py _requested_rl = SlidingWindowRateLimiter(
-_resend_last     function     70 app/services/feature/seed.py async def _resend_last(n: int, target: str, send_batch: int):
-_resend_last_bg  function     78 app/services/feature/channel_seed.py async def _resend_last_bg(n: int):
 _resolve_channel_id_from_link function     79 app/plugins/monitor_watch.py async def _resolve_channel_id_from_link(url: str) -> Tuple[Optional[int], Optional[str], Optional[str]]:
 _resolve_control_peer function     40 app/telethon_client.py async def _resolve_control_peer() -> tuple[int | None, str]:
 _resolve_url     function    201 app/plugins/monitor_links.py async def _resolve_url(url: str) -> Dict[str, Any]:
@@ -898,10 +797,7 @@ _rh              unknown      97 app/plugins/posts_watch_listener.py from app.pl
 _rh              unknown     104 app/plugins/posts_watch_listener.py from app.services.html_render import render_html as _rh # type: ignore
 _rh2             unknown      69 app/debug/debug_post_diff_interactive.py from app.services.html_render import render_html as _rh2 # type: ignore
 _rr              variable     55 app/services/account_pool.py _rr = 0 # round-robin індекс
-_run             function     88 app/services/feature/seed.py async def _run(args):
-_safe_sleep      function     83 app/services/feature/seed_creator.py async def _safe_sleep(base: float):
 _save_meta       function     34 app/plugins/post_templates.py def _save_meta():
-_seed_channels_bg function    105 app/services/feature/channel_seed.py async def _seed_channels_bg(args: Dict[str, str]):
 _send_watch_from_links_batch_bot function    255 app/bot/handlers1.py async def _send_watch_from_links_batch_bot(bot, targets: List[str], mins: int, template_id: int) -> bool:
 _send_watch_from_links_batch_bot function    259 bot_create_watch.py async def _send_watch_from_links_batch_bot(bot, targets: List[str], mins: int, template_id: int, created_by: int) -> bool:
 _send_watch_from_links_batch_bot function    295 app/bot/handlers/create_watch.py async def _send_watch_from_links_batch_bot(bot, targets: List[str], mins: int, template_id: int) -> bool:
@@ -938,7 +834,6 @@ _unique_preserve function     96 bot_create_watch.py def _unique_preserve(items:
 _unique_preserve function    105 app/bot/handlers/create_watch.py def _unique_preserve(items: List[str]) -> List[str]:
 _update_maps     function    250 app/plugins/monitor_links.py async def _update_maps(res: Dict[str, Any]):
 _views_worker    function    259 app/plugins/posts_watch_listener.py async def _views_worker():
-_worker          function    259 app/services/join_scheduler.py async def _worker(idx: int):
 account          variable     88 app/services/models.py account = Column(Text, nullable=False)
 acquire          member      124 app/services/requested_reconciler.py async def acquire(self, key: str):
 active_watches_group_router unknown       5 app/bot/handlers/__init__.py from app.bot.handlers.active_watches_group import router as active_watches_group_router
@@ -979,7 +874,6 @@ bulk_defer_session_requested function    405 app/services/requested_reconciler_d
 bump_cooldown    function    109 app/services/account_pool.py def bump_cooldown(client: TelegramClient, seconds: int) -> None:
 busy             variable     50 app/services/account_pool.py busy: bool = False
 cancel_group_watches function    173 app/bot/services/active_watches_service.py def cancel_group_watches(leader_wid: int) -> bool:
-cancel_post      function    103 app/services/feature/seed_post_db.py def cancel_post(row_id: int) -> bool:
 cancel_watch     function    420 app/services/posts_watch_result_db.py def cancel_watch(watch_id: int) -> None:
 channel_id       variable     68 app/services/requested_reconciler_db.py channel_id: Mapped[int] = mapped_column(Integer, nullable=False)
 channel_id       variable     87 app/services/models.py channel_id = Column(Integer, nullable=False)
@@ -991,14 +885,9 @@ cleanup_expired  function     59 app/services/db/bad_invites.py def cleanup_expi
 clear            function    422 app/services/requested_reconciler_db.py def clear(session: str, channel_id: int) -> None:
 clear_invite     function    325 app/services/requested_reconciler_db.py def clear_invite(session: str, invite_hash: str) -> None:
 client           variable     15 app/telethon_client.py client = TelegramClient(SESSION, API_ID, API_HASH, connection=ConnectionTcpAbridged)
-client           variable     68 app/services/feature/seed_creator.py client: Optional[TelegramClient] = None
-cmd_help         function     61 app/services/feature/channel_seed.py async def cmd_help(event):
 cmd_off          function    413 app/plugins/monitor_links.py async def cmd_off(ev):
 cmd_on           function    391 app/plugins/monitor_links.py async def cmd_on(ev):
-cmd_seed_channels function     98 app/services/feature/channel_seed.py async def cmd_seed_channels(event):
-cmd_seed_links   function     67 app/services/feature/channel_seed.py async def cmd_seed_links(event):
 cmd_status       function    380 app/plugins/monitor_links.py async def cmd_status(ev):
-collapse_ws      function     26 app/utils/text_norm.py def collapse_ws(s: str) -> str:
 collect_links    function    188 app/utils/link_parser.py async def collect_links(evt) -> List[str]:
 configure_logging function    102 app/logging_json.py def configure_logging(force_json: Optional[bool] = None,
 confirm          variable     12 app/bot/states.py confirm = State()
@@ -1008,9 +897,6 @@ confirm_no       function    440 app/bot/handlers/create_watch.py async def conf
 confirm_yes      function    366 app/bot/handlers1.py async def confirm_yes(cb: CallbackQuery, state: FSMContext):
 confirm_yes      function    386 bot_create_watch.py async def confirm_yes(cb: CallbackQuery, state: FSMContext):
 confirm_yes      function    446 app/bot/handlers/create_watch.py async def confirm_yes(cb: CallbackQuery, state: FSMContext):
-consume_one      member       80 app/services/join_scheduler.py def consume_one(self):
-create_batch     function    203 app/services/feature/seed_creator.py async def create_batch(count: int, mix: Optional[Dict[str, int]] = None, title_prefix: str = "SEED") -> List[Dict[str, Any]]:
-create_channel   function    126 app/services/feature/seed_creator.py async def create_channel(title: str, kind: str = "private_open") -> Dict[str, Any]:
 create_or_get_daily_sheet variable     39 app/plugins/monitor_watch.py create_or_get_daily_sheet = append_daily_row = None # type: ignore
 create_watch     function    155 app/services/posts_watch_result_db.py def create_watch(
 create_watch_router unknown       3 app/bot/handlers/__init__.py from app.bot.handlers.create_watch import router as create_watch_router
@@ -1021,15 +907,11 @@ display_name     function      4 app/flows/batch_links/common.py def display_nam
 done             variable     24 app/plugins/progress_live.py done: int = 0
 due_invites      function    246 app/services/requested_reconciler_db.py def due_invites(sessions: Sequence[str], limit: int) -> List[InviteCheck]:
 due_requested    function    364 app/services/requested_reconciler_db.py def due_requested(sessions: Sequence[str], per_account: int, limit: int) -> List[RequestedCheck]:
-due_to_delete    function     73 app/services/feature/seed_post_db.py def due_to_delete(limit: int = 50) -> List[Dict[str, Any]]:
-due_to_post      function     53 app/services/feature/seed_post_db.py def due_to_post(limit: int = 50) -> List[Dict[str, Any]]:
 edit_watch_time_window function    390 app/bot/handlers/active_watches_group.py async def edit_watch_time_window(m: Message, state: FSMContext):
 edit_watch_time_window._try_int_local function    412 app/bot/handlers/active_watches_group.py def _try_int_local(s: str) -> Optional[int]:
 end              function     77 app/services/owner_conflict_guard.py def end(owner: str, source_ref: str, action: str, result: str) -> None:
 engine           variable     80 app/services/requested_reconciler_db.py engine = create_engine(
 enqueue          function     97 app/services/link_queue.py def enqueue(
-enqueue_join     function    443 app/services/join_scheduler.py async def enqueue_join(channel_id: int, invite_or_username: Optional[str], source_url: Optional[str]):
-ensure_client    function     71 app/services/feature/seed_creator.py async def ensure_client():
 ensure_daily_sheet function     45 app/services/gsheets.py def ensure_daily_sheet(title: str, headers: Optional[List[str]] = None):
 ensure_daily_sheet function    306 app/services/gsheets_writer.py def ensure_daily_sheet(sheet_title: str) -> bool:
 ensure_join      function    121 app/services/joiner.py async def ensure_join(client, url: str):
@@ -1045,7 +927,6 @@ fetch_due        function    137 app/services/link_queue.py def fetch_due(limit:
 fetch_rows       function     41 app/services/googlesheets/export_channels_table.py def fetch_rows(db_path: str, sql_path: str) -> List[List[Any]]:
 fetch_unsent_events function    281 app/services/posts_watch_result_db.py def fetch_unsent_events(limit: int = 100) -> List[Tuple[int, int, str, str, str]]:
 find_active_duplicate function    584 app/services/posts_watch_result_db.py def find_active_duplicate(
-find_by_username function     57 app/services/feature/seed_db.py def find_by_username(username: str) -> Optional[Dict[str, Any]]:
 find_channel     function    240 app/services/channel_db.py def find_channel(channel_id: int) -> Optional[Dict[str, Any]]:
 find_matched_by_message function    374 app/services/posts_watch_result_db.py def find_matched_by_message(channel_id: int, message_id: int) -> list[int]:
 find_slot_by_session_name function     80 app/services/account_pool.py def find_slot_by_session_name(name: str) -> Optional[ClientSlot]:
@@ -1054,8 +935,6 @@ finish_batch     function    170 app/services/monitor_links_bridge.py def finish
 finish_processing function     10 app/bot/user_state.py def finish_processing(uid: int):
 flood            variable     29 app/plugins/progress_live.py flood: int = 0
 flush_now        function    414 app/services/gsheets_buffer.py def flush_now() -> None:
-fmt_result_line  function     20 app/utils/formatting.py def fmt_result_line(idx: int, url: str, status: str, who: str | None = None, extra: str | None = None) -> str:
-fmt_summary      function     35 app/utils/formatting.py def fmt_summary(results: Iterable[str]) -> str:
 fmt_tw_end_human function     28 app/bot/utils/active_watches_formatters.py def fmt_tw_end_human(s: Optional[str]) -> str:
 footer           variable     32 app/plugins/progress_live.py footer: str = "" # optional summary
 force_mark_matched function    500 app/services/posts_watch_result_db.py def force_mark_matched(
@@ -1100,9 +979,7 @@ gspread          variable     19 app/services/gsheets_writer.py gspread = None #
 gw               unknown      10 app/services/gsheets_buffer.py from app.services import gsheets_writer as gw
 handler          function    186 app/debug/debug_post_diff_interactive.py async def handler(evt: events.NewMessage.Event):
 help_cmd         function     34 app/plugins/help_and_ping.py async def help_cmd(event):
-init             function     31 app/services/feature/seed_db.py def init():
 init             function     32 app/services/post_watch_db.py def init(db_path: Optional[str] = None):
-init             function     35 app/services/feature/seed_post_db.py def init():
 init             function     45 app/services/channel_db.py def init() -> None:
 init             function     49 app/services/owner_conflict_guard.py def init() -> None:
 init             function     52 app/services/link_queue.py def init(db_path: Optional[str] = None):
@@ -1140,14 +1017,11 @@ join_channels_router unknown       6 app/bot/handlers/__init__.py from app.bot.h
 join_owner_input function    360 app/bot/handlers/join_channels.py async def join_owner_input(m: Message, state: FSMContext):
 join_owner_input._delayed_monitor_off function    389 app/bot/handlers/join_channels.py async def _delayed_monitor_off():
 join_set_owner   function    334 app/bot/handlers/join_channels.py async def join_set_owner(cb: CallbackQuery, state: FSMContext):
-join_status      function    500 app/services/join_scheduler.py def join_status() -> Dict[str, int]:
-last_created     function     49 app/services/feature/seed_db.py def last_created(n: int = 10) -> List[Dict[str, Any]]:
 lease            function    215 app/services/account_pool.py async def lease() -> Optional[asyncio.AbstractAsyncContextManager]:
 list_active_channels function    463 app/services/posts_watch_result_db.py def list_active_channels() -> List[int]:
 list_active_watches function      7 app/bot/services/watches_repo.py def list_active_watches(user_id: int) -> List[Tuple[Any, Any, Any, Any, Any, Any]]:
 list_due_coverage function    478 app/services/posts_watch_result_db.py def list_due_coverage(now_ts: Optional[str] = None) -> List[Tuple[int, int, int, Optional[str]]]:
 list_due_pending_expire function    563 app/services/posts_watch_result_db.py def list_due_pending_expire(now_ts: Optional[str] = None) -> List[int]:
-list_recent      function     96 app/services/feature/seed_post_db.py def list_recent(n: int = 20) -> List[Dict[str, Any]]:
 list_session_names function     97 app/services/account_pool.py def list_session_names() -> List[str]:
 list_templates   function    105 app/services/post_watch_db.py def list_templates(limit: int = 50) -> List[Tuple[int, str, str, float, int]]:
 list_templates_full function    117 app/services/post_watch_db.py def list_templates_full(limit: int = 50) -> List[Tuple[int, str, str, float, int, Optional[str], Optional[str]]]:
@@ -1180,7 +1054,6 @@ log              variable     13 app/telethon_client.py log = logging.getLogger(
 log              variable     14 app/services/googlesheets/export_channels_table.py log = logging.getLogger("channels_table")
 log              variable     14 app/services/posts_watch_result_db.py log = logging.getLogger("services.posts_watch_result_db")
 log              variable     15 app/bot/handlers/active_watches_menu.py log = logging.getLogger("bot_active_watches.menu")
-log              variable     15 app/services/join_scheduler.py log = get_logger("join_scheduler")
 log              variable     16 app/services/requested_reconciler_db.py log = logging.getLogger("services.requested_reconciler.db")
 log              variable     17 app/services/account_pool.py log = logging.getLogger("services.account_pool")
 log              variable     18 app/bot/handlers/join_channels.py log = logging.getLogger("bot_join_channels")
@@ -1191,17 +1064,13 @@ log              variable     20 bot_create_watch.py log = logging.getLogger("bo
 log              variable     21 app/bot/handlers/create_watch.py log = logging.getLogger("bot_create_watch")
 log              variable     21 app/services/joiner.py log = logging.getLogger("services.joiner")
 log              variable     22 app/flows/batch_links/queue_worker.py log = logging.getLogger("flow.batch_links.worker")
-log              variable     22 app/services/feature/seed.py log = logging.getLogger("seed_cli")
 log              variable     22 app/services/requested_reconciler.py log = logging.getLogger("services.requested_reconciler")
-log              variable     23 app/services/feature/channel_seed.py log = get_logger("plugin.channel_seed")
-log              variable     26 app/services/feature/seed_posts.py log = logging.getLogger("seed_posts")
 log              variable     26 app/services/models.py log = logging.getLogger("services.models")
 log              variable     43 app/plugins/monitor_watch.py log = get_logger("plugin.monitor_watch")
 log              variable     45 app/flows/batch_links/process_links.py log = logging.getLogger("flow.batch_links.process")
 log              variable     46 app/bot/handlers/active_watches_group.py log = logging.getLogger("bot_active_watches.group")
 log              variable     47 app/plugins/posts_watch_listener.py log = get_logger("plugin.posts_watch_listener")
 log              variable     53 app/plugins/monitor_links.py log = logging.getLogger("monitor_links")
-log              variable     55 app/services/feature/seed_creator.py log = logging.getLogger("seed_creator")
 lq_enqueue       unknown      34 app/flows/batch_links/process_links.py from app.services.link_queue import enqueue as lq_enqueue
 lq_fetch_due     unknown      13 app/flows/batch_links/queue_worker.py fetch_due as lq_fetch_due, mark_processing as lq_mark_processing,
 lq_init          unknown       9 app/plugins/batch_links.py from app.services.link_queue import init as lq_init
@@ -1211,7 +1080,6 @@ lq_mark_processing unknown      13 app/flows/batch_links/queue_worker.py fetch_d
 main             function      8 safe_apply_patch.py def main():
 main             function     31 app/debug/test_normalize_html_links_tony_bet.py def main():
 main             function     71 apply_anchored_patch.py def main():
-main             function    129 app/services/feature/seed.py def main():
 main             function    169 app/debug/debug_post_diff_interactive.py async def main():
 main.handler     function    186 app/debug/debug_post_diff_interactive.py async def handler(evt: events.NewMessage.Event):
 main_client      unknown      12 app/plugins/monitor_watch.py from app.telethon_client import client as main_client # базовий клієнт
@@ -1220,18 +1088,15 @@ manual_match_watch_from_message function    172 app/bot/services/edit_watch_serv
 map_invite_get   function    207 app/services/membership_db.py def map_invite_get(invite_or_hash: str) -> Tuple[Optional[int], Optional[str]]:
 map_invite_set   function    178 app/services/membership_db.py def map_invite_set(invite_or_hash: str, channel_id: Optional[int], title: Optional[str] = None) -> None:
 mark_bad         function     23 app/services/db/bad_invites.py def mark_bad(invite_hash: str, ttl_seconds: int = 43200, reason: str = "") -> None:
-mark_deleted     function     84 app/services/feature/seed_post_db.py def mark_deleted(row_id: int):
 mark_done        function    163 app/services/link_queue.py def mark_done(item_id: int):
 mark_done_deleted function    358 app/services/posts_watch_result_db.py def mark_done_deleted(watch_id: int) -> None:
 mark_done_views  function    342 app/services/posts_watch_result_db.py def mark_done_views(watch_id: int, final_views: Optional[int]) -> None:
 mark_event_sent  function    302 app/services/posts_watch_result_db.py def mark_event_sent(event_id: int, sent_to: int) -> None:
 mark_expired     function    390 app/services/posts_watch_result_db.py def mark_expired(watch_id: int) -> None:
-mark_failed      function     90 app/services/feature/seed_post_db.py def mark_failed(row_id: int):
 mark_failed      function    168 app/services/link_queue.py def mark_failed(item_id: int, error: str, backoff_sec: int, max_retries: int = 5):
 mark_flood       function    118 app/services/account_pool.py def mark_flood(client: TelegramClient, seconds: int) -> None:
 mark_limit       function    127 app/services/account_pool.py def mark_limit(client_or_slot: Union[TelegramClient, ClientSlot], days: int = 2) -> None:
 mark_matched     function    317 app/services/posts_watch_result_db.py def mark_matched(
-mark_posted      function     64 app/services/feature/seed_post_db.py def mark_posted(row_id: int, message_id: int):
 mark_processing  function    158 app/services/link_queue.py def mark_processing(item_id: int):
 mark_unmatched_after_edit function    402 app/services/posts_watch_result_db.py def mark_unmatched_after_edit(watch_id: int) -> None:
 memb_init        unknown       8 app/plugins/batch_links.py from app.services.membership_db import init as memb_init
@@ -1250,7 +1115,6 @@ mon_start        function     31 app/plugins/metrics_watch.py async def mon_star
 mon_status       function     21 app/plugins/metrics_watch.py async def mon_status(event):
 msk_now          function      6 app/services/time_utils.py def msk_now() -> datetime:
 msk_timestamp    function     10 app/services/time_utils.py def msk_timestamp() -> int:
-need_wait_seconds_for_one member       72 app/services/join_scheduler.py def need_wait_seconds_for_one(self) -> float:
 needle_clear     function     10 app/plugins/needle_reply.py async def needle_clear(event):
 needle_from_reply function     22 app/plugins/needle_reply.py async def needle_from_reply(event):
 needle_show      function     15 app/plugins/needle_reply.py async def needle_show(event):
@@ -1260,8 +1124,6 @@ next_check_at    variable    176 app/services/models.py next_check_at = Column(I
 next_check_at    variable    210 app/services/models.py next_check_at = Column(Integer, nullable=False)
 next_ready       variable     49 app/services/account_pool.py next_ready: float = 0.0 # unix-ts, коли клієнт знову доступний
 normalize        function     53 app/utils/link_parser.py def normalize(url: str) -> str:
-normalize_soft   function     23 app/utils/text_norm.py def normalize_soft(s: str) -> str:
-normalize_strict function     12 app/utils/text_norm.py def normalize_strict(s: str) -> str:
 normalize_target_link function     12 app/bot/services/channels_repo.py def normalize_target_link(target: str) -> str:
 normalize_text   function      3 app/services/post_match.py def normalize_text(s: str) -> str:
 normalize_text   function     18 app/services/post_matcher.py def normalize_text(s: Optional[str]) -> str:
@@ -1273,7 +1135,6 @@ noted_at         variable     54 app/services/requested_reconciler_db.py noted_a
 noted_at         variable     69 app/services/requested_reconciler_db.py noted_at: Mapped[int] = mapped_column(Integer, nullable=False, default=lambda: int(time.time()))
 noted_at         variable    175 app/services/models.py noted_at = Column(Integer, nullable=False)
 noted_at         variable    209 app/services/models.py noted_at = Column(Integer, nullable=False)
-notice           function      5 app/utils/notices.py async def notice(client, control_peer: str | int = CONTROL_PEER, text: str = ""):
 notifier_loop    function     71 app/bot/notifier.py async def notifier_loop(bot: Bot, tick_sec: float = 5.0):
 ok               variable     25 app/plugins/progress_live.py ok: int = 0 # joined
 orm_init_db      unknown      15 main.py          from app.services.models import init_db as orm_init_db
@@ -1287,8 +1148,6 @@ pdb              unknown     211 app/bot/handlers1.py from app.services import p
 pdb              unknown     255 app/bot/handlers/create_watch.py from app.services import post_watch_db as pdb
 pick_order       member       67 app/flows/batch_links/process_links.py def pick_order(self, slots: List[Any]) -> List[Any]:
 ping_cmd         function     38 app/plugins/help_and_ping.py async def ping_cmd(event):
-post_to_channels function    100 app/services/feature/seed_posts.py async def post_to_channels(
-post_to_channels._post_one function    126 app/services/feature/seed_posts.py async def _post_one(ent, link_repr: str):
 posts_result_init unknown      17 main.py          from app.services.posts_watch_result_db import init as posts_result_init
 postwatch_init   unknown      10 main.py          from app.services.post_watch_db import init as postwatch_init
 probe_channel_id function     64 app/services/joiner.py async def probe_channel_id(client, url: str):
@@ -1302,7 +1161,6 @@ read_col_I       function    339 app/services/gsheets_writer.py def read_col_I(s
 read_text        function      3 apply_anchored_patch.py def read_text(p):
 recent_channels  function    283 app/services/channel_db.py def recent_channels(limit: int = 30) -> List[Tuple]:
 recent_links     function    267 app/services/channel_db.py def recent_links(limit: int = 30) -> List[Tuple]:
-record_channel   function     38 app/services/feature/seed_db.py def record_channel(peer_id: str, title: str, kind: str, username: Optional[str], invite_link: Optional[str], notes: Optional[str] = None):
 record_deleted   function    313 app/services/gsheets_buffer.py def record_deleted(watch_id: int, when_str: str | None = None) -> bool:
 record_edited_other_post function    357 app/services/gsheets_buffer.py def record_edited_other_post(watch_id: int, when_str: str | None = None) -> bool:
 record_expired   function    329 app/services/gsheets_buffer.py def record_expired(watch_id: int) -> bool:
@@ -1315,7 +1173,6 @@ reqdb            unknown      14 main.py          from app.services import reque
 reqdb            unknown      17 app/flows/batch_links/queue_worker.py from app.services import requested_reconciler_db as reqdb
 reqdb            unknown      38 app/flows/batch_links/process_links.py from app.services import requested_reconciler_db as reqdb
 requested        variable     26 app/plugins/progress_live.py requested: int = 0 # requested (окремо від already)
-resolve_channels function     48 app/services/feature/seed_posts.py async def resolve_channels(links: List[str]) -> List[Any]:
 resolve_cid_by_target function     27 app/bot/services/channels_repo.py def resolve_cid_by_target(target: str) -> Optional[int]:
 router           variable      8 app/bot/handlers/__init__.py router = Router()
 router           variable     14 app/bot/handlers/active_watches_menu.py router = Router()
@@ -1328,10 +1185,8 @@ run              function      4 safe_apply_patch.py def run(cmd):
 run_bot          function     12 app/bot/run.py   async def run_bot():
 run_link_queue_worker function     57 app/flows/batch_links/queue_worker.py async def run_link_queue_worker(client):
 run_requested_reconciler function    288 app/services/requested_reconciler.py async def run_requested_reconciler() -> None:
-sanitize_link    function      5 app/utils/tg_links.py def sanitize_link(u: str) -> str:
-schedule_post    function     41 app/services/feature/seed_post_db.py def schedule_post(peer_id: str, text: str, post_at: int, delete_at: Optional[int]) -> int:
+sanitize_link    function     75 app/utils/link_parser.py def sanitize_link(u: str) -> str:
 search_channels_by_username function    300 app/services/channel_db.py def search_channels_by_username(substring: str, limit: int = 30) -> List[Tuple]:
-send_links       function    171 app/services/feature/seed_creator.py async def send_links(target: str, links: List[str]):
 session          variable     53 app/services/requested_reconciler_db.py session: Mapped[str] = mapped_column(String, nullable=False)
 session          variable     67 app/services/requested_reconciler_db.py session: Mapped[str] = mapped_column(String, nullable=False)
 session          variable    173 app/services/models.py session = Column(Text, nullable=False)
@@ -1345,14 +1200,12 @@ set_footer       member       72 app/plugins/progress_live.py def set_footer(sel
 set_invite_owner function    351 app/services/channel_db.py def set_invite_owner(invite_hash: str, owner_display: Optional[str], owner_username: Optional[str]) -> None:
 set_processing   function     15 app/bot/processing_guard.py def set_processing(user_id: int, flag: bool, msg_id: int | None = None) -> None:
 set_watch_status_pending function     32 app/bot/services/edit_watch_service.py def set_watch_status_pending(wid: int) -> bool:
-settings         variable     33 app/services/feature/seed_creator.py settings = _S()
 setup            function      4 app/plugins/needle_reply.py def setup(client, control_peer, monitor_buffer):
 setup            function      5 app/plugins/metrics_watch.py def setup(client, control_peer, monitor_buffer):
 setup            function      8 app/plugins/owner_set.py def setup(client, control_peer=None, monitor_buffer=None, **kwargs):
 setup            function     10 app/plugins/resolve_channel.py def setup(control_peer=None, monitor_buffer=None, **kwargs):
 setup            function     20 app/plugins/batch_links.py def setup(client, control_peer=None, monitor_buffer=None, **kwargs):
 setup            function     27 app/plugins/help_and_ping.py def setup(client, control_peer, monitor_buffer):
-setup            function     54 app/services/feature/channel_seed.py def setup(client=None, control_peer=None, monitor_buffer=None):
 setup            function    154 app/plugins/channel_info.py def setup(client, control_peer=None, **kwargs):
 setup            function    156 app/plugins/monitor_watch.py def setup(*, client=None, control_peer=None, monitor_buffer=None):
 setup            function    269 app/plugins/post_templates.py def setup(client, control_peer=None, **kwargs):
@@ -1375,14 +1228,9 @@ setup._on_owner_freeform function    119 app/plugins/owner_set.py async def _on_
 setup._on_owner_set function     48 app/plugins/owner_set.py async def _on_owner_set(event):
 setup._owner_skip function     97 app/plugins/batch_links.py async def _owner_skip(evt):
 setup._parse_owner_freeform function     23 app/plugins/owner_set.py def _parse_owner_freeform(raw: str):
-setup._resend_last_bg function     78 app/services/feature/channel_seed.py async def _resend_last_bg(n: int):
-setup._seed_channels_bg function    105 app/services/feature/channel_seed.py async def _seed_channels_bg(args: Dict[str, str]):
 setup._status    function     71 app/plugins/batch_links.py async def _status(evt):
-setup.cmd_help   function     61 app/services/feature/channel_seed.py async def cmd_help(event):
 setup.cmd_off    function    413 app/plugins/monitor_links.py async def cmd_off(ev):
 setup.cmd_on     function    391 app/plugins/monitor_links.py async def cmd_on(ev):
-setup.cmd_seed_channels function     98 app/services/feature/channel_seed.py async def cmd_seed_channels(event):
-setup.cmd_seed_links function     67 app/services/feature/channel_seed.py async def cmd_seed_links(event):
 setup.cmd_status function    380 app/plugins/monitor_links.py async def cmd_status(ev):
 setup.help_cmd   function     34 app/plugins/help_and_ping.py async def help_cmd(event):
 setup.intake     function    423 app/plugins/monitor_links.py async def intake(ev):
@@ -1393,11 +1241,9 @@ setup.needle_clear function     10 app/plugins/needle_reply.py async def needle_
 setup.needle_from_reply function     22 app/plugins/needle_reply.py async def needle_from_reply(event):
 setup.needle_show function     15 app/plugins/needle_reply.py async def needle_show(event):
 setup.ping_cmd   function     38 app/plugins/help_and_ping.py async def ping_cmd(event):
-setup_join_scheduler function    412 app/services/join_scheduler.py async def setup_join_scheduler(sessions: List[Any]):
 setup_logging    function     34 main.py          def setup_logging():
 sheet_title_from_time_window_start function    366 app/services/gsheets_writer.py def sheet_title_from_time_window_start(tws: str | None) -> str:
 short_title      function     34 app/bot/utils/active_watches_formatters.py def short_title(title: Optional[Any], tid: Optional[int]) -> str:
-snapshot         function    506 app/services/join_scheduler.py def snapshot() -> Dict[str, Any]:
 source_input     variable     16 app/bot/states.py source_input = State()
 start            member       41 app/plugins/progress_live.py async def start(self) -> None:
 start_channels_exporter function     40 app/services/googlesheets/channels_export_service.py def start_channels_exporter() -> Optional[asyncio.Task]:
@@ -1424,7 +1270,6 @@ step_time_window function    381 app/bot/handlers/create_watch.py async def step
 stop_channels_exporter function     64 app/services/googlesheets/channels_export_service.py async def stop_channels_exporter() -> None:
 stop_flusher     function    404 app/services/gsheets_buffer.py def stop_flusher() -> None:
 stop_pool        function    184 app/services/account_pool.py async def stop_pool() -> None:
-strip_invisible  function      5 app/utils/text_norm.py def strip_invisible(s: str) -> str:
 template_pick    variable     10 app/bot/states.py template_pick = State()
 templates_kb     function     28 app/bot/keyboards.py def templates_kb(templates):
 tg_types         unknown       7 app/utils/link_parser.py from telethon.tl import types as tg_types
@@ -1446,7 +1291,6 @@ ts               variable    152 app/services/models.py ts = Column(Integer, nul
 ttypes           unknown       6 app/plugins/batch_links.py from telethon.tl import types as ttypes # для перевірки entities/markup
 ttypes           unknown       7 app/flows/batch_links/process_links.py from telethon.tl import types as ttypes # для читання MessageEntityTextUrl
 ttypes           unknown       7 app/plugins/post_templates.py from telethon.tl import types as ttypes
-update_cap       member       58 app/services/join_scheduler.py def update_cap(self, new_cap: int, window_sec: int):
 update_progress  function    106 app/services/monitor_links_bridge.py async def update_progress(control_msg_id: int, text: str) -> None:
 update_watch_source_url function     98 app/bot/services/edit_watch_service.py def update_watch_source_url(wid: int, url: str) -> bool:
 update_watch_time_window function     60 app/bot/services/edit_watch_service.py def update_watch_time_window(

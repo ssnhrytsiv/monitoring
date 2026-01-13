@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from sqlalchemy import Column, Integer, String, Text, PrimaryKeyConstraint, Index, UniqueConstraint
 
-from app.notificator_bot.db import Base, _engine
+from app.admin_bot.db.session import Base, engine
 
 log = logging.getLogger("notificator.models")
 
@@ -65,7 +65,7 @@ class NotifierMessage(Base):
 
 def ensure_tables() -> None:
     """Створюємо таблиці, якщо ще нема."""
-    Base.metadata.create_all(bind=_engine, tables=[NotifierState.__table__, NotifierMessage.__table__])
+    Base.metadata.create_all(bind=engine, tables=[NotifierState.__table__, NotifierMessage.__table__])
     log.debug("notifier_state/notifier_messages tables ensured")
 
 

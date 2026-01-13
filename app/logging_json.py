@@ -139,6 +139,11 @@ def configure_logging(force_json: Optional[bool] = None,
     if level == logging.DEBUG:
         logging.getLogger("telethon").setLevel(logging.INFO)
 
+    # Опційний детальний лог для DAO/SQL (вмикається через змінну середовища LOG_DAO_DEBUG=1)
+    if _env_bool("LOG_DAO_DEBUG", False):
+        logging.getLogger("app.DAL").setLevel(logging.DEBUG)
+        logging.getLogger("sqlalchemy.engine").setLevel(logging.DEBUG)
+
     return decided_json
 
 def get_logger(name: str, **context) -> StructuredAdapter:

@@ -4,6 +4,7 @@ import os
 import time
 import json
 import logging
+import threading
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -47,6 +48,8 @@ _SH_CACHE: Dict[str, Any] = {}
 _WS_CACHE: Dict[str, Dict[str, Any]] = {}
 _SHEETS_WITH_HEADER: set[Tuple[str, str]] = set()
 _SHARE_ATTEMPTED: set[str] = set()
+_REFRESH_THREAD = None
+_REFRESH_STOP = None
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 GSHEET_DRIVE_ID = os.getenv("GSHEET_DRIVE_ID")
@@ -61,6 +64,65 @@ def _print_err(msg: str, exc: Exception | None = None):
     else:
         print(f"gsheets_writer ERROR: {msg}")
         log.error(msg)
+
+
+def _refresh_loop():
+    """
+    Підтримує access token у token.json свіжим, викликаючи refresh кожен інтервал.
+    Працює тільки якщо є OAuth token file і refresh_token.
+    """
+    global _REFRESH_STOP
+    token_path = os.getenv("GSHEET_OAUTH_TOKEN_FILE", "token.json")
+    interval = int(os.getenv("GSHEET_REFRESH_INTERVAL_SEC", "3600"))
+    if interval < 300:
+        interval = 300
+
+    def _tick():
+        from google.oauth2.credentials import Credentials  # type: ignore
+        try:
+            creds = Credentials.from_authorized_user_file(token_path, scopes=[
+                "https://www.googleapis.com/auth/drive",
+                "https://www.googleapis.com/auth/drive.file",
+                "https://www.googleapis.com/auth/spreadsheets",
+            ])
+        except Exception:
+            return
+        if not getattr(creds, "refresh_token", None):
+            return
+        try:
+            if Request is None:
+                return
+            creds.refresh(Request())
+            with open(token_path, "w", encoding="utf-8") as f:
+                f.write(creds.to_json())
+            log.debug("gsheets: token refreshed in background; new expiry=%s", getattr(creds, "expiry", None))
+        except Exception:
+            pass
+
+    while _REFRESH_STOP and not _REFRESH_STOP.is_set():
+        _tick()
+        _REFRESH_STOP.wait(interval)
+
+
+def _start_refresh_loop():
+    """
+    Стартує фоновий рефреш токена, якщо дозволено через GSHEET_REFRESH_LOOP=1.
+    """
+    global _REFRESH_THREAD, _REFRESH_STOP
+    if os.getenv("GSHEET_REFRESH_LOOP", "0") not in {"1", "true", "yes", "on"}:
+        return
+    if _REFRESH_THREAD and _REFRESH_THREAD.is_alive():
+        return
+    _REFRESH_STOP = threading.Event()
+
+    def _runner():
+        try:
+            _refresh_loop()
+        finally:
+            log.debug("gsheets: refresh loop stopped")
+
+    _REFRESH_THREAD = threading.Thread(target=_runner, name="gsheets-refresh-loop", daemon=True)
+    _REFRESH_THREAD.start()
 
 
 def _client(service_only: bool = False):
@@ -524,6 +586,10 @@ def ensure_daily_sheet(sheet_title: str, spreadsheet_id: Optional[str] = None) -
         return False
     ws = _get_or_create_worksheet(sh, sheet_title, spreadsheet_id)
     return ws is not None
+
+
+# Опційний фоновий рефреш токена, щоб не запускати окрему команду
+_start_refresh_loop()
 
 
 def append_rows(sheet_title: str, rows: List[List[str]], spreadsheet_id: Optional[str] = None) -> None:

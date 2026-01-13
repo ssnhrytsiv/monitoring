@@ -28,9 +28,10 @@ from app.services.account_pool import (
     session_name,
     leave_channels,
 )
-from app.services import channel_db
 from app.config import API_ID, API_HASH
 from telethon import TelegramClient
+from app.admin_bot.db.session import SessionLocal
+from app.admin_bot.db import models as m
 
 DEFAULT_SESSIONS = [
     "tg_session.session",
@@ -40,10 +41,11 @@ DEFAULT_SESSIONS = [
 
 
 def _known_channel_ids() -> Set[int]:
-    conn = channel_db.raw_connection()
-    cur = conn.execute("SELECT channel_id FROM channels WHERE channel_id IS NOT NULL")
-    ids = {int(r[0]) for r in cur.fetchall() if r and r[0] is not None}
-    return ids
+    db = SessionLocal()
+    try:
+        return {int(cid) for cid, in db.query(m.Channel.id).filter(m.Channel.id.isnot(None)).all()}
+    finally:
+        db.close()
 
 
 async def _actual_channel_ids(client) -> Set[int]:
@@ -100,7 +102,6 @@ async def main():
     if target_session:
         target_session = target_session.strip()
 
-    channel_db.init()
     known = _known_channel_ids()
     print(f"Known channels in DB: {len(known)}")
 
@@ -148,12 +149,15 @@ def _report_missing_in_sessions(known: Set[int], actual_all: Set[int]) -> None:
         print("All known channels are present in sessions.")
         return
     print(f"Channels present in DB but not in sessions: {len(missing)}")
-    conn = channel_db.raw_connection()
-    rows = conn.execute(
-        "SELECT channel_id, title, owner_display, owner_username FROM channels WHERE channel_id IN (%s)" %
-        ",".join("?" * len(missing)),
-        tuple(missing),
-    ).fetchall()
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(m.Channel.id, m.Channel.title, m.Channel.owner_display, m.Channel.owner_username)
+            .filter(m.Channel.id.in_(missing))
+            .all()
+        )
+    finally:
+        db.close()
     for cid, title, od, ou in rows:
         owner = od or (f"@{ou}" if ou else "—")
         print(f"cid={cid} title={title or '—'} owner={owner}")

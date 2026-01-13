@@ -2,7 +2,7 @@ from typing import Optional, List, Dict
 import re
 import logging
 
-from app.notificator_bot.db.posts_watch_result_db import raw_connection
+from app.DAL import channels_operations as channels_db
 
 log = logging.getLogger("channels_repo")
 
@@ -37,167 +37,55 @@ def resolve_cid_by_target(target: str) -> Optional[int]:
 
     s = normalize_target_link(s0)
 
-    m = _USER_RE.search(s)
-    if m:
-        username = m.group(1)
+    match_username = _USER_RE.search(s)
+    if match_username:
+        username = match_username.group(1)
         try:
-            conn = raw_connection()
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT channel_id FROM channels WHERE lower(username)=lower(?) LIMIT 1",
-                (username,),
-            )
-            r = cur.fetchone()
-            if r and r[0] is not None:
-                return int(r[0])
+            cid = channels_db.get_channel_id_by_username(username)
+            if cid:
+                return cid
         except Exception as e:
-            log.exception(f"resolve_cid username lookup failed: {e}")
+            log.exception("resolve_cid username lookup failed: %s", e)
 
-    im = _INV_RE.search(s)
-    if im:
-        ih = im.group(1)
+    match_invite = _INV_RE.search(s)
+    if match_invite:
+        invite_hash = match_invite.group(1)
         try:
-            conn = raw_connection()
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT channel_id FROM invite_map WHERE invite_hash=? LIMIT 1",
-                (ih,),
-            )
-            r = cur.fetchone()
-            if r and r[0] is not None:
-                return int(r[0])
+            cid = channels_db.get_channel_id_by_invite_hash(invite_hash)
+            if cid:
+                return cid
         except Exception as e:
-            log.exception(f"resolve_cid invite_map lookup failed: {e}")
+            log.exception("resolve_cid invite_map lookup failed: %s", e)
 
     try:
-        conn = raw_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT channel_id FROM channel_links WHERE link_url_norm=? LIMIT 1",
-            (s,),
-        )
-        r = cur.fetchone()
-        if r and r[0] is not None:
-            return int(r[0])
+        cid = channels_db.get_channel_id_by_url(s)
+        if cid:
+            return cid
     except Exception as e:
-        log.exception(f"resolve_cid channel_links lookup failed: {e}")
+        log.exception("resolve_cid channel_links lookup failed: %s", e)
 
     return None
 
 def get_links_by_channel_ids(cids: List[int]) -> Dict[int, str]:
-    ids = [int(x) for x in cids or [] if x]
-    if not ids:
-        return {}
-
-    mp: Dict[int, str] = {}
     try:
-        conn = raw_connection()
-        cur = conn.cursor()
-        qmarks = ",".join("?" for _ in ids)
-
-        cur.execute(
-            f"""
-            SELECT channel_id, username
-            FROM channels
-            WHERE channel_id IN ({qmarks})
-            """,
-            ids,
-        )
-        for cid, username in cur.fetchall():
-            cid_i = int(cid)
-            if username:
-                mp[cid_i] = f"https://t.me/{str(username).lstrip('@')}"
-
-        cur.execute(
-            f"""
-            SELECT channel_id, invite_hash
-            FROM invite_map
-            WHERE channel_id IN ({qmarks})
-            """,
-            ids,
-        )
-        for cid, invite_hash in cur.fetchall():
-            cid_i = int(cid)
-            if cid_i not in mp and invite_hash:
-                mp[cid_i] = f"https://t.me/+{invite_hash}"
-
-        cur.execute(
-            f"""
-            SELECT channel_id, link_url_norm
-            FROM channel_links
-            WHERE channel_id IN ({qmarks})
-            """,
-            ids,
-        )
-        for cid, link_url_norm in cur.fetchall():
-            cid_i = int(cid)
-            if cid_i not in mp and link_url_norm:
-                mp[cid_i] = str(link_url_norm)
-
+        return channels_db.get_links_by_channel_ids(cids)
     except Exception as e:
-        log.exception(f"get_links_by_channel_ids failed: {e}")
-
-    return {cid: link for cid, link in mp.items() if link}
+        log.exception("get_links_by_channel_ids failed: %s", e)
+        return {}
 
 def get_owners_by_channel_ids(cids: List[int]) -> Dict[int, str]:
-    ids = [int(x) for x in cids or [] if x]
-    if not ids:
-        return {}
-
-    mp: Dict[int, str] = {}
     try:
-        conn = raw_connection()
-        cur = conn.cursor()
-        qmarks = ",".join("?" for _ in ids)
-        cur.execute(
-            f"""
-            SELECT channel_id, owner_display
-            FROM channels
-            WHERE channel_id IN ({qmarks})
-            """,
-            ids,
-        )
-        for cid, owner in cur.fetchall():
-            if cid is None:
-                continue
-            cid_i = int(cid)
-            o = str(owner).strip() if owner is not None else ""
-            if o:
-                mp[cid_i] = o
+        return channels_db.get_owners_by_channel_ids(cids)
     except Exception as e:
-        log.exception(f"get_owners_by_channel_ids failed: {e}")
-
-    return mp
+        log.exception("get_owners_by_channel_ids failed: %s", e)
+        return {}
 
 def get_titles_by_channel_ids(cids: List[int]) -> Dict[int, str]:
     """
     Повертає map channel_id -> title (Telegram-назва каналу) з таблиці channels.
     """
-    ids = [int(x) for x in cids or [] if x]
-    if not ids:
-        return {}
-
-    mp: Dict[int, str] = {}
     try:
-        conn = raw_connection()
-        cur = conn.cursor()
-        qmarks = ",".join("?" for _ in ids)
-        cur.execute(
-            f"""
-            SELECT channel_id, title
-            FROM channels
-            WHERE channel_id IN ({qmarks})
-            """,
-            ids,
-        )
-        for cid, title in cur.fetchall():
-            if cid is None:
-                continue
-            cid_i = int(cid)
-            t = str(title).strip() if title is not None else ""
-            if t:
-                mp[cid_i] = t
+        return channels_db.get_titles_by_channel_ids(cids)
     except Exception as e:
-        log.exception(f"get_titles_by_channel_ids failed: {e}")
-
-    return mp
+        log.exception("get_titles_by_channel_ids failed: %s", e)
+        return {}

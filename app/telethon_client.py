@@ -8,23 +8,11 @@ import re
 from telethon import TelegramClient
 from app.config import API_ID, API_HASH, SESSION, CONTROL_PEER, PLUGINS_PACKAGE
 from telethon.network.connection import ConnectionTcpAbridged
-from app.settings import MONITOR_LINKS_V2  # ← прапор V2
 
 log = logging.getLogger("telethon_client")
 
 client = TelegramClient(SESSION, API_ID, API_HASH, connection=ConnectionTcpAbridged)
 client.parse_mode = "html"
-
-# Плагіни, які мають працювати лише в контрольному чаті
-STRICT_CONTROLLED_PLUGINS = {
-    "batch_links",
-    "monitor_links",
-    "owner_set",
-    "help_and_ping",
-    "resolve_channel",
-    "channel_info",
-    "monitor_watch",
-}
 
 # Shared state
 MONITOR_BUFFER = SimpleNamespace(
@@ -91,17 +79,10 @@ async def load_plugins():
             continue
         discovered.append(name)
 
-    # ---- V1/V2 взаємовиключення -----------------------------------------
-    filtered = []
-    for name in discovered:
-        if MONITOR_LINKS_V2 and name == "batch_links":
-            log.debug("Filtered out legacy plugin due to MONITOR_LINKS_V2=1: %s", name)
-            continue
-        if not MONITOR_LINKS_V2 and name == "monitor_links":
-            log.debug("Filtered out V2 plugin due to MONITOR_LINKS_V2=0: %s", name)
-            continue
-        filtered.append(name)
+    filtered = discovered
 
+    # Якщо немає CONTROL_PEER — пропускаємо строго контрольовані плагіни (якщо будуть)
+    STRICT_CONTROLLED_PLUGINS: set[str] = set()
     if control_id is None:
         filtered_strict = [n for n in filtered if n not in STRICT_CONTROLLED_PLUGINS]
         skipped = [n for n in filtered if n in STRICT_CONTROLLED_PLUGINS]
@@ -128,3 +109,6 @@ async def load_plugins():
                 log.debug("Module %s has no setup() – skipped", full)
         except Exception as e:
             log.exception("Failed to load plugin %s: %s", full, e)
+
+
+

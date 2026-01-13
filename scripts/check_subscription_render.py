@@ -3,9 +3,9 @@
 Запуск: python scripts/check_subscription_render.py
 """
 
-from admin_bot.services.subscription.subscription_status import render_html_with_statuses
-from admin_bot.services.report import build_full_footer
-from admin_bot.services.subscription.subscription_menu import split_text_for_telegram
+from app.admin_bot.services.subscription.subscription_status import render_html_with_statuses
+from app.admin_bot.services.report import build_full_footer
+from app.admin_bot.services.subscription.subscription_menu import split_text_for_telegram
 
 
 def demo_success():

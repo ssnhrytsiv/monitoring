@@ -2,74 +2,72 @@ from __future__ import annotations
 
 import os
 import tempfile
+from sqlalchemy import select
 
-from app.notificator_bot.db import posts_watch_result_db as db
+from app.admin_bot.db.session import Base, engine, SessionLocal
+from app.admin_bot.db import models as m
+from app.notificator_bot.db import posts_watch_result_models as pwm
+from app.DAL import watch_posts_operations as watch_posts_db
+from app.DAL import watch_processing_operations as watch_proc_db
+from app.DAL import watch_candidates_operations as watch_cand_db
+from app.DAL import watch_events_operations as watch_events_db
+
+
+def _ensure_temp_db():
+    if not os.environ.get("SQLALCHEMY_DATABASE_URL"):
+        fd, path = tempfile.mkstemp(prefix="watch_candidates_test", suffix=".sqlite3")
+        os.close(fd)
+        os.environ["SQLALCHEMY_DATABASE_URL"] = f"sqlite:///{path}"
 
 
 def _setup_db():
-    # Використовуємо окремий тимчасовий файл БД для тестів
-    if not os.environ.get("POSTS_WATCH_RESULT_DB_PATH"):
-        fd, path = tempfile.mkstemp(prefix="watch_candidates_test", suffix=".sqlite3")
-        os.close(fd)
-        os.environ["POSTS_WATCH_RESULT_DB_PATH"] = path
-    db.init()
-    conn = db.raw_connection()
-    cur = conn.cursor()
-    for table in ["watch_events", "watch_candidates", "watch_posts", "watch_groups"]:
-        cur.execute(f"DELETE FROM {table}")
-    conn.commit()
-    conn.close()
+    _ensure_temp_db()
+    # Перестворюємо всі таблиці для чистого старту
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+    pwm.init_schema()
 
 
 def _get_watch_status(wid: int):
-    conn = db.raw_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT status, matched_message_id FROM watch_posts WHERE id=?",
-        (wid,),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row if row else (None, None)
+    with SessionLocal() as db:
+        row = db.execute(
+            select(m.WatchPost.status, m.WatchPost.matched_message_id).where(m.WatchPost.id == wid).limit(1)
+        ).first()
+        if not row:
+            return None, None
+        return row[0], row[1]
 
 
 def _get_candidate_status(cid: int):
-    cand = db.get_watch_candidate(cid)
+    cand = watch_cand_db.get_watch_candidate(cid)
     return cand.get("status") if cand else None
 
 
 def _expire_candidate(cid: int):
-    conn = db.raw_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE watch_candidates SET expires_at='2000-01-01 00:00:00' WHERE id=?",
-        (cid,),
-    )
-    conn.commit()
-    conn.close()
+    with SessionLocal() as db:
+        db.execute(
+            m.WatchCandidate.__table__.update().where(m.WatchCandidate.id == cid).values(expires_at="2000-01-01 00:00:00")
+        )
+        db.commit()
 
 
 def _count_events(wid: int, ev_type: str) -> int:
-    conn = db.raw_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT COUNT(*) FROM watch_events WHERE watch_id=? AND event_type=?",
-        (wid, ev_type),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return int(row[0] or 0) if row else 0
+    with SessionLocal() as db:
+        row = db.execute(
+            pwm.select(m.WatchEvent.id).where(m.WatchEvent.watch_id == wid, m.WatchEvent.event_type == ev_type)
+        ).all()
+        return len(row)
 
 
 def test_candidate_accept_matches_multiple_with_same_text_hash():
     _setup_db()
     # Створюємо два вотчі
-    wid1 = db.create_watch(channel_id=111)
-    wid2 = db.create_watch(channel_id=222)
+    wid1 = watch_posts_db.create_watch(channel_id=111)
+    wid2 = watch_posts_db.create_watch(channel_id=222)
 
     text = "Test post content"
     # Додаємо два кандидати з однаковим текстом/хешем
-    cid1 = db.insert_watch_candidate(
+    cid1 = watch_proc_db.insert_watch_candidate(
         watch_id=wid1,
         channel_id=111,
         message_id=5,
@@ -77,7 +75,7 @@ def test_candidate_accept_matches_multiple_with_same_text_hash():
         message_text=text,
         ttl_days=1.0,
     )
-    cid2 = db.insert_watch_candidate(
+    cid2 = watch_proc_db.insert_watch_candidate(
         watch_id=wid2,
         channel_id=222,
         message_id=6,
@@ -87,7 +85,7 @@ def test_candidate_accept_matches_multiple_with_same_text_hash():
     )
 
     # Приймаємо перший — має заметчити обидва завдяки однаковому text_hash
-    ok = db.accept_watch_candidate(cid1)
+    ok = watch_cand_db.accept_watch_candidate(cid1)
     assert ok is True
 
     # Обидва кандидати мають бути accepted
@@ -107,8 +105,8 @@ def test_candidate_accept_matches_multiple_with_same_text_hash():
 
 def test_list_and_get_candidate_fields():
     _setup_db()
-    wid = db.create_watch(channel_id=333)
-    cid = db.insert_watch_candidate(
+    wid = watch_posts_db.create_watch(channel_id=333)
+    cid = watch_proc_db.insert_watch_candidate(
         watch_id=wid,
         channel_id=333,
         message_id=10,
@@ -116,7 +114,7 @@ def test_list_and_get_candidate_fields():
         message_text="Hello world",
         ttl_days=1.0,
     )
-    items = db.list_watch_candidates(wid)
+    items = watch_cand_db.list_watch_candidates(wid)
     assert len(items) == 1
     item = items[0]
     assert item["id"] == cid
@@ -126,7 +124,7 @@ def test_list_and_get_candidate_fields():
     assert item["similarity"] == 0.75
     assert item["text_hash"]  # має бути заповнений
 
-    cand = db.get_watch_candidate(cid)
+    cand = watch_cand_db.get_watch_candidate(cid)
     assert cand is not None
     assert cand["id"] == cid
     assert cand["watch_id"] == wid
@@ -135,8 +133,8 @@ def test_list_and_get_candidate_fields():
 
 def test_reject_and_not_pending_accept():
     _setup_db()
-    wid = db.create_watch(channel_id=444)
-    cid = db.insert_watch_candidate(
+    wid = watch_posts_db.create_watch(channel_id=444)
+    cid = watch_proc_db.insert_watch_candidate(
         watch_id=wid,
         channel_id=444,
         message_id=11,
@@ -145,18 +143,18 @@ def test_reject_and_not_pending_accept():
         ttl_days=1.0,
     )
     # Відхиляємо
-    db.set_watch_candidate_status(cid, "rejected")
+    watch_cand_db.set_watch_candidate_status(cid, "rejected")
     assert _get_candidate_status(cid) == "rejected"
     # Прийняття повинно повернути False, статус не змінюється
-    ok = db.accept_watch_candidate(cid)
+    ok = watch_cand_db.accept_watch_candidate(cid)
     assert ok is False
     assert _get_candidate_status(cid) == "rejected"
 
 
 def test_list_candidates_filters_expired():
     _setup_db()
-    wid = db.create_watch(channel_id=555)
-    cid_active = db.insert_watch_candidate(
+    wid = watch_posts_db.create_watch(channel_id=555)
+    cid_active = watch_proc_db.insert_watch_candidate(
         watch_id=wid,
         channel_id=555,
         message_id=12,
@@ -164,7 +162,7 @@ def test_list_candidates_filters_expired():
         message_text="Active",
         ttl_days=1.0,
     )
-    cid_expired = db.insert_watch_candidate(
+    cid_expired = watch_proc_db.insert_watch_candidate(
         watch_id=wid,
         channel_id=555,
         message_id=13,
@@ -174,7 +172,7 @@ def test_list_candidates_filters_expired():
     )
     _expire_candidate(cid_expired)
 
-    cands = db.list_watch_candidates(wid)
+    cands = watch_cand_db.list_watch_candidates(wid)
     ids = {c["id"] for c in cands}
     assert cid_active in ids
     assert cid_expired not in ids
