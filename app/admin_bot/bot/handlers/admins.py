@@ -156,7 +156,8 @@ async def cb_dedup_sessions(cb: CallbackQuery):
     for cid, sess_list in cid_map.items():
         if len(sess_list) <= 1:
             continue
-        keep = sorted(s for s, _ in sess_list)[0]
+        # Залишаємо сесію з кінця відсортованого списку, а решту відписуємо.
+        keep = sorted(s for s, _ in sess_list)[-1]
         keep_map[cid] = keep
         title_map[cid] = sess_list[0][1] or ""
         for sess, _ in sess_list:
