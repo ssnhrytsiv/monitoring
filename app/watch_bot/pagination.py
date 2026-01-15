@@ -14,7 +14,7 @@ class _Session:
         self.pages = pages
         self.user_id = user_id
         self.created_at = time.time()
-        self.labels = labels or []
+        self.labels = labels  or []
 
 
 _STORE: Dict[str, _Session] = {}
