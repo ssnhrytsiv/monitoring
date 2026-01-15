@@ -4,7 +4,6 @@ import threading
 import time
 from typing import Dict, List, Tuple, Any, Optional
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from app.utils.link_parser import extract_bot_username
 from app.sheet_bot.services import gsheets_writer as gw
@@ -14,8 +13,8 @@ from app.DAL import sheet_projects_operations as spo
 from app.DAL import watch_posts_operations as watch_posts_db
 from app.DAL import channels_operations as channels_db
 import logging
+from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now
 
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 log = logging.getLogger("sheet_bot.gsheets_buffer")
 
 TARGET_FLUSH_SEC = 15.0
@@ -42,7 +41,7 @@ def set_flush_interval(seconds: float) -> None:
 
 
 def _human(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return dt.strftime(MOSCOW_TIME_FORMAT)
 
 
 def _only_time(ts: str | None) -> str:
@@ -160,7 +159,7 @@ def _links_text_from_json(links_json: str | None) -> str:
 
 
 def _edited_other_value(when_str: str | None) -> str:
-    t = _only_time(when_str or _human(datetime.now(MOSCOW_TZ)))
+    t = _only_time(when_str or _human(moscow_now()))
     return f"Відредаговано, інший пост ({t})"
 
 
@@ -199,7 +198,7 @@ def _build_row_for_matched(wid: int) -> Tuple[str, List[str], Optional[str]]:
     ch_title, owner_display = _resolve_title_and_owner(wc["channel_id"], wc.get("source_url"))
     t_title = _db_get_template_title(wc.get("template_id"))
     links_text = _links_text_from_json(wc.get("expected_links_json"))
-    posted_at = wc.get("matched_at") or _human(datetime.now(MOSCOW_TZ))
+    posted_at = wc.get("matched_at") or _human(moscow_now())
     posted_time = _only_time(posted_at)
     source_url = wc.get("source_url") or ""
     sheet_title_override, ssid_override = _select_sheet_for_watch(wc)
@@ -361,7 +360,7 @@ def record_deleted(watch_id: int, when_str: str | None = None) -> bool:
     sheet_title_override, ssid_override = _select_sheet_for_watch(wc)
     sheet_title = sheet_title_override or date_str
     key = _mk_key(sheet_title, ssid_override)
-    when = when_str or wc.get("deleted_at") or _human(datetime.now(MOSCOW_TZ))
+    when = when_str or wc.get("deleted_at") or _human(moscow_now())
     if not _dedup_ttl_key(key, watch_id, "deleted"):
         return True
     with _buf_lock:

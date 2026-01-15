@@ -1,7 +1,6 @@
 from typing import Optional
 import logging
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 import os
 
 from telethon.tl.types import Message as TgMessage  # тип пересланого поста
@@ -14,11 +13,10 @@ from app.DAL.watch_posts_operations import (
     update_watch_source_url,
 )
 from app.services.account_pool import is_already_subscribed
+from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now
 from app import config
 
 log = logging.getLogger("active_watches.edit_service")
-
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 SHEETS_OK = False
 try:
@@ -57,8 +55,8 @@ def _calc_coverage_at(hours_after: float | None = None) -> Optional[str]:
     if not config.WATCH_VIEWS_ENABLED:
         return None
     hrs = hours_after if hours_after is not None else DEFAULT_COVERAGE_HOURS
-    now_msq = datetime.now(MOSCOW_TZ)
-    return (now_msq + timedelta(hours=hrs)).strftime("%Y-%m-%d %H:%M:%S")
+    now_msq = moscow_now()
+    return (now_msq + timedelta(hours=hrs)).strftime(MOSCOW_TIME_FORMAT)
 
 
 from aiogram.types import Message as AiogramMessage

@@ -7,9 +7,9 @@ import logging
 import threading
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from app.config import GSHEET_SPREADSHEET_ID, GSHEET_CREDS_FILE
+from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now
 
 log = logging.getLogger("services.gsheets_writer_transport")
 
@@ -51,7 +51,6 @@ _SHARE_ATTEMPTED: set[str] = set()
 _REFRESH_THREAD = None
 _REFRESH_STOP = None
 
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 GSHEET_DRIVE_ID = os.getenv("GSHEET_DRIVE_ID")
 GSHEET_PREFER_SA = os.getenv("GSHEET_PREFER_SA", "1") == "1"
 _SA_EMAIL: Optional[str] = None
@@ -651,4 +650,4 @@ def sheet_title_from_time_window_start(tws: str | None) -> str:
             return dt.strftime("%Y-%m-%d")
         except Exception:
             pass
-    return datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d")
+    return moscow_now().strftime("%Y-%m-%d")

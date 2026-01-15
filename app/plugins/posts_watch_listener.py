@@ -5,7 +5,6 @@ import logging
 import os
 from datetime import datetime, timedelta
 from typing import Callable, Optional, Dict, Any
-from zoneinfo import ZoneInfo
 import re
 from difflib import SequenceMatcher
 import json
@@ -23,6 +22,7 @@ from app.DAL import watch_processing_operations as watch_proc_db
 from app.DAL import watch_candidates_operations as watch_candidates_db
 from app.services.html_match import exact_html_equal
 from app.services.account_pool import iter_pool_clients, session_name
+from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now
 from app.services.post_matcher import normalize_text, extract_links_norm
 from app.admin_bot.db import models as m
 from app.admin_bot.db.session import SessionLocal
@@ -45,7 +45,6 @@ except Exception:
 log = get_logger("plugin.posts_watch_listener")
 _pylog = logging.getLogger("plugin.posts_watch_listener")
 
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 COVERAGE_POLL_TICK_SEC = 30
 
 _GLOBAL_DELETED_SEEN: Dict[int, float] = {}
@@ -53,6 +52,7 @@ GLOBAL_DELETED_TTL = 180.0
 _GLOBAL_CANDIDATE_SEEN: Dict[tuple[int, int], float] = {}
 CANDIDATE_SEEN_TTL = 24 * 60 * 60  # 1 доба
 CANDIDATE_SIM_THRESHOLD = 0.70
+NEAR_IDENTICAL_TEXT_THRESHOLD = 0.99
 
 
 def _now_monotonic() -> float:
@@ -60,7 +60,7 @@ def _now_monotonic() -> float:
 
 
 def _human(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return dt.strftime(MOSCOW_TIME_FORMAT)
 
 
 def _read_default_coverage_hours() -> float:
@@ -84,7 +84,7 @@ def _calc_coverage_at(hours_after: float | None = None) -> Optional[str]:
     if not config.WATCH_VIEWS_ENABLED:
         return None
     hrs = hours_after if hours_after is not None else DEFAULT_COVERAGE_HOURS
-    now_msq = datetime.now(MOSCOW_TZ)
+    now_msq = moscow_now()
     return _human(now_msq + timedelta(hours=hrs))
 
 
@@ -201,7 +201,9 @@ def _normalize_html_full(html_text: str) -> str:
     Розширена нормалізація HTML для вотчів:
       - застосовує _normalize_html_links (розкриває <a>, приводить &amp; -> &);
       - декодує HTML-ентіті (&quot; -> ", &nbsp; -> пробіл, ...);
-      - трохи чистить пробіли.
+      - прибирає службові символи/zero-width/variation selectors;
+      - конвертує <br>/<p> у переводи рядків;
+      - трохи чистить пробіли/переводи рядків.
 
     Це якраз фіксить кейси типу:
       <i>&quot;Бывший коллега</i> ...
@@ -211,16 +213,29 @@ def _normalize_html_full(html_text: str) -> str:
     if not html_text:
         return ""
 
+    # 0) нормалізуємо переводи рядків
+    html_text = html_text.replace("\r\n", "\n")
+
     # 1) твоя існуюча нормалізація лінків
     s = _normalize_html_links(html_text)
 
     # 2) декодуємо HTML-ентіті (&quot; -> ", &nbsp; -> пробіл, &amp; -> &, ...)
     s = _html_mod.unescape(s)
 
-    # 3) легка нормалізація пробілів
-    # прибираємо подвоєні/троєні пробіли
-    s = re.sub(r"\s{2,}", " ", s)
-    # обрізаємо зайві пробіли по краях
+    # 3) перетворюємо <br>/<p> у переводи рядків, щоб зрівняти рендери
+    s = re.sub(r"<\s*br\s*/?>", "\n", s, flags=re.IGNORECASE)
+    s = re.sub(r"</\s*p\s*>", "\n", s, flags=re.IGNORECASE)
+    s = re.sub(r"<\s*p\s*>", "", s, flags=re.IGNORECASE)
+
+    # 4) прибираємо невидимі/службові символи (zero-width, variation selectors, BOM)
+    s = re.sub(r"[\u200b\u200c\u200d\uFEFF\uFE0F]", "", s)
+
+    # 5) &nbsp; → пробіл (ще раз, якщо лишилось після unescape)
+    s = s.replace("\xa0", " ")
+
+    # 6) легка нормалізація пробілів/переводів рядків
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
     s = s.strip()
 
     return s
@@ -433,7 +448,7 @@ async def _pending_expire_worker():
 
 
 def _mark_done_edited_other(wid: int) -> str:
-    now_str = _human(datetime.now(MOSCOW_TZ))
+    now_str = _human(moscow_now())
     try:
         db = SessionLocal()
         try:
@@ -496,7 +511,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
         if not pending:
             return
 
-        _pylog.info("listen: found %s pending watches for cid=%s", len(pending), cid)
+        _pylog.info("listen: found %s pending watches for cid=%s mid=%s sess=%s", len(pending), cid, mid, tag)
 
         try:
             msg_html = _HTML_RENDER(m) if _HTML_RENDER else (getattr(m, "message", "") or "")
@@ -511,8 +526,18 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             expected_html = row.get("expected_text_hash")
             expected_links_json = row.get("expected_links_json")
             if not expected_html:
-                _pylog.info("listen: wid=%s has no expected_html, skip", wid)
+                _pylog.warning("listen: wid=%s cid=%s mid=%s has no expected_html, skip", wid, cid, mid)
                 continue
+            _pylog.debug(
+                "listen: match_start wid=%s cid=%s mid=%s exp_len=%s links=%s tw=(%s,%s)",
+                wid,
+                cid,
+                mid,
+                len(expected_html or ""),
+                expected_links_json,
+                row.get("time_window_start"),
+                row.get("time_window_end"),
+            )
             msg_html_norm = msg_html
             expected_html_norm = expected_html
             ratio = 0.0
@@ -525,23 +550,67 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 msg_html_norm = _normalize_html_full(msg_html)
                 expected_html_norm = _normalize_html_full(expected_html)
                 ok = exact_html_equal(msg_html_norm, expected_html_norm)
+                if not ok:
+                    # Фолбек: якщо текст без тегів однаковий — теж вважаємо exact
+                    try:
+                        msg_plain_norm = _strip_tags_to_text(msg_html_norm)
+                        expected_plain_norm = _strip_tags_to_text(expected_html_norm)
+                        if msg_plain_norm == expected_plain_norm:
+                            ok = True
+                    except Exception:
+                        pass
             except Exception:
                 _pylog.exception("listen: exact_html_equal failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                 ok = False
-            log.debug(
-                "similar_check: wid=%s cid=%s mid=%s ok=%s ratio=%.3f ratio_text=%.3f",
+            if ok:
+                _pylog.info(
+                    "listen: exact_match wid=%s cid=%s mid=%s sess=%s exp_len=%s msg_len=%s",
+                    wid,
+                    cid,
+                    mid,
+                    tag,
+                    len(expected_html_norm or ""),
+                    len(msg_html_norm or ""),
+                )
+            _pylog.debug(
+                "similar_check: wid=%s cid=%s mid=%s ok=%s exp_len=%s msg_len=%s",
                 wid,
                 cid,
                 mid,
                 ok,
-                ratio,
-                ratio_text,
+                len(expected_html_norm or ""),
+                len(msg_html_norm or ""),
             )
 
             if not ok:
+                try:
+                    exp_links_dbg = _collect_links_from_html(expected_html_norm)
+                except Exception:
+                    exp_links_dbg = []
+                try:
+                    msg_links_dbg = _collect_links_from_html(msg_html_norm)
+                except Exception:
+                    msg_links_dbg = []
+                try:
+                    msg_plain = _strip_tags_to_text(msg_html_norm)
+                    expected_plain = _strip_tags_to_text(expected_html_norm)
+                except Exception:
+                    msg_plain = msg_html_norm
+                    expected_plain = expected_html_norm
+                _pylog.debug(
+                    "listen: no_exact wid=%s cid=%s mid=%s exp_links=%s msg_links=%s "
+                    "exp_snip=%r msg_snip=%r plain_exp_snip=%r plain_msg_snip=%r",
+                    wid,
+                    cid,
+                    mid,
+                    exp_links_dbg,
+                    msg_links_dbg,
+                    (expected_html_norm or "")[:120],
+                    (msg_html_norm or "")[:120],
+                    (expected_plain or "")[:120],
+                    (msg_plain or "")[:120],
+                )
                 # Фаззі-перевірка схожості (якщо дуже схоже, додаємо в кандидати)
-                msg_plain = ""
-                expected_plain = ""
                 try:
                     ratio = SequenceMatcher(None, msg_html_norm, expected_html_norm).ratio()
                 except Exception:
@@ -555,11 +624,18 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                     ratio_text = 0.0
 
                 if ratio >= CANDIDATE_SIM_THRESHOLD or ratio_text >= CANDIDATE_SIM_THRESHOLD:
+                    _pylog.debug(
+                        "listen: fuzzy_candidate wid=%s cid=%s mid=%s ratio=%.3f ratio_text=%.3f",
+                        wid,
+                        cid,
+                        mid,
+                        ratio,
+                        ratio_text,
+                    )
                     # якщо лінки не збігаються — відправляємо у foreign
                     exp_links = _collect_links_from_html(expected_html_norm)
                     if not exp_links and expected_links_json:
                         try:
-                            import json
                             data = json.loads(expected_links_json)
                             if isinstance(data, list):
                                 exp_links = [str(x) for x in data if x]
@@ -573,15 +649,56 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                     elif not exp_links and cand_links:
                         # якщо очікуваних лінків немає, а у фактичному повідомленні вони є — теж вважаємо mismatch
                         links_mismatch = True
-                    log.debug(
-                        "links_compare: wid=%s cid=%s mid=%s exp=%d msg=%d mismatch=%s",
+                    _pylog.debug(
+                        "links_compare: wid=%s cid=%s mid=%s exp=%d msg=%d mismatch=%s exp_raw=%s msg_raw=%s",
                         wid,
                         cid,
                         mid,
                         len(exp_links),
                         len(cand_links),
                         links_mismatch,
+                        exp_links,
+                        cand_links,
                     )
+
+                    if not links_mismatch and ratio_text >= NEAR_IDENTICAL_TEXT_THRESHOLD:
+                        coverage_at = _calc_coverage_at()
+                        matched_session = tag
+                        matched_ok = True
+                        try:
+                            watch_proc_db.mark_matched(wid, mid, coverage_at, matched_session=matched_session)
+                            watch_events_db.insert_watch_event(
+                                wid,
+                                "matched",
+                                json.dumps(
+                                    {
+                                        "watch_id": wid,
+                                        "channel_id": cid,
+                                        "message_id": mid,
+                                        "session": matched_session,
+                                        "via": "near_identical",
+                                        "ratio_text": ratio_text,
+                                    }
+                                ),
+                            )
+                        except Exception:
+                            matched_ok = False
+                        if matched_ok:
+                            matched_any = True
+                            log.info(
+                                "similar: wid=%s cid=%s mid=%s ratio_text=%.3f -> matched (near_identical, sess=%s)",
+                                wid,
+                                cid,
+                                mid,
+                                ratio_text,
+                                matched_session,
+                            )
+                            if SHEETS_OK and gsheets_buffer:
+                                try:
+                                    gsheets_buffer.record_matched(wid)
+                                except Exception:
+                                    _pylog.exception("gsheets_buffer.record_matched failed (wid=%s)", wid)
+                            continue
 
                     if links_mismatch:
                         try:
@@ -595,6 +712,22 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                                 ttl_days=1.0,
                                 status="foreign",
                             )
+                            try:
+                                watch_events_db.insert_watch_event(
+                                    wid,
+                                    "foreign",
+                                    json.dumps(
+                                        {
+                                            "watch_id": wid,
+                                            "channel_id": cid,
+                                            "message_id": mid,
+                                            "similarity": ratio,
+                                            "reason": "links_mismatch",
+                                        }
+                                    ),
+                                )
+                            except Exception:
+                                _pylog.exception("similar: insert foreign event failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                             log.info("similar: wid=%s cid=%s mid=%s ratio=%.3f -> foreign (links mismatch)", wid, cid, mid, ratio)
                         except Exception:
                             _pylog.exception("similar: insert foreign candidate failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
@@ -617,9 +750,35 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                                 text_hash=text_hash,
                                 ttl_days=1.0,
                             )
+                            try:
+                                watch_events_db.insert_watch_event(
+                                    wid,
+                                    "candidate",
+                                    json.dumps(
+                                        {
+                                            "watch_id": wid,
+                                            "channel_id": cid,
+                                            "message_id": mid,
+                                            "similarity": ratio,
+                                            "text_hash": text_hash,
+                                        }
+                                    ),
+                                )
+                            except Exception:
+                                _pylog.exception("similar: insert candidate event failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                             log.info("similar: wid=%s cid=%s mid=%s ratio=%.3f -> candidate", wid, cid, mid, ratio)
                         except Exception:
                             _pylog.exception("similar: insert_watch_candidate failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
+                else:
+                    _pylog.info(
+                        "listen: no_match wid=%s cid=%s mid=%s sess=%s ratio=%.3f ratio_text=%.3f reason=ratio_low",
+                        wid,
+                        cid,
+                        mid,
+                        tag,
+                        ratio,
+                        ratio_text,
+                    )
                 continue
 
             # exact match пройшов — фіксуємо matched
@@ -841,3 +1000,10 @@ def setup(client=None, control_peer=None, monitor_buffer=None, **_):
 
     loop.create_task(_pending_expire_worker(), name="posts_watch_expire_pending")
     log.info("posts_watch_listener: pending-expire worker scheduled")
+
+    try:
+        missing = watch_proc_db.list_pending_without_expected(limit=50)
+        if missing:
+            _pylog.warning("health-check: pending watches without expected_html: count=%s sample=%s", len(missing), missing[:10])
+    except Exception:
+        _pylog.exception("health-check: list_pending_without_expected failed")

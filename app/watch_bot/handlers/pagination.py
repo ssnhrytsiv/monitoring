@@ -4,8 +4,8 @@ from aiogram import F, Router
 from aiogram.types import CallbackQuery
 from aiogram.exceptions import TelegramBadRequest
 
-from app.bot import pagination as pager
-from app.bot.keyboards import main_menu_kb
+from app.watch_bot import pagination as pager
+from app.watch_bot.keyboards import main_menu_kb
 
 router = Router()
 

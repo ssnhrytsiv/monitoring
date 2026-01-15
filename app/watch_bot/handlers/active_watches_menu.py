@@ -6,9 +6,9 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 
-from app.bot.keyboards import main_menu_kb
-from app.bot.services.templates_repo import load_templates_map
-from app.bot.services.channels_repo import get_owners_by_channel_ids
+from app.watch_bot.keyboards import main_menu_kb
+from app.watch_bot.services.templates_repo import load_templates_map
+from app.watch_bot.services.channels_repo import get_owners_by_channel_ids
 from app.DAL.watch_posts_operations import list_active_watches, group_active
 
 router = Router()

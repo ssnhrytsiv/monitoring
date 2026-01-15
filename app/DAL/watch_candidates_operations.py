@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta
 import json
 
 from sqlalchemy import func, select, update
@@ -11,12 +10,16 @@ from app.admin_bot.db.session import SessionLocal
 from app.admin_bot.db import models as m
 from app.DAL.watch_processing_operations import mark_matched as process_mark_matched
 from app.DAL.watch_events_operations import insert_watch_event
-
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+from app.utils.time_utils import (
+    MOSCOW_TIME_FORMAT,
+    ensure_moscow_timezone,
+    moscow_now,
+    moscow_now_str,
+)
 
 
 def _now_str() -> str:
-    return datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return moscow_now_str()
 
 
 def list_watch_candidates(watch_id: int, status: str = "pending") -> List[Dict[str, Any]]:
@@ -201,12 +204,27 @@ def set_watch_candidate_status(candidate_id: int, status: str) -> bool:
         db.close()
 
 
-def accept_watch_candidate(candidate_id: int, matched_session: Optional[str] = None) -> bool:
+def accept_watch_candidate(
+    candidate_id: int,
+    matched_session: Optional[str] = None,
+    coverage_hours: Optional[float] = None,
+) -> bool:
     cand = get_watch_candidate(candidate_id)
     if not cand or cand.get("status") != "pending":
         return False
     text_hash = cand.get("text_hash") or ""
     candidates = list_candidates_by_hash(text_hash) if text_hash else [cand]
+
+    def _coverage_at_from_created(created_at: Optional[str]) -> str:
+        if coverage_hours is None:
+            return _now_str()
+        try:
+            dt = datetime.fromisoformat(str(created_at)) if created_at else moscow_now()
+            dt = ensure_moscow_timezone(dt)
+            dt = dt + timedelta(hours=float(coverage_hours))
+            return dt.strftime(MOSCOW_TIME_FORMAT)
+        except Exception:
+            return _now_str()
 
     any_ok = False
     for c in candidates:
@@ -216,7 +234,7 @@ def accept_watch_candidate(candidate_id: int, matched_session: Optional[str] = N
         cid = c.get("id")
         if not watch_id or not message_id:
             continue
-        coverage_at = _now_str()
+        coverage_at = _coverage_at_from_created(c.get("created_at"))
         try:
             process_mark_matched(
                 int(watch_id),

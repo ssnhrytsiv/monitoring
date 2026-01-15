@@ -277,13 +277,19 @@ async def process_batch(
         db_lookup.close()
 
     # Оцінка часу: лише для тих, що потребують мережі
-    eta_sec = cnt_invite_need * LINK_DELAY_INVITE_MAX + cnt_public_need * LINK_DELAY_PUBLIC_MAX
+    cooldown_extra_sec = 30  # додатковий кулдаун між пакетами
+    eta_sec = (
+        cnt_invite_need * LINK_DELAY_INVITE_MAX
+        + cnt_public_need * LINK_DELAY_PUBLIC_MAX
+        + cooldown_extra_sec
+    )
     eta_min = math.ceil(eta_sec / 60) if (cnt_invite_need + cnt_public_need) > 0 else 0
     try:
         await reply_msg.answer(
             f"Орієнтовний час підписки: ~{eta_min} хв "
             f"(інвайтів: {cnt_invite_need} x {LINK_DELAY_INVITE_MAX:.0f}s, "
-            f"публічних: {cnt_public_need} x {LINK_DELAY_PUBLIC_MAX:.0f}s)."
+            f"публічних: {cnt_public_need} x {LINK_DELAY_PUBLIC_MAX:.0f}s, "
+            f"кулдаун: +{cooldown_extra_sec}s)."
         )
     except Exception:
         pass

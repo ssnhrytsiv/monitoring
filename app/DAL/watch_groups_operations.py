@@ -7,6 +7,7 @@ from sqlalchemy import exists, select, update
 
 from app.admin_bot.db import models as m
 from app.admin_bot.db.session import SessionLocal
+from app.utils.time_utils import ensure_moscow_timezone, moscow_now
 
 
 def list_groups_for_admin(admin_id: int, network_ids: Optional[List[int]] = None) -> List[Dict]:
@@ -48,7 +49,7 @@ def list_groups_for_admin(admin_id: int, network_ids: Optional[List[int]] = None
 
 def sum_actual_price_for_network(net_id: int, days: int = 30) -> float:
     try:
-        cutoff = datetime.now() - timedelta(days=days)
+        cutoff = moscow_now() - timedelta(days=days)
     except Exception:
         return 0.0
     total = 0.0
@@ -61,7 +62,7 @@ def sum_actual_price_for_network(net_id: int, days: int = 30) -> float:
         ).all()
         for price, created_at in rows:
             try:
-                if created_at and datetime.fromisoformat(str(created_at)) < cutoff:
+                if created_at and ensure_moscow_timezone(datetime.fromisoformat(str(created_at))) < cutoff:
                     continue
             except Exception:
                 pass
@@ -77,7 +78,7 @@ def sum_actual_price_for_network(net_id: int, days: int = 30) -> float:
 
 def sum_subscribers_for_network(net_id: int, days: int = 30) -> int:
     try:
-        cutoff = datetime.now() - timedelta(days=days)
+        cutoff = moscow_now() - timedelta(days=days)
     except Exception:
         return 0
     total = 0
@@ -90,7 +91,7 @@ def sum_subscribers_for_network(net_id: int, days: int = 30) -> int:
         ).all()
         for subs, created_at in rows:
             try:
-                if created_at and datetime.fromisoformat(str(created_at)) < cutoff:
+                if created_at and ensure_moscow_timezone(datetime.fromisoformat(str(created_at))) < cutoff:
                     continue
             except Exception:
                 pass

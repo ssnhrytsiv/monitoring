@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select, update, distinct, and_
 
@@ -11,12 +10,11 @@ from app.admin_bot.db import models as m
 from app.admin_bot.db.session import SessionLocal
 from app.DAL import channels_operations as cho
 from app.DAL.membership_operations import MembershipDAO
-
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now, moscow_now_str
 
 
 def _now_str() -> str:
-    return datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return moscow_now_str()
 
 
 def calc_text_hash(text: str | None) -> str:
@@ -30,8 +28,8 @@ def calc_text_hash(text: str | None) -> str:
 
 def _candidate_expires_at(days: float = 1.0) -> str:
     try:
-        dt = datetime.now(MOSCOW_TZ) + timedelta(days=days)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
+        dt = moscow_now() + timedelta(days=days)
+        return dt.strftime(MOSCOW_TIME_FORMAT)
     except Exception:
         return _now_str()
 
@@ -186,7 +184,7 @@ def mark_done_views(watch_id: int, final_views: Optional[int]) -> None:
                     actual_views=views_sum,
                     actual_price=spent_sum,
                     actual_cpm=actual_cpm,
-                    updated_at=int(datetime.now().timestamp()),
+                    updated_at=int(moscow_now().timestamp()),
                 )
             )
         if wp and wp[2]:
@@ -308,6 +306,26 @@ def list_due_pending_expire(now_ts: Optional[str] = None) -> List[int]:
                 m.WatchPost.time_window_end != "",
                 m.WatchPost.time_window_end <= now_val,
             )
+        ).all()
+        return [int(r.id) for r in rows]
+    finally:
+        db.close()
+
+
+def list_pending_without_expected(limit: int = 200) -> List[int]:
+    """
+    Повертає pending watch_id, у яких немає expected_text_hash (для health-check).
+    """
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            select(m.WatchPost.id)
+            .where(
+                m.WatchPost.status == "pending",
+                (m.WatchPost.expected_text_hash.is_(None)) | (m.WatchPost.expected_text_hash == ""),
+            )
+            .order_by(m.WatchPost.id.desc())
+            .limit(int(limit))
         ).all()
         return [int(r.id) for r in rows]
     finally:

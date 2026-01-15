@@ -1,19 +1,16 @@
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import select, update
 
 from app.admin_bot.db.session import SessionLocal
 from app.admin_bot.db import models as m
-
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+from app.utils.time_utils import moscow_now, moscow_now_str
 
 
 def _now_str() -> str:
-    return datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return moscow_now_str()
 
 
 def insert_watch_event(

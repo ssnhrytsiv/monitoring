@@ -116,11 +116,15 @@ def configure_logging(force_json: Optional[bool] = None,
         show_fields_plain = _env_bool("LOG_PLAIN_FIELDS", True)
 
     root = logging.getLogger()
-    if root.handlers:
-        return decided_json
-
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
+
+    # Якщо хендлери вже є (наприклад, хтось налаштував logging.basicConfig),
+    # усе одно виставляємо рівні та фільтри для SQLAlchemy і повертаємо.
+    if root.handlers:
+        root.setLevel(level)
+        _configure_sqlalchemy_logging()
+        return decided_json
 
     handler = logging.StreamHandler()
     if decided_json:
@@ -140,11 +144,39 @@ def configure_logging(force_json: Optional[bool] = None,
         logging.getLogger("telethon").setLevel(logging.INFO)
 
     # Опційний детальний лог для DAO/SQL (вмикається через змінну середовища LOG_DAO_DEBUG=1)
-    if _env_bool("LOG_DAO_DEBUG", False):
-        logging.getLogger("app.DAL").setLevel(logging.DEBUG)
-        logging.getLogger("sqlalchemy.engine").setLevel(logging.DEBUG)
+    _configure_sqlalchemy_logging()
 
     return decided_json
+
+
+def _configure_sqlalchemy_logging() -> None:
+    """
+    Налаштовує рівні логів SQLAlchemy залежно від LOG_DAO_DEBUG.
+    Викликається завжди, навіть якщо хендлери вже налаштовані раніше.
+    """
+    if _env_bool("LOG_DAO_DEBUG", False):
+        logging.getLogger("app.DAL").setLevel(logging.DEBUG)
+        # Дозволяємо службові логи SQLAlchemy, але приглушуємо детальні SQL з Engine
+        logging.getLogger("sqlalchemy.engine").setLevel(logging.INFO)
+        _mute_sqlalchemy_engine_logs()
+    else:
+        for name in ("sqlalchemy.engine.Engine", "sqlalchemy.engine", "sqlalchemy.pool", "sqlalchemy"):
+            lg = logging.getLogger(name)
+            lg.handlers.clear()
+            lg.setLevel(logging.CRITICAL + 10)
+            lg.disabled = True
+            lg.propagate = False
+
+
+def _mute_sqlalchemy_engine_logs() -> None:
+    """
+    Вимикає детальні логи engine (sqlalchemy.engine.Engine), але залишає інші логери SQLAlchemy активними.
+    """
+    lg = logging.getLogger("sqlalchemy.engine.Engine")
+    lg.handlers.clear()
+    lg.setLevel(logging.CRITICAL + 10)
+    lg.disabled = True
+    lg.propagate = False
 
 def get_logger(name: str, **context) -> StructuredAdapter:
     logger = logging.getLogger(name)

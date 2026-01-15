@@ -1,4 +1,4 @@
-# app/bot/services/templates_repo.py
+# app/watch_bot/services/templates_repo.py
 from typing import Dict, Any, Optional
 import logging
 

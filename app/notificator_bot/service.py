@@ -28,6 +28,8 @@ log = logging.getLogger("notificator.service")
 
 PRIORITY = {
     "pending": 0,
+    "candidate": 0,
+    "foreign": 0,
     "matched": 1,
     "views": 1,
     "edited_other": 1,
@@ -182,6 +184,28 @@ def _build_line(event_type: str, payload: dict, watch_info: dict, title: str, li
         desc = "Вотч создан"
     elif event_type == "pending":
         desc = "Ожидает публикации"
+    elif event_type == "candidate":
+        sim = payload.get("similarity")
+        if sim is not None:
+            try:
+                desc = f"Кандидат (похожесть: {float(sim):.3f})"
+            except Exception:
+                desc = "Кандидат"
+        else:
+            desc = "Кандидат"
+    elif event_type == "foreign":
+        sim = payload.get("similarity")
+        reason = payload.get("reason") or "links_mismatch"
+        details = []
+        if sim is not None:
+            try:
+                details.append(f"похожесть: {float(sim):.3f}")
+            except Exception:
+                pass
+        if reason:
+            details.append(f"причина: {reason}")
+        details_txt = f" ({'; '.join(details)})" if details else ""
+        desc = f"Чужой пост{details_txt}"
 
     link_html = f'<a href="{link}">{title}</a>' if link else title
     if event_type == "expired":

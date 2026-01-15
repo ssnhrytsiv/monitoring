@@ -9,9 +9,9 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
 
-from app.bot.states import JoinChannels
-from app.bot.keyboards import main_menu_kb, back_to_menu_kb
-from app.bot.processing_guard import is_processing, set_processing
+from app.watch_bot.states import JoinChannels
+from app.watch_bot.keyboards import main_menu_kb, back_to_menu_kb
+from app.watch_bot.processing_guard import is_processing, set_processing
 from app.utils.link_parser import sanitize_link
 
 router = Router()

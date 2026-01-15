@@ -10,7 +10,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
 
-from app.bot.states import CreateWatch
+from app.watch_bot.states import CreateWatch
 from app.DAL import SessionLocal
 from app.DAL import sheet_projects_operations as spo
 from app.DAL import post_templates_operations as post_watch_db
@@ -18,9 +18,14 @@ from app.DAL import watch_posts_operations as watch_posts_db
 from app.DAL import watch_events_operations as watch_events_db
 from app.sheet_bot.services import gsheets_writer as gsw
 from app.sheet_bot.services import gsheets_buffer as gsb
-from app.bot.keyboards import main_menu_kb, back_to_menu_kb, yes_no_kb
+from app.watch_bot.keyboards import main_menu_kb, back_to_menu_kb, yes_no_kb
 from app.services.time_utils import msk_now
-from app.bot.services.channels_repo import resolve_cid_by_target, normalize_target_link, get_links_by_channel_ids
+from app.watch_bot.services.channels_repo import (
+    resolve_cid_by_target,
+    normalize_target_link,
+    get_links_by_channel_ids,
+    get_titles_by_channel_ids,
+)
 from app.utils.link_parser import sanitize_link
 from app.admin_bot.services import admins as svc_admins
 from app.admin_bot.services import networks as svc_networks
@@ -817,7 +822,19 @@ async def step_time_window(m: Message, state: FSMContext):
 
     await state.update_data(time_window_start=tw_start, time_window_end=tw_end, mins=mins)
 
-    targets_txt = "\n".join(f"• {t}" for t in targets)
+    cids: List[int] = []
+    for t in targets:
+        cid_val = resolve_cid_by_target(t)
+        if cid_val:
+            cids.append(cid_val)
+    links_map = get_links_by_channel_ids(cids)
+    titles_map = get_titles_by_channel_ids(cids)
+    targets_txt = "\n".join(
+        f"• <a href=\"{links_map.get(resolve_cid_by_target(t), t)}\">"
+        f"{titles_map.get(resolve_cid_by_target(t), t)}</a>"
+        if resolve_cid_by_target(t) else f"• {t}"
+        for t in targets
+    )
     txt = (
         f"Підтверди створення watch:\n\n"
         f"targets:\n{targets_txt}\n\n"
@@ -838,7 +855,7 @@ async def step_time_window(m: Message, state: FSMContext):
     await m.answer(
         txt + "\nОбери проєкт:",
         reply_markup=kb,
-        parse_mode=None
+        parse_mode="HTML"
     )
 
 
@@ -854,7 +871,19 @@ async def pick_project(cb: CallbackQuery, state: FSMContext):
     net_id = data.get("network_id")
     tw_end = data.get("time_window_end")
     proj_txt = proj
-    targets_txt = "\n".join(f"• {t}" for t in targets)
+    cids: List[int] = []
+    for t in targets:
+        cid_val = resolve_cid_by_target(t)
+        if cid_val:
+            cids.append(cid_val)
+    links_map = get_links_by_channel_ids(cids)
+    titles_map = get_titles_by_channel_ids(cids)
+    targets_txt = "\n".join(
+        f"• <a href=\"{links_map.get(resolve_cid_by_target(t), t)}\">"
+        f"{titles_map.get(resolve_cid_by_target(t), t)}</a>"
+        if resolve_cid_by_target(t) else f"• {t}"
+        for t in targets
+    )
     txt = (
         f"Підтверди створення watch:\n\n"
         f"targets:\n{targets_txt}\n\n"
@@ -869,7 +898,7 @@ async def pick_project(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text(
         txt,
         reply_markup=yes_no_kb("watch:confirm_yes", "watch:confirm_no"),
-        parse_mode=None
+        parse_mode="HTML"
     )
 
 
@@ -918,11 +947,8 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
         targets_links, targets, links_map,
     )
 
-    control_id = _control_chat_id()
-    # для сіткового флоу вимикаємо control chat, щоб одразу ставити локально
-    if net_id:
-        control_id = None
-
+    # Потік через CONTROL_CHAT більше не використовується — створюємо вотчі одразу локально.
+    control_id = None
     sent_ok = False
     if control_id and tid:
         control_targets = targets_links if targets_links else targets
@@ -947,6 +973,17 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
             tpl_links_json = tpl_meta.get("links_json")
             if not tpl_html:
                 log.warning("watch_net: template id=%s has empty html", tid)
+            else:
+                try:
+                    # Використовуємо той самий нормалізатор, що й у слухачі
+                    from app.plugins.posts_watch_listener import _normalize_html_full, _strip_tags_to_text  # type: ignore
+                    tpl_html_norm = _normalize_html_full(tpl_html)
+                    tpl_plain = _strip_tags_to_text(tpl_html_norm)
+                    tpl_html = tpl_html_norm
+                    tpl_plain_len = len(tpl_plain or "")
+                except Exception:
+                    log.exception("watch_net: tpl normalization failed (tid=%s)", tid)
+                    tpl_plain_len = len(tpl_html or "")
 
         group_id = None
         try:
@@ -966,12 +1003,15 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
             if not cid or not tid:
                 failed.append(f"{t} (cid not found or no template)")
                 continue
+            if not tpl_html:
+                failed.append(f"{t} (template html empty)")
+                continue
             try:
                 wid = watch_posts_db.create_watch(
                     channel_id=int(cid),
                     template_id=int(tid),
                     expected_text_hash=tpl_html,
-                    expected_text_norm_len=len(tpl_html or "") if tpl_html else None,
+                    expected_text_norm_len=tpl_plain_len if tpl_html else None,
                     expected_links_json=tpl_links_json,
                     expected_media_fingerprint=None,
                     time_window_start=data.get("time_window_start"),
@@ -982,6 +1022,15 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                     admin_id=admin_id,
                     network_id=net_id,
                     group_id=group_id,
+                )
+                log.info(
+                    "watch_net: created watch wid=%s cid=%s admin=%s net=%s project=%s links=%s",
+                    wid,
+                    cid,
+                    admin_id,
+                    net_id,
+                    project,
+                    links_map.get(int(cid)),
                 )
                 try:
                     watch_events_db.insert_watch_event(
@@ -1007,7 +1056,14 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                             )
                     except Exception:
                         log.exception("bind watch to project failed")
-                created.append(f"{t} (fallback wid={wid})")
+                created.append(
+                    (
+                        int(cid),
+                        links_map.get(int(cid)) or t,
+                        titles_map.get(int(cid)) or t,
+                        wid,
+                    )
+                )
             except TypeError:
                 failed.append(t)
             except Exception:
@@ -1017,13 +1073,23 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
 
     msg_parts: List[str] = []
     if created:
-        if control_id and sent_ok:
-            msg_parts.append("✅ Команду /watch_from_links відправлено в CONTROL_CHAT для:\n" + "\n".join(f"• {x}" for x in created))
-        else:
-            msg_parts.append("✅ Watch(и) створено через fallback:\n" + "\n".join(f"• {x}" for x in created))
+        lines = []
+        for cid, link, title, wid in created:
+            safe_link = link
+            safe_title = title
+            try:
+                safe_link = link.replace('"', "").strip()
+            except Exception:
+                pass
+            try:
+                safe_title = title.replace("<", "").replace(">", "").strip()
+            except Exception:
+                pass
+            lines.append(f'• <a href="{safe_link}">{safe_title}</a> (fallback wid={wid})')
+        msg_parts.append("✅ Watch(и) створено:\n" + "\n".join(lines))
     if failed:
         msg_parts.append("⚠️ Не вдалося створити watch для:\n" + "\n".join(f"• {x}" for x in failed))
     if not msg_parts:
-        msg_parts.append("❌ Не вдалося створити watch. Перевір CONTROL_CHAT/CONTROL_PEER і доступ MAIN клієнта.")
+        msg_parts.append("❌ Не вдалося створити watch.")
 
-    await cb.message.edit_text("\n\n".join(msg_parts), reply_markup=main_menu_kb(), parse_mode=None)
+    await cb.message.edit_text("\n\n".join(msg_parts), reply_markup=main_menu_kb(), parse_mode="HTML")

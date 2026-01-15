@@ -6,7 +6,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramNetworkError
 
-from app.bot.handlers import router  # центральний router
+from app.watch_bot.handlers import router  # центральний router
 from app.config import BOT_TOKEN
 
 async def run_bot():
@@ -14,7 +14,7 @@ async def run_bot():
     if not token:
         raise RuntimeError("BOT_TOKEN env is required")
 
-    log = logging.getLogger("app.bot.run")
+    log = logging.getLogger("app.watch_bot.run")
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
 

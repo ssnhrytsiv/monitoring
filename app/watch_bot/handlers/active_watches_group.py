@@ -1,4 +1,5 @@
 from typing import Optional, List, Any, Dict
+import os
 import logging
 import re
 import html
@@ -9,17 +10,17 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 
-from app.bot.states import EditWatch
-from app.bot.keyboards import main_menu_kb
+from app.watch_bot.states import EditWatch
+from app.watch_bot.keyboards import main_menu_kb
 from app.services.time_utils import msk_now
 
-from app.bot.services.templates_repo import load_templates_map
-from app.bot.services.channels_repo import (
+from app.watch_bot.services.templates_repo import load_templates_map
+from app.watch_bot.services.channels_repo import (
     get_links_by_channel_ids,
     get_owners_by_channel_ids,
     get_titles_by_channel_ids,
 )
-from app.bot.services.active_watches_service import (
+from app.watch_bot.services.active_watches_service import (
     get_group_leader_key,
     load_group_items,
     load_group_channels,
@@ -27,7 +28,7 @@ from app.bot.services.active_watches_service import (
     get_watch_by_id,
     get_group_leader_for_watch,
 )
-from app.bot.services.edit_watch_service import (
+from app.watch_bot.services.edit_watch_service import (
     set_watch_status_pending,
     update_watch_time_window,
     manual_match_watch_from_message,
@@ -47,14 +48,14 @@ try:
 except Exception:
     gsb = None
 from app.services.post_matcher import normalize_text, extract_links_norm
-from app.bot.utils.active_watches_formatters import (
+from app.watch_bot.utils.active_watches_formatters import (
     fmt_tw_end_human,
     short_title,
     status_to_emoji,
     build_group_table,
     format_single_watch,
 )
-from app.bot.utils.active_watches_pagination import (
+from app.watch_bot.utils.active_watches_pagination import (
     paginate_items,
     build_group_keyboard,
     PAGE_SIZE,
@@ -201,7 +202,7 @@ async def watch_cancel(cb: CallbackQuery):
     await cb.answer("Скасовано", show_alert=False)
 
     # Щоб оновити список, імпортуємо хендлер меню тут
-    from app.bot.handlers.active_watches_menu import menu_list_active
+    from app.watch_bot.handlers.active_watches_menu import menu_list_active
 
     await menu_list_active(cb, status_key=status_key)
 
@@ -553,7 +554,23 @@ async def watch_similar_accept(cb: CallbackQuery):
     if not cand:
         await cb.answer("кандидат не знайдений", show_alert=True)
         return
-    ok = accept_watch_candidate(cid)
+
+    def _read_coverage_hours() -> Optional[float]:
+        mins = os.getenv("WATCH_COVERAGE_MINUTES")
+        if mins:
+            try:
+                return float(mins) / 60.0
+            except Exception:
+                pass
+        hrs = os.getenv("WATCH_COVERAGE_HOURS")
+        if hrs:
+            try:
+                return float(hrs)
+            except Exception:
+                pass
+        return None
+
+    ok = accept_watch_candidate(cid, coverage_hours=_read_coverage_hours())
     if not ok:
         await cb.answer("не вдалось заметчити", show_alert=True)
         return

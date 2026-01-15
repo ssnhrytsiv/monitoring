@@ -18,7 +18,7 @@ async def _worker(bot: Bot):
     ensure_tables()
     while True:
         try:
-            await send_notifications(bot, debounce_sec=60)
+            await send_notifications(bot, debounce_sec=30)
         except Exception:
             log.exception("notifier tick failed")
         await asyncio.sleep(max(1, NOTIFIER_POLL_INTERVAL_SEC))

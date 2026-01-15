@@ -21,7 +21,7 @@ from app.services.googlesheets.channels_export_service import (
     stop_channels_exporter,
 )
 
-from app.bot.run import run_bot
+from app.watch_bot.run import run_bot
 from app.admin_bot.run import run_admin_bot
 from app.admin_bot.config import ADMIN_BOT_TOKEN
 from scripts.forward_bot import start_forward_bot

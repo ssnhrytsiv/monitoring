@@ -1,12 +1,28 @@
-from datetime import datetime
-import pytz
+from __future__ import annotations
 
-MSK_TZ = pytz.timezone("Europe/Moscow")
+"""
+Сумісний шар: усі функції роботи з московським часом винесені в app.utils.time_utils.
+Не додавайте нову логіку сюди, використовуйте time_utils як єдиний джерело.
+"""
 
-def msk_now() -> datetime:
-    """Datetime зараз у Europe/Moscow (tz-aware)."""
-    return datetime.now(MSK_TZ)
+from app.utils.time_utils import (  # noqa: F401
+    MOSCOW_TZ,
+    MOSCOW_TIME_FORMAT,
+    ensure_moscow_timezone,
+    moscow_now,
+    moscow_now_str,
+    moscow_timestamp,
+    msk_now,
+    msk_timestamp,
+)
 
-def msk_timestamp() -> int:
-    """Unix timestamp (int, сек) у Europe/Moscow."""
-    return int(msk_now().timestamp())
+__all__ = [
+    "MOSCOW_TZ",
+    "MOSCOW_TIME_FORMAT",
+    "ensure_moscow_timezone",
+    "moscow_now",
+    "moscow_now_str",
+    "moscow_timestamp",
+    "msk_now",
+    "msk_timestamp",
+]

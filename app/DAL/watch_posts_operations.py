@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_, select, update
 
@@ -15,6 +14,7 @@ from app.notificator_bot.db.posts_watch_result_models import (
 from app.DAL.watch_processing_operations import get_session_for_source_url as process_get_session_for_source_url
 from app.DAL.watch_events_operations import insert_watch_event
 from app.admin_bot.db import models as m
+from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now
 
 # Дозволені статуси вотчів
 ALLOWED_STATUSES: Dict[str, str] = {
@@ -23,11 +23,9 @@ ALLOWED_STATUSES: Dict[str, str] = {
     "expired": "expired",
 }
 
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")
-
 
 def _now_msk_str() -> str:
-    return datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return moscow_now().strftime(MOSCOW_TIME_FORMAT)
 
 
 def _time_window_key(value: Any) -> Optional[str]:
