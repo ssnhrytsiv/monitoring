@@ -140,6 +140,26 @@ def _find_channel_by_link(raw_url: str):
         db.close()
 
 
+def _upsert_channel_basic(cid: int, ent, status: str) -> None:
+    """
+    Легкий апдейт channels: зберігаємо username/title для публічних каналів (не ботів).
+    """
+    if not cid or not ent:
+        return
+    try:
+        username = getattr(ent, "username", None)
+        if not username or getattr(ent, "bot", False):
+            return
+        title = getattr(ent, "title", None)
+        db = SessionLocal()
+        try:
+            cho.upsert_channel(db, cid, username, title, None, None, status)
+        finally:
+            db.close()
+    except Exception:
+        _log_exc("_upsert_channel_basic")
+
+
 async def probe_channel_id(client, url: str):
     """
     Повертає (channel_id, title, kind, invite_hash)
@@ -571,6 +591,11 @@ async def ensure_join(client, url: str):
                     url_put(cleaned_url, "joined")
             except Exception:
                 _log_exc("ensure_join: url_put joined public")
+            try:
+                if cid:
+                    _upsert_channel_basic(cid, ent, "joined")
+            except Exception:
+                pass
             return "joined", title, "public", cid, invite_hash
         except UserAlreadyParticipantError:
             title = getattr(ent, "title", None)
@@ -587,6 +612,11 @@ async def ensure_join(client, url: str):
                     url_put(cleaned_url, "already")
             except Exception:
                 _log_exc("ensure_join: url_put already public")
+            try:
+                if cid:
+                    _upsert_channel_basic(cid, ent, "already")
+            except Exception:
+                pass
             return "already", title, "public", cid, invite_hash
 
     # ---- обробка винятків ----

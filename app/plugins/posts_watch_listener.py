@@ -224,6 +224,10 @@ def _normalize_html_full(html_text: str) -> str:
     # 2) декодуємо HTML-ентіті (&quot; -> ", &nbsp; -> пробіл, &amp; -> &, ...)
     s = _html_mod.unescape(s)
 
+    # 2.1) ігноруємо службовий хештег #реклама (будь-який регістр, з/без лінка)
+    s = re.sub(r"<a[^>]*>\s*#\s*реклама\s*</a>", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"#\s*реклама\b", "", s, flags=re.IGNORECASE)
+
     # 3) перетворюємо <br>/<p> у переводи рядків, щоб зрівняти рендери
     s = re.sub(r"<\s*br\s*/?>", "\n", s, flags=re.IGNORECASE)
     s = re.sub(r"</\s*p\s*>", "\n", s, flags=re.IGNORECASE)
@@ -254,6 +258,8 @@ def _normalize_html_for_edit(html_text: str) -> str:
     s = html_text.replace("\r\n", "\n")
     s = _normalize_html_links(s)
     s = _html_mod.unescape(s)
+    s = re.sub(r"<a[^>]*>\s*#\s*реклама\s*</a>", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"#\s*реклама\b", "", s, flags=re.IGNORECASE)
     s = re.sub(r"<\s*br\s*/?>", "\n", s, flags=re.IGNORECASE)
     s = re.sub(r"</\s*p\s*>", "\n", s, flags=re.IGNORECASE)
     s = re.sub(r"<\s*p\s*>", "", s, flags=re.IGNORECASE)
