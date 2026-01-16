@@ -726,6 +726,7 @@ def get_watch_info(watch_id: int) -> Dict[str, Any]:
                 WatchPost.final_views,
                 WatchPost.template_id,
                 WatchPost.expected_links_json,
+                WatchPost.expected_text_hash,
                 WatchPost.time_window_start,
                 WatchPost.admin_id,
             ).where(WatchPost.id == int(watch_id)).limit(1)
@@ -749,6 +750,7 @@ def get_watch_info(watch_id: int) -> Dict[str, Any]:
         "final_views": row.final_views,
         "template_id": row.template_id,
         "expected_links_json": row.expected_links_json,
+        "expected_text_hash": row.expected_text_hash,
         "time_window_start": row.time_window_start,
         "admin_id": row.admin_id,
     }

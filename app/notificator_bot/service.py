@@ -28,8 +28,10 @@ log = logging.getLogger("notificator.service")
 
 PRIORITY = {
     "pending": 0,
+    "pending_candidate": 0,
     "candidate": 0,
     "foreign": 0,
+    "edited_candidate": 1,
     "matched": 1,
     "views": 1,
     "edited_other": 1,
@@ -50,6 +52,17 @@ def _fetch_channel(channel_id: int) -> dict | None:
     db = SessionLocal()
     try:
         return cho.find_channel(db, channel_id)
+    except Exception:
+        return None
+    finally:
+        db.close()
+
+
+def _fetch_channel_link(channel_id: int) -> str | None:
+    db = SessionLocal()
+    try:
+        links = cho.get_links_by_channel_ids([channel_id]) or {}
+        return links.get(channel_id)
     except Exception:
         return None
     finally:
@@ -121,6 +134,9 @@ def _channel_meta(channel_id: int, fallback_url: str | None) -> Tuple[str, str]:
                 )
             else:
                 log.debug("notificator: bot_link not found for username=%s (fallback_url=%s)", bot_username, fallback_url)
+    if not link:
+        link = _fetch_channel_link(channel_id) or link
+
     log.debug("notificator: channel_meta resolved cid=%s -> title=%s link=%s", channel_id, title, link)
     return title, link
 
@@ -184,6 +200,15 @@ def _build_line(event_type: str, payload: dict, watch_info: dict, title: str, li
         desc = "Вотч создан"
     elif event_type == "pending":
         desc = "Ожидает публикации"
+    elif event_type == "pending_candidate":
+        sim = payload.get("similarity")
+        if sim is not None:
+            try:
+                desc = f"Кандидат ожидает публикации (похожесть: {float(sim):.3f})"
+            except Exception:
+                desc = "Кандидат ожидает публикации"
+        else:
+            desc = "Кандидат ожидает публикации"
     elif event_type == "candidate":
         sim = payload.get("similarity")
         if sim is not None:
@@ -193,6 +218,8 @@ def _build_line(event_type: str, payload: dict, watch_info: dict, title: str, li
                 desc = "Кандидат"
         else:
             desc = "Кандидат"
+    elif event_type == "edited_candidate":
+        desc = "Кандидат отредактирован"
     elif event_type == "foreign":
         sim = payload.get("similarity")
         reason = payload.get("reason") or "links_mismatch"
@@ -333,6 +360,7 @@ def collect_grouped_events(
                     "expired": "expired",
                     "cancelled": "cancelled",
                     "pending": "pending",
+                    "pending_candidate": "pending_candidate",
                     "deleted": "deleted",
                     "edited": "edited_other",
                     # done після переглядів показуємо як “Отстоял просмотры”

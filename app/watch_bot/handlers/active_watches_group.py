@@ -34,6 +34,7 @@ from app.watch_bot.services.edit_watch_service import (
     manual_match_watch_from_message,
 )
 from app.DAL.watch_candidates_operations import (
+    CANDIDATE_PENDING_STATUS,
     list_watch_candidates,
     list_group_watch_candidates,
     list_candidates_by_hash,
@@ -380,7 +381,7 @@ async def watch_group_similar(cb: CallbackQuery):
         await cb.answer("Вотчів у групі немає", show_alert=True)
         return
 
-    cands = list_group_watch_candidates(wids)
+    cands = list_group_watch_candidates(wids, status=CANDIDATE_PENDING_STATUS)
     if not cands:
         kb = InlineKeyboardBuilder()
         kb.button(text="⬅️ Back", callback_data=f"watch:group:{leader_wid}")
@@ -650,7 +651,22 @@ async def watch_similar_view(cb: CallbackQuery):
     wid = cand.get("watch_id")
 
     # Всі кандидати з тим самим text_hash (щоб показати всі канали разом; тільки pending)
-    same_hash = list_candidates_by_hash(cand.get("text_hash") or "", status="pending") or [cand]
+    same_hash = list_candidates_by_hash(cand.get("text_hash") or "", status=CANDIDATE_PENDING_STATUS) or [cand]
+
+    # Обмежуємо кандидати лише рамками цієї групи watch'ів
+    group_wids: List[int] = []
+    try:
+        leader = get_group_leader_for_watch(wid) if wid else None
+        leader_key = get_group_leader_key(leader) if leader else None
+        if leader_key:
+            tpl_id, tw_key, created_by, _ = leader_key
+            group_items = load_group_items(tpl_id, tw_key, created_by)
+            group_wids = [item[0] for item in group_items]
+    except Exception:
+        group_wids = []
+    if group_wids:
+        same_hash = [c for c in same_hash if c.get("watch_id") in group_wids] or [cand]
+
     cids = [c.get("channel_id") for c in same_hash if c.get("channel_id")]
     links_map: Dict[int, str] = {}
     titles_map: Dict[int, str] = {}
@@ -741,7 +757,7 @@ async def watch_similar_list(cb: CallbackQuery):
         await cb.answer("bad id", show_alert=True)
         return
 
-    cands = list_watch_candidates(wid)
+    cands = list_watch_candidates(wid, status=CANDIDATE_PENDING_STATUS)
     if not cands:
         await cb.message.edit_text("Схожих постів поки немає.", reply_markup=_edit_back_kb(wid).as_markup())
         await cb.answer()

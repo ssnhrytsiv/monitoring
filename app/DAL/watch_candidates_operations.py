@@ -17,12 +17,14 @@ from app.utils.time_utils import (
     moscow_now_str,
 )
 
+CANDIDATE_PENDING_STATUS = "pending_candidate"
+
 
 def _now_str() -> str:
     return moscow_now_str()
 
 
-def list_watch_candidates(watch_id: int, status: str = "pending") -> List[Dict[str, Any]]:
+def list_watch_candidates(watch_id: int, status: str = CANDIDATE_PENDING_STATUS) -> List[Dict[str, Any]]:
     now_ts = _now_str()
     db = SessionLocal()
     try:
@@ -64,7 +66,7 @@ def list_watch_candidates(watch_id: int, status: str = "pending") -> List[Dict[s
     ]
 
 
-def list_group_watch_candidates(watch_ids: List[int], status: str = "pending") -> List[Dict[str, Any]]:
+def list_group_watch_candidates(watch_ids: List[int], status: str = CANDIDATE_PENDING_STATUS) -> List[Dict[str, Any]]:
     if not watch_ids:
         return []
     now_ts = _now_str()
@@ -108,7 +110,7 @@ def list_group_watch_candidates(watch_ids: List[int], status: str = "pending") -
     ]
 
 
-def list_candidates_by_hash(text_hash: str, status: str = "pending") -> List[Dict[str, Any]]:
+def list_candidates_by_hash(text_hash: str, status: str = CANDIDATE_PENDING_STATUS) -> List[Dict[str, Any]]:
     if not text_hash:
         return []
     now_ts = _now_str()
@@ -139,6 +141,54 @@ def list_candidates_by_hash(text_hash: str, status: str = "pending") -> List[Dic
         {
             "watch_id": r.watch_id,
             "id": int(r.id),
+            "channel_id": r.channel_id,
+            "message_id": r.message_id,
+            "text_hash": r.text_hash,
+            "similarity": r.similarity,
+            "message_text": r.message_text,
+            "created_at": r.created_at,
+            "expires_at": r.expires_at,
+            "status": r.status,
+        }
+        for r in rows
+    ]
+
+
+def find_candidates_by_channel_message(
+    channel_id: int,
+    message_id: int,
+    status: str = CANDIDATE_PENDING_STATUS,
+) -> List[Dict[str, Any]]:
+    if not channel_id or not message_id:
+        return []
+    now_ts = _now_str()
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            select(
+                m.WatchCandidate.id,
+                m.WatchCandidate.watch_id,
+                m.WatchCandidate.channel_id,
+                m.WatchCandidate.message_id,
+                m.WatchCandidate.text_hash,
+                m.WatchCandidate.similarity,
+                m.WatchCandidate.message_text,
+                m.WatchCandidate.created_at,
+                m.WatchCandidate.expires_at,
+                m.WatchCandidate.status,
+            ).where(
+                m.WatchCandidate.channel_id == int(channel_id),
+                m.WatchCandidate.message_id == int(message_id),
+                m.WatchCandidate.status == status,
+                func.coalesce(m.WatchCandidate.expires_at, now_ts) >= now_ts,
+            )
+        ).all()
+    finally:
+        db.close()
+    return [
+        {
+            "id": int(r.id),
+            "watch_id": int(r.watch_id),
             "channel_id": r.channel_id,
             "message_id": r.message_id,
             "text_hash": r.text_hash,
@@ -204,16 +254,73 @@ def set_watch_candidate_status(candidate_id: int, status: str) -> bool:
         db.close()
 
 
+def merge_watch_candidate(
+    candidate_id: int,
+    message_id: Optional[int],
+    text_hash: Optional[str],
+    similarity: Optional[float],
+    message_text: Optional[str],
+) -> None:
+    """
+    Оновлює існуючого кандидата: зберігає більшу схожість і, за потреби, новий текст/хеш/повідомлення.
+    """
+    db = SessionLocal()
+    try:
+        row = db.execute(
+            select(
+                m.WatchCandidate.similarity,
+                m.WatchCandidate.message_text,
+                m.WatchCandidate.message_id,
+                m.WatchCandidate.text_hash,
+            ).where(m.WatchCandidate.id == candidate_id)
+        ).first()
+        if not row:
+            return
+        current_sim = float(row.similarity or 0.0)
+        new_sim = max(current_sim, float(similarity or 0.0))
+
+        # За замовчуванням залишаємо поточні значення
+        update_message_id = row.message_id
+        update_message_text = row.message_text
+        update_text_hash = row.text_hash
+
+        # Якщо новий текст довший/інформативніший — підміняємо його разом із message_id та хешем
+        try:
+            if message_text and len(message_text) > len(row.message_text or ""):
+                update_message_text = message_text
+                update_message_id = message_id if message_id is not None else row.message_id
+                update_text_hash = text_hash if text_hash is not None else row.text_hash
+        except Exception:
+            pass
+
+        db.execute(
+            update(m.WatchCandidate)
+            .where(m.WatchCandidate.id == candidate_id)
+            .values(
+                similarity=new_sim,
+                message_id=update_message_id,
+                message_text=update_message_text,
+                text_hash=update_text_hash,
+            )
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 def accept_watch_candidate(
     candidate_id: int,
     matched_session: Optional[str] = None,
     coverage_hours: Optional[float] = None,
 ) -> bool:
     cand = get_watch_candidate(candidate_id)
-    if not cand or cand.get("status") != "pending":
+    if not cand or cand.get("status") not in ("pending", CANDIDATE_PENDING_STATUS):
         return False
     text_hash = cand.get("text_hash") or ""
-    candidates = list_candidates_by_hash(text_hash) if text_hash else [cand]
+    candidates = list_candidates_by_hash(text_hash, status=CANDIDATE_PENDING_STATUS) if text_hash else [cand]
 
     def _coverage_at_from_created(created_at: Optional[str]) -> str:
         if coverage_hours is None:

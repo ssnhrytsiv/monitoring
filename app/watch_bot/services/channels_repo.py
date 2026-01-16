@@ -3,6 +3,7 @@ import re
 import logging
 
 from app.DAL import channels_operations as channels_db
+from app.admin_bot.db.session import SessionLocal
 
 log = logging.getLogger("channels_repo")
 
@@ -58,7 +59,11 @@ def resolve_cid_by_target(target: str) -> Optional[int]:
             log.exception("resolve_cid invite_map lookup failed: %s", e)
 
     try:
-        cid = channels_db.get_channel_id_by_url(s)
+        db = SessionLocal()
+        try:
+            cid = channels_db.get_channel_id_by_url(db, s)
+        finally:
+            db.close()
         if cid:
             return cid
     except Exception as e:

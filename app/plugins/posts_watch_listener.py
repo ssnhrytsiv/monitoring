@@ -52,7 +52,9 @@ GLOBAL_DELETED_TTL = 180.0
 _GLOBAL_CANDIDATE_SEEN: Dict[tuple[int, int], float] = {}
 CANDIDATE_SEEN_TTL = 24 * 60 * 60  # 1 доба
 CANDIDATE_SIM_THRESHOLD = 0.70
+# Якщо текстові кандидат-пости схожі >= 0.99, вважаємо їх одним і тим самим кандидатам (не дублюємо).
 NEAR_IDENTICAL_TEXT_THRESHOLD = 0.99
+GROUP_NEAR_IDENTICAL_THRESHOLD = 0.95
 
 
 def _now_monotonic() -> float:
@@ -238,6 +240,26 @@ def _normalize_html_full(html_text: str) -> str:
     s = re.sub(r"\n{3,}", "\n\n", s)
     s = s.strip()
 
+    return s
+
+
+def _normalize_html_for_edit(html_text: str) -> str:
+    """
+    Нормалізація для порівняння редагувань: мінімально прибираємо шум,
+    але НЕ стискаємо пробіли/переноси, щоб будь-яка правка (навіть пробіл) фіксувалася.
+    """
+    if not html_text:
+        return ""
+
+    s = html_text.replace("\r\n", "\n")
+    s = _normalize_html_links(s)
+    s = _html_mod.unescape(s)
+    s = re.sub(r"<\s*br\s*/?>", "\n", s, flags=re.IGNORECASE)
+    s = re.sub(r"</\s*p\s*>", "\n", s, flags=re.IGNORECASE)
+    s = re.sub(r"<\s*p\s*>", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"[\u200b\u200c\u200d\uFEFF\uFE0F]", "", s)
+    s = s.replace("\xa0", " ")
+    # спеціально не стискаємо пробіли/переноси
     return s
 
 
@@ -525,6 +547,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             wid = int(row["id"])
             expected_html = row.get("expected_text_hash")
             expected_links_json = row.get("expected_links_json")
+            group_id = row.get("group_id")
             if not expected_html:
                 _pylog.warning("listen: wid=%s cid=%s mid=%s has no expected_html, skip", wid, cid, mid)
                 continue
@@ -544,21 +567,10 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             ratio_text = 0.0
 
             try:
-                # РОЗШИРЕНА нормалізація:
-                #  - _normalize_html_links (a href="X" vs X)
-                #  - html.unescape (&quot; vs ")
-                msg_html_norm = _normalize_html_full(msg_html)
-                expected_html_norm = _normalize_html_full(expected_html)
+                # Строга нормалізація: мінімальні правки (пробіл/перенос) не ігноруються.
+                msg_html_norm = _normalize_html_for_edit(msg_html)
+                expected_html_norm = _normalize_html_for_edit(expected_html)
                 ok = exact_html_equal(msg_html_norm, expected_html_norm)
-                if not ok:
-                    # Фолбек: якщо текст без тегів однаковий — теж вважаємо exact
-                    try:
-                        msg_plain_norm = _strip_tags_to_text(msg_html_norm)
-                        expected_plain_norm = _strip_tags_to_text(expected_html_norm)
-                        if msg_plain_norm == expected_plain_norm:
-                            ok = True
-                    except Exception:
-                        pass
             except Exception:
                 _pylog.exception("listen: exact_html_equal failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                 ok = False
@@ -661,45 +673,6 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                         cand_links,
                     )
 
-                    if not links_mismatch and ratio_text >= NEAR_IDENTICAL_TEXT_THRESHOLD:
-                        coverage_at = _calc_coverage_at()
-                        matched_session = tag
-                        matched_ok = True
-                        try:
-                            watch_proc_db.mark_matched(wid, mid, coverage_at, matched_session=matched_session)
-                            watch_events_db.insert_watch_event(
-                                wid,
-                                "matched",
-                                json.dumps(
-                                    {
-                                        "watch_id": wid,
-                                        "channel_id": cid,
-                                        "message_id": mid,
-                                        "session": matched_session,
-                                        "via": "near_identical",
-                                        "ratio_text": ratio_text,
-                                    }
-                                ),
-                            )
-                        except Exception:
-                            matched_ok = False
-                        if matched_ok:
-                            matched_any = True
-                            log.info(
-                                "similar: wid=%s cid=%s mid=%s ratio_text=%.3f -> matched (near_identical, sess=%s)",
-                                wid,
-                                cid,
-                                mid,
-                                ratio_text,
-                                matched_session,
-                            )
-                            if SHEETS_OK and gsheets_buffer:
-                                try:
-                                    gsheets_buffer.record_matched(wid)
-                                except Exception:
-                                    _pylog.exception("gsheets_buffer.record_matched failed (wid=%s)", wid)
-                            continue
-
                     if links_mismatch:
                         try:
                             watch_proc_db.insert_watch_candidate(
@@ -740,6 +713,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                     last_seen = _GLOBAL_CANDIDATE_SEEN.get(key)
                     if last_seen is None or (now_m - last_seen) >= CANDIDATE_SEEN_TTL:
                         _GLOBAL_CANDIDATE_SEEN[key] = now_m
+
                         try:
                             watch_proc_db.insert_watch_candidate(
                                 watch_id=wid,
@@ -749,6 +723,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                                 message_text=msg_html,
                                 text_hash=text_hash,
                                 ttl_days=1.0,
+                                status=watch_candidates_db.CANDIDATE_PENDING_STATUS,
                             )
                             try:
                                 watch_events_db.insert_watch_event(
@@ -813,6 +788,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
     @cli.on(events.MessageEdited())
     async def _on_edited(ev: events.MessageEdited.Event):
         m: Message = ev.message
+        _pylog.info("edited: handler triggered cid=%s mid=%s", getattr(getattr(m, 'peer_id', None), 'channel_id', None), getattr(m, 'id', None))
 
         cid = None
         try:
@@ -836,8 +812,17 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             _pylog.exception("edited: find_matched_by_message failed (cid=%s mid=%s)", cid, mid)
             return
 
+        candidate_entries: list[Dict[str, Any]] = []
         if not wids:
-            return
+            try:
+                candidate_entries = watch_candidates_db.find_candidates_by_channel_message(
+                    cid, mid, status=watch_candidates_db.CANDIDATE_PENDING_STATUS
+                )
+            except Exception:
+                _pylog.exception("edited: find_candidates_by_channel_message failed (cid=%s mid=%s)", cid, mid)
+                candidate_entries = []
+            if not candidate_entries:
+                return
 
         try:
             msg_html = _HTML_RENDER(m) if _HTML_RENDER else (getattr(m, "message", "") or "")
@@ -845,7 +830,9 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             _pylog.exception("edited: HTML render failed (cid=%s mid=%s)", cid, mid)
             msg_html = (getattr(m, "message", "") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-        for wid in wids:
+        target_wids = wids if wids else [int(c.get("watch_id")) for c in candidate_entries if c.get("watch_id")]
+
+        for wid in target_wids:
             wc = _db_get_watch_core(int(wid))
             if not wc:
                 continue
@@ -854,9 +841,10 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 continue
 
             try:
-                msg_html_norm = _normalize_html_full(msg_html)
-                expected_html_norm = _normalize_html_full(expected_html)
-                ok = exact_html_equal(msg_html_norm, expected_html_norm)
+                msg_html_norm = _normalize_html_for_edit(msg_html)
+                expected_html_norm = _normalize_html_for_edit(expected_html)
+                # Для edit перевіряємо строго: будь-яка відмінність після нормалізації вважається редагуванням.
+                ok = msg_html_norm == expected_html_norm
             except Exception:
                 _pylog.exception("edited: exact_html_equal failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                 ok = False
@@ -864,11 +852,27 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             if ok:
                 continue
 
+            # Лог додаткових даних для аналізу відмінностей
+            try:
+                diff_ratio = SequenceMatcher(None, msg_html_norm, expected_html_norm).ratio()
+            except Exception:
+                diff_ratio = 0.0
+            _pylog.info(
+                "edited: wid=%s cid=%s mid=%s -> edited (ratio=%.3f exp_len=%s msg_len=%s)",
+                wid,
+                cid,
+                mid,
+                diff_ratio,
+                len(expected_html_norm or ""),
+                len(msg_html_norm or ""),
+            )
+
             now_str = _mark_done_edited_other(int(wid))
             try:
+                event_type = "edited_other" if wid in wids else "edited_candidate"
                 watch_events_db.insert_watch_event(
                     int(wid),
-                    "edited_other",
+                    event_type,
                     json.dumps(
                         {
                             "watch_id": int(wid),
@@ -880,6 +884,27 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 )
             except Exception:
                 pass
+
+            if wid not in wids and candidate_entries:
+                for c in candidate_entries:
+                    if int(c.get("watch_id") or 0) != int(wid):
+                        continue
+                    try:
+                        msg_plain = _strip_tags_to_text(msg_html_norm)
+                        expected_plain = _strip_tags_to_text(expected_html_norm)
+                        sim_val = SequenceMatcher(None, msg_plain, expected_plain).ratio()
+                    except Exception:
+                        sim_val = 0.0
+                    try:
+                        watch_candidates_db.merge_watch_candidate(
+                            int(c.get("id")),
+                            mid,
+                            watch_proc_db.calc_text_hash(msg_html_norm),
+                            sim_val,
+                            msg_html_norm,
+                        )
+                    except Exception:
+                        _pylog.exception("edited: merge_watch_candidate failed (cid=%s mid=%s cand_id=%s)", cid, mid, c.get("id"))
 
             log.info("edited: wid=%s cid=%s mid=%s -> edited_other at=%s", wid, cid, mid, now_str)
 

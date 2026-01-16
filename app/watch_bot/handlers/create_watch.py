@@ -927,6 +927,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
 
     created: List[str] = []
     failed: List[str] = []
+    failed_reasons: List[tuple[str, str]] = []
 
     # Підготуємо нормалізовані посилання для control chat і fallback
     cids: List[int] = []
@@ -935,6 +936,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
         if cid:
             cids.append(cid)
     links_map = get_links_by_channel_ids(cids)
+    titles_map = get_titles_by_channel_ids(cids)
     targets_links: List[str] = []
     for t in targets:
         cid = resolve_cid_by_target(t)
@@ -1001,10 +1003,12 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
         for t in targets:
             cid = resolve_cid_by_target(t)
             if not cid or not tid:
-                failed.append(f"{t} (cid not found or no template)")
+                failed.append(t)
+                failed_reasons.append((t, "Не вдалося визначити channel_id або відсутній шаблон"))
                 continue
             if not tpl_html:
-                failed.append(f"{t} (template html empty)")
+                failed.append(t)
+                failed_reasons.append((t, "Порожній HTML шаблону"))
                 continue
             try:
                 wid = watch_posts_db.create_watch(
@@ -1064,10 +1068,12 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                         wid,
                     )
                 )
-            except TypeError:
+            except TypeError as e:
                 failed.append(t)
-            except Exception:
+                failed_reasons.append((t, f"TypeError: {e}"))
+            except Exception as e:
                 failed.append(t)
+                failed_reasons.append((t, f"{e.__class__.__name__}: {e}"))
 
     await state.clear()
 
@@ -1088,7 +1094,29 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
             lines.append(f'• <a href="{safe_link}">{safe_title}</a> (fallback wid={wid})')
         msg_parts.append("✅ Watch(и) створено:\n" + "\n".join(lines))
     if failed:
-        msg_parts.append("⚠️ Не вдалося створити watch для:\n" + "\n".join(f"• {x}" for x in failed))
+        lines = []
+        reasons_map = {t: r for t, r in failed_reasons}
+        for item in failed:
+            cid = resolve_cid_by_target(item)
+            reason = reasons_map.get(item, "")
+            safe_link = item
+            safe_title = item
+            if cid:
+                safe_link = links_map.get(cid, item)
+                safe_title = titles_map.get(cid, item)
+            try:
+                safe_link = safe_link.replace('"', "").strip()
+            except Exception:
+                pass
+            try:
+                safe_title = safe_title.replace("<", "").replace(">", "").strip()
+            except Exception:
+                pass
+            text = f'• <a href="{safe_link}">{safe_title}</a>'
+            if reason:
+                text = f"{text} — {reason}"
+            lines.append(text)
+        msg_parts.append("⚠️ Не вдалося створити watch для:\n" + "\n".join(lines))
     if not msg_parts:
         msg_parts.append("❌ Не вдалося створити watch.")
 

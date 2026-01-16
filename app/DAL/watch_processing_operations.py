@@ -58,6 +58,7 @@ def get_pending_by_channel(channel_id: int) -> List[Dict[str, Any]]:
                 m.WatchPost.expected_media_fingerprint,
                 m.WatchPost.time_window_start,
                 m.WatchPost.time_window_end,
+                m.WatchPost.group_id,
             ).where(m.WatchPost.channel_id == channel_id, m.WatchPost.status == "pending")
         ).all()
         return [
@@ -70,6 +71,7 @@ def get_pending_by_channel(channel_id: int) -> List[Dict[str, Any]]:
                 "expected_media_fingerprint": r.expected_media_fingerprint,
                 "time_window_start": r.time_window_start,
                 "time_window_end": r.time_window_end,
+                "group_id": r.group_id,
             }
             for r in rows
         ]
@@ -339,7 +341,7 @@ def insert_watch_candidate(
     text_hash: str,
     similarity: float,
     message_text: str,
-    status: str = "pending",
+    status: str = "pending_candidate",
     expires_days: Optional[float] = None,
     ttl_days: Optional[float] = None,
 ) -> None:
