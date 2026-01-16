@@ -1081,17 +1081,16 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
     if created:
         lines = []
         for cid, link, title, wid in created:
-            safe_link = link
-            safe_title = title
             try:
-                safe_link = link.replace('"', "").strip()
+                safe_link = (link or "").strip().replace('"', "")
             except Exception:
-                pass
+                safe_link = link or ""
             try:
-                safe_title = title.replace("<", "").replace(">", "").strip()
+                safe_title = html.escape((title or "").strip())
             except Exception:
-                pass
-            lines.append(f'• <a href="{safe_link}">{safe_title}</a> (fallback wid={wid})')
+                safe_title = (title or "")
+            safe_link_esc = html.escape(safe_link)
+            lines.append(f'• <a href="{safe_link_esc}">{safe_title}</a> (fallback wid={wid})')
         msg_parts.append("✅ Watch(и) створено:\n" + "\n".join(lines))
     if failed:
         lines = []
@@ -1105,14 +1104,15 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                 safe_link = links_map.get(cid, item)
                 safe_title = titles_map.get(cid, item)
             try:
-                safe_link = safe_link.replace('"', "").strip()
+                safe_link = (safe_link or "").replace('"', "").strip()
             except Exception:
                 pass
             try:
-                safe_title = safe_title.replace("<", "").replace(">", "").strip()
+                safe_title = html.escape((safe_title or "").strip())
             except Exception:
-                pass
-            text = f'• <a href="{safe_link}">{safe_title}</a>'
+                safe_title = (safe_title or "")
+            safe_link_esc = html.escape(safe_link or "")
+            text = f'• <a href="{safe_link_esc}">{safe_title}</a>'
             if reason:
                 text = f"{text} — {reason}"
             lines.append(text)
