@@ -55,6 +55,8 @@ CANDIDATE_SIM_THRESHOLD = 0.70
 # Якщо текстові кандидат-пости схожі >= 0.99, вважаємо їх одним і тим самим кандидатам (не дублюємо).
 NEAR_IDENTICAL_TEXT_THRESHOLD = 0.99
 GROUP_NEAR_IDENTICAL_THRESHOLD = 0.95
+# Редагування: дрібні відмінності не вважаємо суттєвими, якщо ratio майже 1.0
+EDIT_NEAR_THRESHOLD = 0.99
 
 
 def _now_monotonic() -> float:
@@ -794,7 +796,6 @@ def _attach_listener_for_client(tag: str, cli) -> None:
     @cli.on(events.MessageEdited())
     async def _on_edited(ev: events.MessageEdited.Event):
         m: Message = ev.message
-        _pylog.info("edited: handler triggered cid=%s mid=%s", getattr(getattr(m, 'peer_id', None), 'channel_id', None), getattr(m, 'id', None))
 
         cid = None
         try:
@@ -849,8 +850,30 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             try:
                 msg_html_norm = _normalize_html_for_edit(msg_html)
                 expected_html_norm = _normalize_html_for_edit(expected_html)
-                # Для edit перевіряємо строго: будь-яка відмінність після нормалізації вважається редагуванням.
+                # Для edit: або повна ідентичність, або допускаємо дуже малу різницю (ratio>=EDIT_NEAR_THRESHOLD) без зміни лінків
                 ok = msg_html_norm == expected_html_norm
+                diff_ratio = 1.0
+                links_same = True
+                if not ok:
+                    try:
+                        exp_links = sorted(_collect_links_from_html(expected_html_norm))
+                        msg_links = sorted(_collect_links_from_html(msg_html_norm))
+                        links_same = exp_links == msg_links
+                    except Exception:
+                        links_same = True
+                    try:
+                        diff_ratio = SequenceMatcher(None, msg_html_norm, expected_html_norm).ratio()
+                    except Exception:
+                        diff_ratio = 0.0
+                    if diff_ratio >= EDIT_NEAR_THRESHOLD and links_same:
+                        ok = True
+                        _pylog.debug(
+                            "edited: wid=%s cid=%s mid=%s diff_ratio=%.3f (links unchanged) -> skip minor edit",
+                            wid,
+                            cid,
+                            mid,
+                            diff_ratio,
+                        )
             except Exception:
                 _pylog.exception("edited: exact_html_equal failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                 ok = False

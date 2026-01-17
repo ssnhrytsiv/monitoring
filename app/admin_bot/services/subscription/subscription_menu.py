@@ -45,8 +45,16 @@ async def _safe_answer(cb: CallbackQuery, text: str | None = None) -> None:
         raise
 
 
-def make_report_kb(page: int, total: int, has_report: bool) -> InlineKeyboardMarkup:
-    """Клавіатура навігації по звіту: стрілки + кнопка повернення в меню."""
+def make_report_kb(
+    page: int,
+    total: int,
+    has_report: bool,
+    extra_rows: list | None = None,
+) -> InlineKeyboardMarkup:
+    """
+    Клавіатура навігації по звіту: стрілки + кнопка повернення в меню.
+    Додатково може містити extra_rows (наприклад, кнопки підтвердження).
+    """
     buttons = []
 
     if total > 1:
@@ -57,6 +65,9 @@ def make_report_kb(page: int, total: int, has_report: bool) -> InlineKeyboardMar
                 InlineKeyboardButton(text="➡️", callback_data="report_page_next"),
             ]
         )
+
+    if extra_rows:
+        buttons.extend(extra_rows)
 
     buttons.append(
         [
@@ -105,7 +116,12 @@ async def cb_report_page_nav(cb: CallbackQuery) -> None:
     else:
         cur = (cur + 1) % total
     entry["page"] = cur
-    kb = make_report_kb(cur, total, has_report=entry.get("report_idx") is not None)
+    kb = make_report_kb(
+        cur,
+        total,
+        has_report=entry.get("report_idx") is not None,
+        extra_rows=entry.get("extra_rows"),
+    )
     await cb.message.edit_text(
         pages[cur],
         disable_web_page_preview=True,

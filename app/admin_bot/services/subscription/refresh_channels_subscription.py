@@ -648,14 +648,13 @@ async def refresh_channels_for_admin(
         )
         preview_lines.append("")
         preview_lines.append("Підтвердити відписку?")
-        kb_confirm = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="Так", callback_data=f"refresh_unsub_yes:{batch_id}"),
-                    InlineKeyboardButton(text="Ні", callback_data=f"refresh_unsub_no:{batch_id}"),
-                ]
+        confirm_rows = [
+            [
+                InlineKeyboardButton(text="Так", callback_data=f"refresh_unsub_yes:{batch_id}"),
+                InlineKeyboardButton(text="Ні", callback_data=f"refresh_unsub_no:{batch_id}"),
             ]
-        )
+        ]
+        kb_confirm = InlineKeyboardMarkup(inline_keyboard=confirm_rows)
         text_preview = "\n".join(preview_lines)
         pages = split_text_for_telegram(text_preview, max_len=5000)
         if len(pages) == 1:
@@ -667,7 +666,7 @@ async def refresh_channels_for_admin(
                 parse_mode="HTML",
             )
         else:
-            kb = make_report_kb(0, len(pages), has_report=False)
+            kb = make_report_kb(0, len(pages), has_report=False, extra_rows=confirm_rows)
             sent = await answer_with_retry(
                 reply_msg,
                 pages[0],
@@ -676,7 +675,7 @@ async def refresh_channels_for_admin(
                 reply_markup=kb,
             )
             if sent:
-                report_cache.register(sent.chat.id, sent.message_id, pages, None)
+                report_cache.register(sent.chat.id, sent.message_id, pages, None, confirm_rows)
         db.close()
         return
 
