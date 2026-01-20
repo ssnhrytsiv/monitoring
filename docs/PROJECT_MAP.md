@@ -20,8 +20,7 @@
 │   │   │   ├── __init__.py
 │   │   │   ├── active_watches_group.py
 │   │   │   ├── active_watches_menu.py
-│   │   │   ├── create_watch.py
-│   │   │   └── join_channels.py
+│   │   │   └── create_watch.py
 │   │   ├── handlers1.py
 │   │   ├── keyboards.py
 │   │   ├── notifier.py
@@ -87,8 +86,7 @@
 │   │   ├── models.py
 │   │   ├── monitor_links_bridge.py
 │   │   ├── owner_conflict_guard.py
-│   │   ├── post_match.py
-│   │   ├── post_matcher.py
+│   │   ├── post_match.py
 │   │   ├── post_watch_db.py
 │   │   ├── posts_watch_result_db.py
 │   │   ├── requested_reconciler.py
@@ -278,19 +276,7 @@ InviteCheckStatus class        61 app/services/requested_reconciler.py class Inv
 InviteCheckStatus.OK variable     62 app/services/requested_reconciler.py OK = "ok"
 InviteCheckStatus.TERMINAL variable     64 app/services/requested_reconciler.py TERMINAL = "terminal"
 InviteCheckStatus.TRANSIENT variable     63 app/services/requested_reconciler.py TRANSIENT = "transient"
-InviteMap        class       102 app/services/models.py class InviteMap(Base):
-InviteMap.__repr__ member      118 app/services/models.py def __repr__(self) -> str:
-InviteMap.__tablename__ variable    111 app/services/models.py __tablename__ = "invite_map"
-InviteMap.channel_id variable    114 app/services/models.py channel_id = Column(Integer, nullable=True)
-InviteMap.invite_hash variable    113 app/services/models.py invite_hash = Column(Text, primary_key=True)
-InviteMap.title  variable    115 app/services/models.py title = Column(Text, nullable=True)
-InviteMap.updated_at variable    116 app/services/models.py updated_at = Column(Integer, nullable=True)
-InviteStatus     class       122 app/services/models.py class InviteStatus(Base):
-InviteStatus.__repr__ member      136 app/services/models.py def __repr__(self) -> str:
-InviteStatus.__tablename__ variable    130 app/services/models.py __tablename__ = "invite_status"
-InviteStatus.invite_hash variable    132 app/services/models.py invite_hash = Column(Text, primary_key=True)
-InviteStatus.status variable    133 app/services/models.py status = Column(Text, nullable=False)
-InviteStatus.ts  variable    134 app/services/models.py ts = Column(Integer, nullable=False)
+invite_cache     table      —   (legacy InviteMap/InviteStatus дропнуті; кеш інвайтів тепер у invite_cache.*
 JSONFormatter    class         9 app/logging_json.py class JSONFormatter(logging.Formatter):
 JSONFormatter.format member       10 app/logging_json.py def format(self, record: logging.LogRecord) -> str:
 JoinChannels     class         3 app/watch_bot/states.py class JoinChannels(StatesGroup):
@@ -484,8 +470,14 @@ _TRAIL_PUNCT     variable     35 app/utils/link_parser.py _TRAIL_PUNCT = ".,;:)]
 _USER_LOCKS      variable     16 app/services/monitor_links_bridge.py _USER_LOCKS: Dict[int, bool] = {}
 _USER_RE         variable     10 app/watch_bot/services/channels_repo.py _USER_RE = re.compile(r"(?:https?://)?t\.me/([A-Za-z0-9_]{3,})/?$", re.IGNORECASE)
 _WS_CACHE        variable     40 app/services/gsheets_writer.py _WS_CACHE: Dict[str, Any] = {}
-_ZERO_WIDTH      variable     11 app/services/post_matcher.py _ZERO_WIDTH = ("\u200b", "\u200e", "\u200f")
 _ZW              variable      7 app/services/html_match.py _ZW = "[\u200b\u200c\u200d\u200e\u200f]" # zero-width chars
+_strip_zw        function     10 app/services/post_match.py def _strip_zw(s: str) -> str:
+normalize_text   function     12 app/services/post_match.py def normalize_text(s: Optional[str]) -> str:
+extract_links_norm function     20 app/services/post_match.py def extract_links_norm(s: str) -> list[str]:
+_canon_url       function     24 app/services/post_match.py def _canon_url(u: str) -> str:
+exact_match      function     28 app/services/post_match.py def exact_match(a: str, b: str) -> bool:
+fuzzy_ratio      function     31 app/services/post_match.py def fuzzy_ratio(a: str, b: str) -> float:
+fuzzy_match      function     34 app/services/post_match.py def fuzzy_match(a: str, b: str, threshold: float = 0.70) -> bool:
 __all__          variable      4 app/flows/batch_links/__init__.py __all__ = ["process_links", "run_link_queue_worker"]
 __all__          variable      4 app/services/__init__.py __all__ = ["list_templates_full"]
 __all__          variable      9 app/services/channel_db.py __all__ = [
@@ -507,8 +499,6 @@ __table_args__   variable    213 app/services/models.py __table_args__ = (
 __tablename__    variable     50 app/services/requested_reconciler_db.py __tablename__ = "invite_check"
 __tablename__    variable     65 app/services/requested_reconciler_db.py __tablename__ = "requested_check"
 __tablename__    variable     85 app/services/models.py __tablename__ = "membership"
-__tablename__    variable    111 app/services/models.py __tablename__ = "invite_map"
-__tablename__    variable    130 app/services/models.py __tablename__ = "invite_status"
 __tablename__    variable    148 app/services/models.py __tablename__ = "url_cache"
 __tablename__    variable    171 app/services/models.py __tablename__ = "invite_check"
 __tablename__    variable    205 app/services/models.py __tablename__ = "requested_check"
@@ -540,7 +530,6 @@ _busy_reply      function     56 app/watch_bot/handlers/join_channels.py async d
 _calc_coverage_at function     82 app/plugins/posts_watch_listener.py def _calc_coverage_at(hours_after: float | None = None) -> Optional[str]:
 _calc_coverage_at function    152 app/watch_bot/services/edit_watch_service.py def _calc_coverage_at(hours_after: float | None = None) -> Optional[str]:
 _calc_next       function    123 app/services/requested_reconciler_db.py def _calc_next(base: int, tries: int, max_cap: int, factor: float = 2.0) -> int:
-_canon_url       function     30 app/services/post_matcher.py def _canon_url(u: str) -> str:
 _changed         variable     35 app/plugins/progress_live.py _changed: bool = False
 _chat_allowed    function    157 app/plugins/channel_info.py def _chat_allowed(event) -> bool:
 _check_invite_with_session function    220 app/services/requested_reconciler.py async def _check_invite_with_session(client, invite_hash: str) -> Tuple["InviteCheckStatus", Optional[Any]]:
@@ -798,9 +787,6 @@ _rh              unknown     104 app/plugins/posts_watch_listener.py from app.se
 _rh2             unknown      69 app/debug/debug_post_diff_interactive.py from app.services.html_render import render_html as _rh2 # type: ignore
 _rr              variable     55 app/services/account_pool.py _rr = 0 # round-robin індекс
 _save_meta       function     34 app/plugins/post_templates.py def _save_meta():
-_send_watch_from_links_batch_bot function    255 app/watch_bot/handlers1.py async def _send_watch_from_links_batch_bot(bot, targets: List[str], mins: int, template_id: int) -> bool:
-_send_watch_from_links_batch_bot function    259 bot_create_watch.py async def _send_watch_from_links_batch_bot(bot, targets: List[str], mins: int, template_id: int, created_by: int) -> bool:
-_send_watch_from_links_batch_bot function    295 app/watch_bot/handlers/create_watch.py async def _send_watch_from_links_batch_bot(bot, targets: List[str], mins: int, template_id: int) -> bool:
 _session_name    unknown       7 app/flows/batch_links/queue_worker.py iter_pool_clients, mark_flood, mark_limit, session_name as _session_name,
 _session_name    unknown      22 app/flows/batch_links/process_links.py iter_ready_pool_clients, bump_cooldown, mark_flood, mark_limit, session_name as _session_name
 _set_flood_cooldown function    184 app/services/requested_reconciler.py def _set_flood_cooldown(sess: str, seconds: int) -> float:
@@ -819,7 +805,6 @@ _sqlite_pragmas  function     53 app/services/models.py def _sqlite_pragmas(dbap
 _status          function     71 app/plugins/batch_links.py async def _status(evt):
 _strip_conflict  function    135 app/flows/batch_links/process_links.py def _strip_conflict(status: str) -> str:
 _strip_simple_tags function    168 app/plugins/posts_watch_listener.py def _strip_simple_tags(html_fragment: str) -> str:
-_strip_zw        function     13 app/services/post_matcher.py def _strip_zw(s: str) -> str:
 _table_exists    function     47 app/services/link_queue.py def _table_exists(c: sqlite3.Connection, name: str) -> bool:
 _tag_for_entity  function     25 app/services/html_render.py def _tag_for_entity(e) -> Tuple[str, str]:
 _touch_oldest_event_ts function     61 app/services/gsheets_buffer.py def _touch_oldest_event_ts():
@@ -867,8 +852,6 @@ batch_update_values function    353 app/services/gsheets_writer.py def batch_upd
 begin            function     55 app/services/owner_conflict_guard.py def begin(owner: str, source_ref: str, action: str) -> Tuple[bool, str]:
 build_group_keyboard function     33 app/watch_bot/utils/active_watches_pagination.py def build_group_keyboard(
 build_group_table function     58 app/watch_bot/utils/active_watches_formatters.py def build_group_table(
-build_media_fingerprint function     65 app/services/post_matcher.py def build_media_fingerprint(msg) -> Optional[str]:
-build_text_fingerprint function     54 app/services/post_matcher.py def build_text_fingerprint(s: Optional[str]) -> Tuple[str, int, str]:
 bulk_defer_session_invites function    308 app/services/requested_reconciler_db.py def bulk_defer_session_invites(session: str, next_ts_epoch: int) -> None:
 bulk_defer_session_requested function    405 app/services/requested_reconciler_db.py def bulk_defer_session_requested(session: str, next_ts_epoch: int) -> None:
 bump_cooldown    function    109 app/services/account_pool.py def bump_cooldown(client: TelegramClient, seconds: int) -> None:
@@ -922,7 +905,6 @@ exact_match      function      9 app/services/post_match.py def exact_match(a: s
 export_channels_table function    229 app/services/googlesheets/export_channels_table.py def export_channels_table(logger: Optional[logging.Logger] = None) -> bool:
 extract_links    function     85 app/utils/link_parser.py def extract_links(text: str) -> List[str]:
 extract_links_any function    164 app/utils/link_parser.py def extract_links_any(msg_or_text: Union[str, "TgMessage"]) -> List[str]:
-extract_links_norm function     38 app/services/post_matcher.py def extract_links_norm(s: str) -> List[str]:
 fetch_due        function    137 app/services/link_queue.py def fetch_due(limit: int = 20) -> List[Tuple[int, str, int, Optional[int], Optional[int], Optional[str], Optional[str]]]:
 fetch_rows       function     41 app/services/googlesheets/export_channels_table.py def fetch_rows(db_path: str, sql_path: str) -> List[List[Any]]:
 fetch_unsent_events function    281 app/services/posts_watch_result_db.py def fetch_unsent_events(limit: int = 100) -> List[Tuple[int, int, str, str, str]]:
@@ -1002,7 +984,6 @@ is_already_subscribed function    233 app/services/account_pool.py async def is_
 is_already_subscribed_any function     12 app/services/subscription_check.py async def is_already_subscribed_any(url: str) -> Optional[str]:
 is_bad           function     38 app/services/db/bad_invites.py def is_bad(invite_hash: str) -> Tuple[bool, Optional[int], Optional[str]]:
 is_invite        function     77 app/utils/link_parser.py def is_invite(url: str) -> bool:
-is_match_message function     98 app/services/post_matcher.py def is_match_message(
 is_processing    function      4 app/watch_bot/user_state.py def is_processing(uid: int) -> bool:
 is_processing    function     10 app/watch_bot/processing_guard.py def is_processing(user_id: int) -> bool:
 is_requested     function    431 app/services/requested_reconciler_db.py def is_requested(session: str, channel_id: int) -> bool:
@@ -1042,7 +1023,6 @@ log              variable      7 app/watch_bot/services/channels_repo.py log = l
 log              variable      8 app/watch_bot/services/active_watches_service.py log = logging.getLogger("active_watches.service")
 log              variable      8 app/plugins/resolve_channel.py log = get_logger("plugin.resolve_channel")
 log              variable      8 app/utils/throttle.py log = logging.getLogger("utils.throttle")
-log              variable      9 app/services/post_matcher.py log = logging.getLogger("services.post_matcher")
 log              variable     10 app/services/googlesheets/channels_export_service.py log = logging.getLogger("channels_exporter")
 log              variable     10 app/services/monitor_links_bridge.py log = logging.getLogger("monitor_links_bridge")
 log              variable     10 app/services/subscription_check.py log = logging.getLogger("services.subscription_check")
@@ -1126,7 +1106,6 @@ next_ready       variable     49 app/services/account_pool.py next_ready: float 
 normalize        function     53 app/utils/link_parser.py def normalize(url: str) -> str:
 normalize_target_link function     12 app/watch_bot/services/channels_repo.py def normalize_target_link(target: str) -> str:
 normalize_text   function      3 app/services/post_match.py def normalize_text(s: str) -> str:
-normalize_text   function     18 app/services/post_matcher.py def normalize_text(s: Optional[str]) -> str:
 note_conflict    function     91 app/services/owner_conflict_guard.py def note_conflict(owner: str, channel_id: Optional[int], source_ref: Optional[str], reason: str) -> None:
 note_owner_conflict function    157 app/services/channel_facts.py def note_owner_conflict(channel_id: int, incoming_owner: str, source_link: Optional[str]) -> None:
 note_requested   function    336 app/services/requested_reconciler_db.py def note_requested(session: str, channel_id: int, start_after_sec: int = 60) -> None:

@@ -30,8 +30,8 @@ from app.services.account_pool import (
 )
 from app.config import API_ID, API_HASH
 from telethon import TelegramClient
-from app.admin_bot.db.session import SessionLocal
-from app.admin_bot.db import models as m
+from app.db.session import SessionLocal
+from app.db import models as m
 
 DEFAULT_SESSIONS = [
     "tg_session.session",
@@ -152,14 +152,21 @@ def _report_missing_in_sessions(known: Set[int], actual_all: Set[int]) -> None:
     db = SessionLocal()
     try:
         rows = (
-            db.query(m.Channel.id, m.Channel.title, m.Channel.owner_display, m.Channel.owner_username)
+            db.query(
+                m.Channel.id,
+                m.Channel.title,
+                m.Channel.owner_admin_id,
+                m.Channel.owner_username,
+                m.Admin.display,
+            )
+            .outerjoin(m.Admin, m.Admin.id == m.Channel.owner_admin_id)
             .filter(m.Channel.id.in_(missing))
             .all()
         )
     finally:
         db.close()
-    for cid, title, od, ou in rows:
-        owner = od or (f"@{ou}" if ou else "—")
+    for cid, title, owner_admin_id, ou, adm_display in rows:
+        owner = adm_display or (f"@{ou}" if ou else (f"id={owner_admin_id}" if owner_admin_id else "—"))
         print(f"cid={cid} title={title or '—'} owner={owner}")
 
 

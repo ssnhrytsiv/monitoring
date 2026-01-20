@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import html
-from typing import List, Tuple
+import re
+from typing import Any, Iterable, List, Tuple
 
 from telethon.tl.types import (
     Message,
@@ -57,27 +58,67 @@ def _tag_for_entity(e) -> Tuple[str, str]:
     # за замовчуванням – без тегів
     return "", ""
 
-def render_html(msg: Message) -> str:
+def _tag_for_generic_entity(e: Any) -> Tuple[str, str]:
     """
-    Будує HTML із врахуванням entities (жирний, курсив, підкреслення, лінки, код, цитати, спойлери).
-    Емодзі зберігаються як є (це звичайні Юнікод-символи).
-    Переноси рядків -> <br>.
+    Дає open/close тег для сутності (Telethon або Aiogram).
+    Працює через duck-typing: для Aiogram використовує .type, для Telethon — isinstance.
     """
-    text = (getattr(msg, "message", "") or "")
-    if not text:
+    etype = getattr(e, "type", None)
+
+    # Aiogram string-based types
+    if isinstance(etype, str):
+        t = etype.lower()
+        if t == "bold":
+            return "<b>", "</b>"
+        if t == "italic":
+            return "<i>", "</i>"
+        if t in {"underline", "text_underline"}:
+            return "<u>", "</u>"
+        if t in {"strikethrough", "text_strikethrough"}:
+            return "<s>", "</s>"
+        if t in {"spoiler"}:
+            return '<span class="tg-spoiler">', "</span>"
+        if t in {"code"}:
+            return "<code>", "</code>"
+        if t in {"pre"}:
+            return "<pre>", "</pre>"
+        if t in {"blockquote"}:
+            return "<blockquote>", "</blockquote>"
+        if t == "text_link":
+            href = html.escape(getattr(e, "url", "") or "", quote=True)
+            return f'<a href="{href}">', "</a>"
+        if t in {"url"}:
+            return '<a href="__AUTOURL__">', "</a>"
+        if t in {"text_mention"}:
+            uid = getattr(e, "user", None)
+            uid_val = None
+            if uid is not None:
+                uid_val = getattr(uid, "id", None)
+            uid_val = uid_val if uid_val is not None else getattr(e, "user_id", None)
+            href = f"tg://user?id={int(uid_val or 0)}"
+            return f'<a href="{html.escape(href, quote=True)}">', "</a>"
+
+    # Telethon classes (fallback)
+    try:
+        return _tag_for_entity(e)
+    except Exception:
+        return "", ""
+
+
+def render_html_generic(text: str, entities: Iterable[Any] | None = None) -> str:
+    """
+    Побудова HTML з plain-text + колекції сутностей (Telethon або Aiogram).
+    """
+    txt = text or ""
+    ents = list(entities or [])
+    if not txt:
         return ""
 
-    entities = getattr(msg, "entities", None) or []
-    # boundaries: список подій відкриття/закриття тегів
-    # Кожна подія: (pos, is_close, priority, html)
-    # priority робимо так, щоб закриття відбувалось ПЕРЕД відкриттям на тій самій позиції
     opens: List[Tuple[int, int, int, str]] = []
     closes: List[Tuple[int, int, int, str]] = []
-
-    # Заздалегідь збережемо фрагменти для URL-авто
     url_ranges = {}
 
-    for e in entities:
+    for e in ents:
         try:
             off = int(getattr(e, "offset", 0) or 0)
             ln = int(getattr(e, "length", 0) or 0)
@@ -88,57 +129,74 @@ def render_html(msg: Message) -> str:
         except Exception:
             continue
 
-        open_tag, close_tag = _tag_for_entity(e)
-
-        # Особливий випадок авто-URL: треба знати сам фрагмент щоб підставити href
-        if isinstance(e, MessageEntityUrl):
-            frag = text[start:end]
+        open_tag, close_tag = _tag_for_generic_entity(e)
+        # Особливий випадок авто-URL
+        if (isinstance(getattr(e, "type", None), str) and getattr(e, "type").lower() == "url") or isinstance(e, MessageEntityUrl):
+            frag = txt[start:end]
             url_ranges[(start, end)] = frag
 
-        # open: is_close=0; close: is_close=1
-        # Для сортування: закриття має пріоритет перед відкриттям (priority: close=0, open=1)
         opens.append((start, 0, 1, open_tag))
         closes.append((end, 1, 0, close_tag))
 
     events_all = opens + closes
-    # Сортуємо: за позицією; далі за is_close (щоб закриття ішло першим); далі за priority
     events_all.sort(key=lambda x: (x[0], x[1], x[2]))
 
     out = []
     cur = 0
     for pos, is_close, _, tag in events_all:
-        pos = max(0, min(len(text), pos))
+        pos = max(0, min(len(txt), pos))
         if pos > cur:
-            out.append(_escape(text[cur:pos]))
+            out.append(_escape(txt[cur:pos]))
             cur = pos
 
         if tag:
             if is_close:
                 out.append(tag)
             else:
-                # якщо це авто-URL, треба підставити правильний href (фрагмент від [pos .. next close])
-                if tag.startswith("<a href=\"__AUTOURL__\""):
-                    # шукаємо відповідне закриття, щоб зрозуміти кінцеву позицію
-                    # спростимо: в url_ranges вже є (start,end) для такого шматка
-                    # знаходимо range із start==pos
+                if tag.startswith('<a href="__AUTOURL__"'):
                     end_pos = None
                     for (s, e) in url_ranges.keys():
                         if s == pos:
                             end_pos = e
                             frag = url_ranges[(s, e)]
                             href = html.escape(frag, quote=True)
-                            out.append(f"<a href=\"{href}\">")
+                            out.append(f'<a href="{href}">')
                             break
                     if end_pos is None:
-                        # не знайшли – підставимо пустий href
-                        out.append("<a href=\"#\">")
+                        out.append('<a href="#">')
                 else:
                     out.append(tag)
 
-    if cur < len(text):
-        out.append(_escape(text[cur:]))
+    if cur < len(txt):
+        out.append(_escape(txt[cur:]))
 
     html_out = "".join(out)
-    # Переноси рядків => <br>
     html_out = html_out.replace("\n", "<br>")
+    html_out = re.sub(r"\s+(</(?:b|i|u|s|code|pre|blockquote|span|a)>)", r"\1", html_out, flags=re.IGNORECASE)
     return html_out
+
+
+def render_html_from_aiogram(msg: Any) -> str:
+    """
+    Рендер для aiogram-повідомлення через універсальний рендер.
+    """
+    text = (getattr(msg, "text", None) or getattr(msg, "caption", None) or "") or ""
+    entities = getattr(msg, "entities", None) or getattr(msg, "caption_entities", None) or []
+    return render_html_generic(text, entities)
+
+
+def render_html(msg: Any) -> str:
+    """
+    Єдиний публічний рендер: приймає або Telethon Message, або Aiogram Message,
+    підтягує текст/ентіті й будує HTML через render_html_generic.
+    """
+    # Telethon Message: .message + .entities
+    if isinstance(msg, Message):
+        text = (getattr(msg, "message", "") or "")
+        entities = getattr(msg, "entities", None) or []
+        return render_html_generic(text, entities)
+
+    # Aiogram-like
+    text = (getattr(msg, "text", None) or getattr(msg, "caption", None) or "") or ""
+    entities = getattr(msg, "entities", None) or getattr(msg, "caption_entities", None) or []
+    return render_html_generic(text, entities)

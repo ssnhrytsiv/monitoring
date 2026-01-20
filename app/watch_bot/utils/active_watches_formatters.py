@@ -59,7 +59,7 @@ def build_group_table(
     all_items: List[GroupItem],
     templates_map: Dict[int, Dict[str, Any]],
     channel_titles: Dict[int, str],
-    owner_display: str,
+    owner_name: str,
 ) -> str:
     ID_W = 6
     TITLE_W = 10
@@ -67,7 +67,7 @@ def build_group_table(
     STATUS_W = 2
 
     lines: List[str] = []
-    lines.append(owner_display)
+    lines.append(owner_name)
 
     header_line = (
         f"{'ID':<{ID_W}} "
@@ -101,7 +101,7 @@ def format_single_watch(
     watch: SingleWatch,
     templates_map: Dict[int, Dict[str, Any]],
     channel_titles: Dict[int, str],
-    owner_display: str | None = None,
+    owner_name: str | None = None,
 ) -> str:
     """
     Формує текст для екрану редагування одного watch'а.
@@ -116,18 +116,16 @@ def format_single_watch(
     tpl_info = templates_map.get(tpl_id or 0) or {}
     raw_title = tpl_info.get("title") or (f"tpl#{tpl_id}" if tpl_id else "—")
     raw_chan_title = channel_titles.get(int(channel_id) if channel_id else 0, "—")
-    raw_status = status or ""
     raw_tw_txt = fmt_tw_end_human(
         str(time_window_end)[:16] if time_window_end is not None else None
     )
-    raw_owner = owner_display or raw_chan_title or "—"
+    raw_owner = owner_name or raw_chan_title or "—"
     raw_source = source_url or ""
 
     # ці поля ми можемо легенько екранувати (на випадок, якщо колись знову ввімкнемо MarkdownV2),
     # але це не обов'язково для plain text
     title = escape_mdv2(raw_title)
     chan_title = escape_mdv2(raw_chan_title)
-    status_text = escape_mdv2(raw_status)
     tw_txt = escape_mdv2(raw_tw_txt)
     owner = escape_mdv2(raw_owner)
 

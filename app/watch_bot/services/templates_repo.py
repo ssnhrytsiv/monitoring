@@ -1,8 +1,9 @@
 # app/watch_bot/services/templates_repo.py
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 import logging
 
-from app.DAL.post_templates_operations import list_templates_full
+from app.DAL.post_templates_operations import list_templates_full_db
+from app.DAL import session_scope
 
 log = logging.getLogger("templates_repo")
 
@@ -13,7 +14,8 @@ def load_templates_map() -> Dict[int, Dict[str, Any]]:
     Використовує DAL list_templates_full і не звертається до полів через індекси.
     """
     try:
-        rows = list_templates_full()
+        with session_scope() as db:
+            rows = list_templates_full_db(db)
     except Exception as e:
         log.exception("load_templates_map failed: %s", e)
         return {}
@@ -21,18 +23,9 @@ def load_templates_map() -> Dict[int, Dict[str, Any]]:
     templates: Dict[int, Dict[str, Any]] = {}
     for row in rows:
         try:
-            (
-                template_id,
-                _text,
-                _mode,
-                _threshold,
-                _created_at,
-                title,
-                links_json,
-            ) = row
-            templates[int(template_id)] = {
-                "title": title,
-                "links_json": links_json,
+            templates[int(row.id)] = {
+                "title": row.title,
+                "links_json": row.links,
             }
         except Exception:
             continue

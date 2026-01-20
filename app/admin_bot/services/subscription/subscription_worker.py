@@ -1,39 +1,36 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import math
 import re
 from typing import List, Optional, Dict, Tuple
 
-from sqlalchemy import select
-from aiogram.exceptions import TelegramRetryAfter, TelegramServerError
-
 from app.admin_bot.services import report_cache
 from app.services import link_queue
 from app.services.account_pool import mark_flood, mark_limit, bump_cooldown, session_name
 from app.services.joiner import ensure_join, _extract_invite_hash
-from app.DAL.membership_operations import MembershipDAO, FINAL_GLOBAL
+from app.DAL import membership_operations as mem_db
+from app.DAL.membership_operations import FINAL_GLOBAL
 from app.admin_bot.services.subscription.subscription_for_bot import ensure_bot_started
 from app.utils.throttle import LINK_DELAY_INVITE_MAX, LINK_DELAY_PUBLIC_MAX
 from app.utils.link_parser import sanitize_link, extract_bot_username
-from app.admin_bot.services.channels import upsert_channel_full
-from app.admin_bot.db.models import upsert_membership
+from app.DAL.channels_operations import upsert_channel_full
+from app.db.models import upsert_membership
 from app.admin_bot.services.owner_conflicts import log_conflict
-from app.admin_bot.services.subscription.subscription_menu import split_text_for_telegram, make_report_kb
+from app.admin_bot.services.subscription.subscription_menu import split_text_for_telegram
+from app.admin_bot.services.subscription.keyboards import make_report_keyboard
 from app.admin_bot.services.subscription import batch_cache
 from app.admin_bot.services.progress import Progress
 from app.admin_bot.services import admins as svc_admins
 from app.admin_bot.services import networks as svc_networks
-from app.admin_bot.db.session import SessionLocal
-from app.admin_bot.db import models as m
+from app.db.session import session_scope
 from app.admin_bot.services.subscription.subscription_slots_pool import get_ready_slot
 from app.admin_bot.services.subscription.subscription_status import normalize_url, render_html_with_statuses
 from app.admin_bot.services.subscription.subscription_report import answer_with_retry
 from app.admin_bot.services.subscription.subscription_utils import norm_keys as collect_norm_keys
 from app.logging_json import get_logger, configure_logging
 from app.DAL import channels_operations as cho
-from app.DAL.membership_operations import _extract_invite_hash
+from app.DAL import requested_operations as req_ops
 
 # Гарантований мінімальний логер (на випадок, якщо головний процес не налаштував logging).
 if not logging.getLogger().handlers:
@@ -45,33 +42,39 @@ _INVITE_STUB_RE = re.compile(r"^https?://t\\.me/(?:joinchat/?)?(?:\\+)?$")
 
 
 def _find_channel_by_link(url: str, cleaned: Optional[str] = None):
-    db = SessionLocal()
-    try:
+    with session_scope() as db:
         row = cho.find_channel_by_link(db, url)
         if not row and cleaned and cleaned != url:
             row = cho.find_channel_by_link(db, cleaned)
         return row
-    finally:
-        db.close()
 
 
 def _get_channel_id_by_url(url: str, cleaned: Optional[str] = None):
-    db = SessionLocal()
-    try:
+    with session_scope() as db:
         cid = cho.get_channel_id_by_url(db, url)
         if not cid and cleaned and cleaned != url:
             cid = cho.get_channel_id_by_url(db, cleaned)
         return cid
-    finally:
-        db.close()
 
 
-def _add_link(channel_id, raw_url, kind, batch_msg_id, owner_display, owner_username):
-    db = SessionLocal()
-    try:
-        cho.add_link(db, channel_id, raw_url, kind, batch_msg_id, owner_display, owner_username)
-    finally:
-        db.close()
+def _add_link(
+    channel_id,
+    raw_url,
+    kind,
+    batch_msg_id,
+    owner_admin_id: Optional[int],
+    owner_username: Optional[str],
+):
+    with session_scope() as db:
+        cho.add_link(
+            db,
+            channel_id,
+            raw_url,
+            kind,
+            batch_msg_id,
+            owner_admin_id=owner_admin_id,
+            owner_username=owner_username,
+        )
 
 
 async def process_batch(
@@ -79,6 +82,7 @@ async def process_batch(
     batch_id: str,
     chat_id: int,
     reply_msg,
+    admin_id: Optional[int],
     admin_display: str,
     admin_username: Optional[str],
     admin_tg_id: Optional[int],
@@ -90,13 +94,10 @@ async def process_batch(
     """
     Обробляє записані в link_queue URL для batch_id. Використовує один lease, якщо доступний.
     """
-    db = SessionLocal()
-    membership_db = MembershipDAO(db)
     urls_rec = link_queue.fetch_batch_due(batch_id, limit=200)
     log.info("queue_worker.start batch_id=%s chat_id=%s urls=%s", batch_id, chat_id, len(urls_rec))
     if not urls_rec:
         await answer_with_retry(reply_msg, "Черга порожня або ще не готова.")
-        db.close()
         return
 
     total = len(urls_rec)
@@ -104,9 +105,33 @@ async def process_batch(
     await progress.start()
 
     result_items: List[Dict] = []
-    admin_id: Optional[int] = None
-    current_owner_display = admin_display
+    admin_id: Optional[int] = admin_id
     current_owner_username = admin_username
+
+    def _cache_invite_status(
+        invite_hash: Optional[str],
+        *,
+        cid: Optional[int],
+        title: Optional[str],
+        status: str,
+        sess: Optional[str],
+        last_error: Optional[str] = None,
+    ) -> None:
+        if not invite_hash:
+            return
+        try:
+            with session_scope() as db_cache:
+                mem_db.invite_cache_upsert(
+                    db_cache,
+                    invite_hash,
+                    channel_id=cid,
+                    title=title,
+                    status=status,
+                    session=sess,
+                    last_error=last_error,
+                )
+        except Exception:
+            pass
 
     # Попередня перевірка: якщо URL уже відомий у links (DAO) і є фінальний статус у membership_db,
     # одразу ставимо "already" без мережевих викликів.
@@ -139,7 +164,7 @@ async def process_batch(
             seen_urls[k] = entry
 
     for rec in urls_rec:
-        _, url, *_ = rec
+        url = rec.url
         bot_username = extract_bot_username(url)
         if bot_username:
             # Боти не рахуються у ETA підписки на канали
@@ -171,19 +196,21 @@ async def process_batch(
         preferred_session: Optional[str] = None
         if inv_hash:
             try:
-                preferred_session = membership_db.invite_check_last_session(inv_hash)
+                with session_scope() as db_sess:
+                    preferred_session = mem_db.invite_check_last_session(db_sess, inv_hash)
             except Exception:
                 preferred_session = None
         # 1) find_channel_by_link (raw/clean)
         try:
             link_row = _find_channel_by_link(url, cleaned)
             if link_row:
-                cid_link, title_link = link_row
-                final = membership_db.any_final_for_channel(cid_link)
+                cid_link, title_link = link_row.channel_id, link_row.title
+                with session_scope() as db_link:
+                    final = mem_db.any_final_for_channel(db_link, cid_link)
                 if final:
                     final_norm = "already" if final == "joined" else final
                     if final_norm in FINAL_GLOBAL and final_norm != "requested":
-                        sess_known = membership_db.get_any_session_for_channel(cid_link)
+                        sess_known = mem_db.get_any_session_for_channel(db_link, cid_link)
                         data = (final_norm, title_link, cid_link, "link_cache", sess_known)
                         _register_preknown(url, data)
                         if cleaned != url:
@@ -193,11 +220,12 @@ async def process_batch(
             # 1b) get_channel_id_by_url
             cid_raw = _get_channel_id_by_url(url, cleaned)
             if cid_raw:
-                final = membership_db.any_final_for_channel(cid_raw)
+                with session_scope() as db_raw:
+                    final = mem_db.any_final_for_channel(db_raw, cid_raw)
                 if final:
                     final_norm = "already" if final == "joined" else final
                     if final_norm in FINAL_GLOBAL and final_norm != "requested":
-                        sess_known = membership_db.get_any_session_for_channel(cid_raw)
+                        sess_known = mem_db.get_any_session_for_channel(db_raw, cid_raw)
                         data = (final_norm, None, cid_raw, "link_raw", sess_known)
                         _register_preknown(url, data)
                         if cleaned != url:
@@ -206,14 +234,17 @@ async def process_batch(
 
             # 2) Інвайт: якщо знаємо invite_hash -> channel_id і фінальний статус
             if inv_hash:
-                cid_cached, title_cached = membership_db.map_invite_get(inv_hash)
-                if cid_cached:
-                    final = membership_db.any_final_for_channel(int(cid_cached))
+                with session_scope() as db_inv_cache:
+                    cache = mem_db.invite_cache_get(db_inv_cache, inv_hash)
+                if cache and cache.channel_id:
+                    cid_cached = int(cache.channel_id)
+                    title_cached = cache.title
+                    final = mem_db.any_final_for_channel(db_inv_cache, cid_cached)
                     if final:
                         final_norm = "already" if final == "joined" else final
                         if final_norm in FINAL_GLOBAL and final_norm != "requested":
-                            sess_known = membership_db.get_any_session_for_channel(int(cid_cached))
-                            data = (final_norm, title_cached, int(cid_cached), "invite_cache", sess_known)
+                            sess_known = mem_db.get_any_session_for_channel(db_inv_cache, cid_cached)
+                            data = (final_norm, title_cached, cid_cached, "invite_cache", sess_known)
                             _register_preknown(url, data)
                             if cleaned != url:
                                 _register_preknown(cleaned, data)
@@ -223,11 +254,12 @@ async def process_batch(
 
         # 3) url_cache — фінальні стани або duplicate
         try:
-            ust = membership_db.url_get(url) or membership_db.url_get(cleaned)
+            with session_scope() as db_url:
+                url_rec = mem_db.url_get(db_url, url) or mem_db.url_get(db_url, cleaned)
         except Exception:
-            ust = None
-        if ust:
-            status_norm = "already" if ust == "joined" else ust
+            url_rec = None
+        if url_rec:
+            status_norm = "already" if url_rec == "joined" else url_rec
             if (status_norm in FINAL_GLOBAL and status_norm != "requested") or status_norm == "duplicate":
                 data = (status_norm, None, None, "url_cache", None)
                 _register_preknown(url, data)
@@ -237,14 +269,16 @@ async def process_batch(
 
         # Якщо сюди дійшли — мережа потрібна
         if inv_hash:
-            # Якщо в invite_status уже є фінальний статус (наприклад, invalid), не рахуємо у ETA
+            # Якщо в invite_cache уже є фінальний статус (наприклад, invalid), не рахуємо у ETA
             try:
-                st_inv = membership_db.invite_status_get(inv_hash)
+                with session_scope() as db_inv:
+                    cache = mem_db.invite_cache_get(db_inv, inv_hash)
+                    st_inv = cache.status if cache else None
             except Exception:
                 st_inv = None
             if st_inv and st_inv != "requested":
                 final_norm = "already" if st_inv == "joined" else st_inv
-                data = (final_norm, None, None, "invite_status", None)
+                data = (final_norm, None, None, "invite_cache_status", None)
                 _register_preknown(url, data)
                 if cleaned != url:
                     _register_preknown(cleaned, data)
@@ -261,8 +295,7 @@ async def process_batch(
         )
 
     # Якщо є існуючий адмін з такими даними — використовуємо його одразу, щоб уникнути фальшивих owner_conflict
-    db_lookup = SessionLocal()
-    try:
+    with session_scope() as db_lookup:
         existing_admin = svc_admins.find_admin(
             db_lookup,
             tg_id=admin_tg_id,
@@ -271,10 +304,7 @@ async def process_batch(
         )
         if existing_admin:
             admin_id = existing_admin.id
-            current_owner_display = existing_admin.display
             current_owner_username = existing_admin.username
-    finally:
-        db_lookup.close()
 
     # Оцінка часу: лише для тих, що потребують мережі
     cooldown_extra_sec = 30  # додатковий кулдаун між пакетами
@@ -294,7 +324,16 @@ async def process_batch(
     except Exception:
         pass
     for idx, rec in enumerate(urls_rec, start=1):
-        item_id, url, tries, origin_chat, origin_msg, od, ou = rec
+        item_id = rec.id
+        url = rec.url
+        tries = rec.tries
+        origin_msg = rec.origin_msg
+        owner_admin_id_rec = rec.owner_admin_id
+        ou = rec.owner_username
+        if owner_admin_id_rec and admin_id is None:
+            admin_id = owner_admin_id_rec
+        if ou and not current_owner_username:
+            current_owner_username = ou
         keys_norm = collect_norm_keys(url)
         existing_seen = None
         for k in keys_norm:
@@ -325,11 +364,6 @@ async def process_batch(
                 "channel_id": cid_dup,
             })
             await progress.update(status_display, title_dup or url, sess_dup)
-            try:
-                for k in keys_norm:
-                    membership_db.url_put(k, status_dup)
-            except Exception:
-                pass
             continue
         _remember_seen(keys_norm)
 
@@ -358,7 +392,7 @@ async def process_batch(
                 status, _ = await ensure_bot_started(
                     client,
                     url,
-                    owner_display=current_owner_display,
+                    owner_admin_id=admin_id,
                     owner_username=current_owner_username,
                     batch_id=batch_id,
                 )
@@ -400,6 +434,7 @@ async def process_batch(
             if base_status == "duplicate":
                 link_queue.mark_done(item_id)
                 status_display = f"{status_for_report}[{sess}]" if sess else status_for_report
+                _cache_invite_status(inv_hash, cid=cid, title=title, status=base_status, sess=sess)
                 result_items.append({
                     "idx": idx,
                     "url": url,
@@ -408,18 +443,13 @@ async def process_batch(
                     "channel_id": cid,
                 })
                 await progress.update(status_display, title or url, sess)
-                try:
-                    membership_db.url_put(url, status_for_report)
-                    for k in collect_norm_keys(url):
-                        membership_db.url_put(k, status_for_report)
-                except Exception:
-                    pass
                 _remember_seen(collect_norm_keys(url), title=title, channel_id=cid, session=sess)
                 continue
 
             if cid is None:
                 link_queue.mark_done(item_id)
                 status_display = f"{status_for_report}[{sess}]" if sess else status_for_report
+                _cache_invite_status(inv_hash, cid=None, title=title, status=base_status, sess=sess, last_error=base_status if base_status.startswith("error") else None)
                 result_items.append({
                     "idx": idx,
                     "url": url,
@@ -428,94 +458,82 @@ async def process_batch(
                     "channel_id": None,
                 })
                 await progress.update(status_display, title or url, sess)
-                try:
-                    membership_db.url_put(url, status_for_report)
-                    for k in collect_norm_keys(url):
-                        membership_db.url_put(k, status_for_report)
-                except Exception:
-                    pass
                 _remember_seen(collect_norm_keys(url), title=title, channel_id=None, session=sess)
                 continue
-            try:
-                upsert_channel_full(
-                    db,
-                    channel_id=cid,
-                    username=None,
-                    title=title,
-                    owner_display=current_owner_display,
-                    owner_username=current_owner_username,
-                    last_status=base_status,
-                )
-            except Exception:
-                pass
-
-            # owner_conflict check і прив'язка (як звичайно)
-            other_owner = None
-            other_owner_id = None
-            try:
-                row = db.execute(
-                    select(m.AdminChannel, m.Admin)
-                    .join(m.Admin, m.Admin.id == m.AdminChannel.admin_id)
-                    .where(m.AdminChannel.channel_id == cid)
-                ).first()
-                if row:
-                    _, adm_obj = row
-                    if adm_obj:
-                        other_owner_id = adm_obj.id
-                        other_owner = (adm_obj.display or f"@{adm_obj.username}") if adm_obj else None
-            except Exception:
-                other_owner = None
-
-            if other_owner_id and (admin_id is None or admin_id != other_owner_id):
-                status_for_report = f"owner_conflict(existing={other_owner})"
-                log_conflict(db, channel_id=cid, owner=other_owner or "unknown", source_ref=url)
-                log.warning(
-                    "queue_worker.owner_conflict batch_id=%s idx=%s url=%s sess=%s other=%s",
-                    batch_id,
-                    idx,
-                    url,
-                    sess,
-                    other_owner,
-                )
-            else:
-                if admin_id is None:
-                    adm_obj = svc_admins.get_or_create_admin(
+            with session_scope() as db:
+                try:
+                    upsert_channel_full(
                         db,
-                        tg_id=admin_tg_id,
-                        username=admin_username,
-                        display=admin_display,
+                        channel_id=cid,
+                        username=None,
+                        title=title,
+                        order_index=item_id,
+                        owner_admin_id=admin_id,
+                        last_status=base_status,
                     )
-                    admin_id = adm_obj.id
-                    current_owner_display = adm_obj.display
-                    current_owner_username = adm_obj.username
+                except Exception:
+                    pass
 
-                ch = svc_admins.ensure_channel(db, channel_id=cid, username=None, title=title)
-                link_res = svc_admins.attach_channel(db, admin_id=admin_id, channel_id=ch.channel_id)
-                svc_networks.move_orphans_to_primary(db, admin_id)
+                # owner_conflict check і прив'язка (як звичайно)
+                other_owner = None
+                other_owner_id = None
+                adm_info = cho.get_admin_for_channel(db, cid)
+                if adm_info and adm_info.admin_id:
+                    other_owner_id = adm_info.admin_id
+                    other_owner = (adm_info.display or f"@{adm_info.username}") if adm_info else None
 
-                if link_res.get("status") == "conflict":
-                    other_id = link_res.get("admin_id")
-                    other = svc_admins.get_admin_by_id(db, other_id) if other_id else None
-                    other_name = (other.display or f"@{other.username}") if other else str(other_id)
-                    status_for_report = f"owner_conflict(existing={other_name})"
-                    log_conflict(db, channel_id=cid, owner=other_name or "unknown", source_ref=url)
+                if other_owner_id and (admin_id is None or admin_id != other_owner_id):
+                    status_for_report = f"owner_conflict(existing={other_owner})"
+                    log_conflict(db, channel_id=cid, owner=other_owner or "unknown", source_ref=url)
                     log.warning(
                         "queue_worker.owner_conflict batch_id=%s idx=%s url=%s sess=%s other=%s",
                         batch_id,
                         idx,
                         url,
                         sess,
-                        other_name,
+                        other_owner,
                     )
+                else:
+                    if admin_id is None and base_status in ("joined", "already", "requested"):
+                        adm_obj = svc_admins.get_or_create_admin(
+                            db,
+                            tg_id=admin_tg_id,
+                            username=admin_username,
+                            display=admin_display,
+                        )
+                        admin_id = adm_obj.id
+                        current_owner_username = adm_obj.username
 
-            upsert_membership(db, channel_id=cid, account=(sess or ""), status=base_status)
+                    ch = svc_admins.ensure_channel(db, channel_id=cid, username=None, title=title)
+                    link_res = svc_admins.attach_channel(db, admin_id=admin_id, channel_id=ch.channel_id)
+                    svc_networks.move_orphans_to_primary(db, admin_id)
+
+                    if link_res.get("status") == "conflict":
+                        other_id = link_res.get("admin_id")
+                        other = svc_admins.get_admin_by_id(db, other_id) if other_id else None
+                        other_name = (other.display or f"@{other.username}") if other else str(other_id)
+                        status_for_report = f"owner_conflict(existing={other_name})"
+                        log_conflict(db, channel_id=cid, owner=other_name or "unknown", source_ref=url)
+                        log.warning(
+                            "queue_worker.owner_conflict batch_id=%s idx=%s url=%s sess=%s other=%s",
+                            batch_id,
+                            idx,
+                            url,
+                            sess,
+                            other_name,
+                        )
+
+                upsert_membership(db, channel_id=cid, account=(sess or ""), status=base_status)
             link_queue.mark_done(item_id)
             try:
-                membership_db.url_put(url, status_for_report)
-            except Exception:
-                pass
-            try:
-                _add_link(cid, url, kind, origin_msg, current_owner_display, current_owner_username)
+                _add_link(
+                    cid,
+                    url,
+                    kind,
+                    origin_msg,
+                    admin_id,
+                    current_owner_username,
+                )
             except Exception:
                 pass
 
@@ -594,7 +612,33 @@ async def process_batch(
             base_status = status or "unknown"
             status_display = f"{base_status}[{sess}]" if sess else base_status
 
+            if base_status == "requested":
+                try:
+                    if invite_hash:
+                        with session_scope() as db:
+                            req_ops.note_requested_invite(db, sess or "", invite_hash, start_after_sec=60)
+                    elif cid:
+                        req_ops.note_requested(sess or "", cid, start_after_sec=60)
+                except Exception:
+                    log.exception(
+                        "queue_worker.note_requested failed batch_id=%s idx=%s url=%s sess=%s invite=%s cid=%s",
+                        batch_id,
+                        idx,
+                        url,
+                        sess,
+                        invite_hash,
+                        cid,
+                    )
+
             if cid is None:
+                _cache_invite_status(
+                    invite_hash,
+                    cid=None,
+                    title=title,
+                    status=base_status,
+                    sess=sess,
+                    last_error=base_status if base_status.startswith("error") else None,
+                )
                 link_queue.mark_failed(item_id, base_status, backoff_sec=backoff_seconds)
                 log.info(
                     "queue_worker.item_failed batch_id=%s idx=%s url=%s status=%s sess=%s",
@@ -608,86 +652,90 @@ async def process_batch(
                 await progress.update(status_display, title or url, sess)
                 continue
 
-            upsert_channel_full(
-                db,
-                channel_id=cid,
-                username=None,
-                title=title,
-                owner_display=current_owner_display,
-                owner_username=current_owner_username,
-                last_status=base_status,
-            )
-
-            # Перевіряємо, чи канал уже закріплений за іншим адміном до створення нового
-            other_owner = None
-            other_owner_id = None
-            try:
-                row = db.execute(
-                    select(m.AdminChannel, m.Admin)
-                    .join(m.Admin, m.Admin.id == m.AdminChannel.admin_id)
-                    .where(m.AdminChannel.channel_id == cid)
-                ).first()
-                if row:
-                    _, adm_obj = row
-                    if adm_obj:
-                        other_owner_id = adm_obj.id
-                        other_owner = (adm_obj.display or f"@{adm_obj.username}") if adm_obj else None
-            except Exception:
-                other_owner = None
-
-            status_for_report = base_status
-            # owner_conflict: канал уже у іншого адміна і ми ще не створили свого
-            if other_owner_id and (admin_id is None or admin_id != other_owner_id):
-                status_for_report = f"owner_conflict(existing={other_owner})"
-                log_conflict(db, channel_id=cid, owner=other_owner or "unknown", source_ref=url)
-                log.warning(
-                    "queue_worker.owner_conflict batch_id=%s idx=%s url=%s sess=%s other=%s",
-                    batch_id,
-                    idx,
-                    url,
-                    sess,
-                    other_owner,
+            with session_scope() as db:
+                upsert_channel_full(
+                    db,
+                    channel_id=cid,
+                    username=None,
+                    title=title,
+                    order_index=item_id,
+                    owner_admin_id=admin_id,
+                    last_status=base_status,
                 )
-            else:
-                # Створюємо адміна лише перед першою успішною прив'язкою
-                if admin_id is None:
-                    adm_obj = svc_admins.get_or_create_admin(
-                        db,
-                        tg_id=admin_tg_id,
-                        username=admin_username,
-                        display=admin_display,
-                    )
-                    admin_id = adm_obj.id
-                    current_owner_display = adm_obj.display
-                    current_owner_username = adm_obj.username
 
-                ch = svc_admins.ensure_channel(db, channel_id=cid, username=None, title=title)
-                link_res = svc_admins.attach_channel(db, admin_id=admin_id, channel_id=ch.channel_id)
-                svc_networks.move_orphans_to_primary(db, admin_id)
+                other_owner = None
+                other_owner_id = None
+                adm_info = cho.get_admin_for_channel(db, cid)
+                if adm_info and adm_info.admin_id:
+                    other_owner_id = adm_info.admin_id
+                    other_owner = (adm_info.display or f"@{adm_info.username}") if adm_info else None
 
-                if link_res.get("status") == "conflict":
-                    other_id = link_res.get("admin_id")
-                    other = svc_admins.get_admin_by_id(db, other_id) if other_id else None
-                    other_name = (other.display or f"@{other.username}") if other else str(other_id)
-                    status_for_report = f"owner_conflict(existing={other_name})"
-                    log_conflict(db, channel_id=cid, owner=other_name or "unknown", source_ref=url)
+                status_for_report = base_status
+                # owner_conflict: канал уже у іншого адміна і ми ще не створили свого
+                if other_owner_id and (admin_id is None or admin_id != other_owner_id):
+                    status_for_report = f"owner_conflict(existing={other_owner})"
+                    log_conflict(db, channel_id=cid, owner=other_owner or "unknown", source_ref=url)
                     log.warning(
                         "queue_worker.owner_conflict batch_id=%s idx=%s url=%s sess=%s other=%s",
                         batch_id,
                         idx,
                         url,
                         sess,
-                        other_name,
+                        other_owner,
                     )
+                else:
+                    # Створюємо адміна лише перед першою успішною прив'язкою
+                    create_allowed = base_status in ("joined", "already", "requested")
+                    if create_allowed and admin_id is None:
+                        adm_obj = svc_admins.get_or_create_admin(
+                            db,
+                            tg_id=admin_tg_id,
+                            username=admin_username,
+                            display=admin_display,
+                        )
+                        admin_id = adm_obj.id
+                        current_owner_username = adm_obj.username
 
-            upsert_membership(db, channel_id=cid, account=sess or "", status=base_status)
+                    ch = svc_admins.ensure_channel(db, channel_id=cid, username=None, title=title)
+                    link_res = svc_admins.attach_channel(db, admin_id=admin_id, channel_id=ch.channel_id)
+                    svc_networks.move_orphans_to_primary(db, admin_id)
+
+                    if link_res.get("status") == "conflict":
+                        other_id = link_res.get("admin_id")
+                        other = svc_admins.get_admin_by_id(db, other_id) if other_id else None
+                        other_name = (other.display or f"@{other.username}") if other else str(other_id)
+                        status_for_report = f"owner_conflict(existing={other_name})"
+                        log_conflict(db, channel_id=cid, owner=other_name or "unknown", source_ref=url)
+                        log.warning(
+                            "queue_worker.owner_conflict batch_id=%s idx=%s url=%s sess=%s other=%s",
+                            batch_id,
+                            idx,
+                            url,
+                            sess,
+                            other_name,
+                        )
+
+                upsert_membership(db, channel_id=cid, account=sess or "", status=base_status)
+
+            _cache_invite_status(
+                invite_hash,
+                cid=cid,
+                title=title,
+                status=base_status,
+                sess=sess,
+                last_error=base_status if base_status.startswith("error") else None,
+            )
+
             link_queue.mark_done(item_id)
             try:
-                membership_db.url_put(url, status_for_report)
-            except Exception:
-                pass
-            try:
-                _add_link(cid, url, kind, origin_msg, current_owner_display, current_owner_username)
+                _add_link(
+                    cid,
+                    url,
+                    kind,
+                    origin_msg,
+                    admin_id,
+                    current_owner_username,
+                )
             except Exception:
                 pass
 
@@ -766,56 +814,47 @@ async def process_batch(
 
     # Фолбек: підтягуємо title з БД, якщо його немає у результатах
     try:
-        db_titles = SessionLocal()
-        mem_dao = MembershipDAO(db_titles)
-        for it in result_items:
-            cid = it.get("channel_id")
-            url_val = it.get("url")
-            # 1) Title by channel_id
-            if cid and not it.get("title"):
-                ch = cho.find_channel(db_titles, cid)
-                if ch and ch.get("title"):
-                    it["title"] = ch.get("title")
-            # 2) Якщо досі немає title – пробуємо через raw_url
-            if not it.get("title") and url_val:
-                row = cho.find_channel_by_link(db_titles, url_val)
-                if row:
-                    # row може бути (channel_id, title)
-                    if len(row) >= 1 and row[0] and not cid:
-                        cid = int(row[0])
-                        it["channel_id"] = cid
-                    if len(row) >= 2 and row[1] and not it.get("title"):
-                        it["title"] = row[1]
-            # 2b) Якщо це інвайт і маємо map_invite -> title
-            if not it.get("title") and url_val:
-                inv_hash = _extract_invite_hash(url_val)
-                if inv_hash:
-                    inv_cid, inv_title = mem_dao.map_invite_get(inv_hash)
-                    if inv_cid and not cid:
-                        it["channel_id"] = inv_cid
-                        cid = inv_cid
-                    if inv_title:
-                        it["title"] = inv_title
-            # 3) Підтягуємо сесію для already/joined, не перетираючи існуючий статус із сесією
-            status_raw = (it.get("status") or "").strip()
-            if "[" not in status_raw and cid:
-                sess_known = mem_dao.get_session_by_channel(cid)
-                log.debug(
-                    "queue_worker.report: hydrate session cid=%s status=%s session=%s url=%s",
-                    cid,
-                    status_raw,
-                    sess_known,
-                    url_val,
-                )
-                if sess_known:
-                    it["status"] = f"{status_raw or 'already'}[{sess_known}]"
+        with session_scope() as db_titles:
+            for it in result_items:
+                cid = it.get("channel_id")
+                url_val = it.get("url")
+                if cid and not it.get("title"):
+                    ch = cho.find_channel(db_titles, cid)
+                    if ch and ch.title:
+                        it["title"] = ch.title
+                if not it.get("title") and url_val:
+                    row = cho.find_channel_by_link(db_titles, url_val)
+                    if row:
+                        if row.channel_id and not cid:
+                            cid = int(row.channel_id)
+                            it["channel_id"] = cid
+                        if row.title and not it.get("title"):
+                            it["title"] = row.title
+                if not it.get("title") and url_val:
+                    inv_hash = _extract_invite_hash(url_val)
+                    if inv_hash:
+                        cache = mem_db.invite_cache_get(db_titles, inv_hash)
+                        inv_cid = cache.channel_id if cache else None
+                        inv_title = cache.title if cache else None
+                        if inv_cid and not cid:
+                            it["channel_id"] = inv_cid
+                            cid = inv_cid
+                        if inv_title:
+                            it["title"] = inv_title
+                status_raw = (it.get("status") or "").strip()
+                if "[" not in status_raw and cid:
+                    sess_known = mem_db.get_session_by_channel(db_titles, cid)
+                    log.debug(
+                        "queue_worker.report: hydrate session cid=%s status=%s session=%s url=%s",
+                        cid,
+                        status_raw,
+                        sess_known,
+                        url_val,
+                    )
+                    if sess_known:
+                        it["status"] = f"{status_raw or 'already'}[{sess_known}]"
     except Exception:
         log.exception("queue_worker: failed to hydrate titles/sessions from DB")
-    finally:
-        try:
-            db_titles.close()
-        except Exception:
-            pass
 
     # Рендер звіту зі збереженням форматування та статусами біля кожного лінка
     try:
@@ -843,7 +882,7 @@ async def process_batch(
 
     if pages:
 
-        kb = make_report_kb(0, len(pages), has_report=report_idx is not None)
+        kb = make_report_keyboard(0, len(pages), has_report=report_idx is not None)
         sent = await answer_with_retry(
             reply_msg,
             pages[0],
@@ -870,4 +909,3 @@ async def process_batch(
         batch_cache.register(batch_id, result_items, original_urls)
     except Exception:
         log.exception("queue_worker: failed to cache result_items for batch_id=%s", batch_id)
-    db.close()

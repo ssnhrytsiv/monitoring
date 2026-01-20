@@ -1,7 +1,8 @@
 from typing import List, Tuple, Callable, Optional
 
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import InlineKeyboardButton
+
+from app.watch_bot.keyboards import build_pager_row
 
 # (wid, channel_id, status, source_url, template_id)
 GroupItem = Tuple[int, int, str, str, int]
@@ -70,35 +71,10 @@ def build_group_keyboard(
     kb.adjust(6)
 
     # навігація
-    nav_row = []
-
-    if page > 1:
-        nav_row.append(
-            InlineKeyboardButton(
-                text="⬅️ Prev",
-                callback_data=_group_cb(page - 1),
-            )
-        )
-    else:
-        nav_row.append(InlineKeyboardButton(text=" ", callback_data="watch:noop"))
-
-    nav_row.append(
-        InlineKeyboardButton(
-            text=f"Page {page}/{total_pages}",
-            callback_data="watch:noop",
-        )
-    )
-
-    if page < total_pages:
-        nav_row.append(
-            InlineKeyboardButton(
-                text="Next ➡️",
-                callback_data=_group_cb(page + 1),
-            )
-        )
-    else:
-        nav_row.append(InlineKeyboardButton(text=" ", callback_data="watch:noop"))
-
-    kb.row(*nav_row)
+    if total_pages > 1:
+        prev_cb = _group_cb(page - 1) if page > 1 else None
+        next_cb = _group_cb(page + 1) if page < total_pages else None
+        nav_row = build_pager_row(page, total_pages, prev_cb, next_cb, noop_cb="watch:noop")
+        kb.row(*nav_row)
 
     return kb

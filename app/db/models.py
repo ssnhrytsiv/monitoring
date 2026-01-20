@@ -1,24 +1,26 @@
 from __future__ import annotations
 
+import time
+from typing import List, Optional, Tuple
+
 from sqlalchemy import (
     Column,
     Integer,
     BigInteger,
     String,
     Text,
+    ForeignKey,
     UniqueConstraint,
     Float,
     delete,
     select,
     Index,
+    PrimaryKeyConstraint,
 )
-import time
-from typing import List, Optional, Tuple
-
-from sqlalchemy.orm import Session, relationship, foreign
+from sqlalchemy.orm import Session, relationship
 from sqlalchemy.sql import text
 
-from app.admin_bot.db.session import Base
+from app.db.session import Base
 
 
 class Channel(Base):
@@ -26,12 +28,11 @@ class Channel(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     channel_id = Column(BigInteger, unique=True, index=True)
+    order_index = Column(BigInteger, index=True)
     username = Column(String)
     title = Column(String)
-    owner_display = Column(String)
-    owner_username = Column(String)
+    owner_admin_id = Column(Integer)
     last_status = Column(String)
-    created_at = Column(String)
     updated_at = Column(String)
 
     links = relationship(
@@ -40,21 +41,35 @@ class Channel(Base):
         lazy="selectin",
         viewonly=True,
     )
+    owner_admin = relationship(
+        "Admin",
+        primaryjoin="foreign(Channel.owner_admin_id)==Admin.id",
+        lazy="joined",
+        viewonly=True,
+    )
+    invite_caches = relationship(
+        "InviteCache",
+        primaryjoin="Channel.channel_id==foreign(InviteCache.channel_id)",
+        lazy="selectin",
+        viewonly=True,
+    )
 
 
 class Link(Base):
     __tablename__ = "links"
+    __table_args__ = (
+        UniqueConstraint("url_norm", name="uq_links_url_norm"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     channel_id = Column(BigInteger, index=True)
+    owner_admin_id = Column(Integer)
     raw_url = Column(Text)
+    url_norm = Column(Text, index=True)
     kind = Column(String)
     batch_msg_id = Column(BigInteger)
-    owner_display = Column(String)
     owner_username = Column(String)
     added_at = Column(String)
-
-    # Двосторонній зв'язок не налаштований через відсутність явних FK у схемі.
 
 
 class Membership(Base):
@@ -90,6 +105,7 @@ def upsert_membership(db: Session, channel_id: int, account: str, status: str) -
 
 class LinkQueue(Base):
     __tablename__ = "link_queue"
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     url = Column(Text, nullable=False)
@@ -101,32 +117,19 @@ class LinkQueue(Base):
     batch_id = Column(String)
     origin_chat = Column(BigInteger)
     origin_msg = Column(BigInteger)
-    owner_display = Column(String)
+    owner_admin_id = Column(Integer)
     owner_username = Column(String)
 
 
-class InviteMap(Base):
-    __tablename__ = "invite_map"
+class InviteCache(Base):
+    __tablename__ = "invite_cache"
 
     invite_hash = Column(String, primary_key=True)
-    channel_id = Column(Integer)
+    channel_id = Column(BigInteger, ForeignKey("channels.channel_id", ondelete="SET NULL"), index=True, nullable=True)
     title = Column(String)
-    updated_at = Column(Integer)
-
-
-class InviteStatus(Base):
-    __tablename__ = "invite_status"
-
-    invite_hash = Column(String, primary_key=True)
-    status = Column(String, nullable=False)
-    ts = Column(Integer, nullable=False)
-
-
-class InviteAttempt(Base):
-    __tablename__ = "invite_attempts"
-    invite_hash = Column(String, primary_key=True)
-    day = Column(Integer, primary_key=True)
-    attempts = Column(Integer, nullable=False)
+    status = Column(String)
+    session = Column(String)
+    last_error = Column(Text)
 
 
 class UrlCache(Base):
@@ -140,6 +143,60 @@ class UrlCache(Base):
         return f"<UrlCache url={self.url} status={self.status} ts={self.ts}>"
 
 
+class InviteCheck(Base):
+    """
+    Черга перевірок інвайтів по сесіях (backoff).
+    Первинний ключ: (session, invite_hash).
+    """
+
+    __tablename__ = "invite_check"
+
+    invite_hash = Column(Text, nullable=False)
+    session = Column(Text, nullable=False)
+    noted_at = Column(Integer, nullable=False)
+    next_check_at = Column(Integer, nullable=False)
+    tries = Column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        PrimaryKeyConstraint("session", "invite_hash", name="pk_invite_check"),
+        Index("idx_invite_check_next", "next_check_at"),
+        Index("idx_invite_check_session", "session"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<InviteCheck session={self.session} invite_hash={self.invite_hash} "
+            f"next_check_at={self.next_check_at} tries={self.tries}>"
+        )
+
+
+class RequestedCheck(Base):
+    """
+    Черга повторних перевірок заявок (requested) по сесіях/каналах.
+    Первинний ключ: (session, channel_id).
+    """
+
+    __tablename__ = "requested_check"
+
+    session = Column(Text, nullable=False)
+    channel_id = Column(Integer, nullable=False)
+    noted_at = Column(Integer, nullable=False)
+    next_check_at = Column(Integer, nullable=False)
+    tries = Column(Integer, nullable=False, default=0)
+
+    __table_args__ = (
+        PrimaryKeyConstraint("session", "channel_id", name="pk_requested_check"),
+        Index("idx_requested_check_next", "next_check_at"),
+        Index("idx_requested_check_session", "session"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<RequestedCheck session={self.session} channel_id={self.channel_id} "
+            f"next_check_at={self.next_check_at} tries={self.tries}>"
+        )
+
+
 class OwnerConflict(Base):
     __tablename__ = "owner_conflicts"
 
@@ -151,7 +208,6 @@ class OwnerConflict(Base):
     created_at = Column(Integer, nullable=False)
 
 
-# Нові таблиці для admin-bot (не впливають на існуючі схеми)
 class Admin(Base):
     __tablename__ = "admins"
 
@@ -211,31 +267,22 @@ class NetworkChannel(Base):
     channel_id = Column(Integer, nullable=False)
     price = Column(Float)
     currency = Column(String)
-    cpm = Column(Float)  # задається вручну
-    expected_views = Column(Integer)  # очікувані перегляди
-    actual_views = Column(Integer)  # фактичні середні перегляди
-    avg_views_30d = Column(Integer)  # середні перегляди за 30 днів
-    last_views = Column(Integer)  # перегляди останнього поста
-    theme = Column(String)  # тематика/теги
+    cpm = Column(Float)
+    expected_views = Column(Integer)
+    actual_views = Column(Integer)
+    avg_views_30d = Column(Integer)
+    last_views = Column(Integer)
+    theme = Column(String)
     note = Column(Text)
     created_at = Column(Integer)
     updated_at = Column(Integer)
-
-
-class ChannelLink(Base):
-    __tablename__ = "channel_links"
-
-    link_url_norm = Column(Text, primary_key=True)
-    channel_id = Column(Integer, index=True)
-    first_seen_ts = Column(Integer)
-    last_seen_ts = Column(Integer)
 
 
 class InviteOwner(Base):
     __tablename__ = "invite_owners"
 
     invite_hash = Column(Text, primary_key=True)
-    owner_display = Column(Text)
+    owner_admin_id = Column(Integer)
     owner_username = Column(Text)
     created_at = Column(Text)
 
@@ -252,38 +299,11 @@ class BotLink(Base):
     status = Column(Text)
     session = Column(Text)
     title = Column(Text)
-    owner_display = Column(Text)
+    owner_admin_id = Column(Integer)
     owner_username = Column(Text)
     batch_id = Column(Text)
     last_ts = Column(Integer)
     last_error = Column(Text)
-
-
-class Subscription(Base):
-    __tablename__ = "subscriptions"
-
-    channel_id = Column(Integer, primary_key=True)
-    joined = Column(Integer, default=0)
-    session_alias = Column(Text)
-    last_join_try_ts = Column(Integer)
-    join_error = Column(Text)
-
-
-class OwnerAction(Base):
-    __tablename__ = "owner_actions"
-    __table_args__ = (
-        UniqueConstraint("owner", "source_ref", "action", name="ux_owner_actions_triplet"),
-        UniqueConstraint("idempotency_key", name="ux_owner_actions_idem"),
-    )
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    owner = Column(Text, nullable=False)
-    source_ref = Column(Text, nullable=False)
-    action = Column(Text, nullable=False)
-    idempotency_key = Column(Text, nullable=False)
-    status = Column(Text, nullable=False)
-    created_at = Column(Integer, nullable=False)
-    updated_at = Column(Integer, nullable=False)
 
 
 class PostTemplate(Base):
@@ -315,9 +335,6 @@ class SheetProjectArchive(Base):
     spreadsheet_id = Column(Text, nullable=False)
     title = Column(Text)
     archived_at = Column(Text)
-
-
-# ------------------ Watch tracking (перенесено зі старого posts_watch_result_models) ------------------ #
 
 
 class WatchGroup(Base):
@@ -414,9 +431,6 @@ class WatchCandidate(Base):
     expires_at = Column(Text, nullable=True, index=True)
 
 
-# ------------------ Helper-функції видалення ------------------ #
-
-
 def delete_admin_channels_by_admin(db: Session, admin_id: int) -> int:
     return db.execute(delete(AdminChannel).where(AdminChannel.admin_id == admin_id)).rowcount or 0
 
@@ -454,18 +468,6 @@ def delete_membership_status_by_channels(db: Session, chan_ids: List[int]) -> in
         return 0
 
 
-def delete_invite_status_by_hashes(db: Session, hashes: List[str]) -> int:
-    if not hashes:
-        return 0
-    return db.execute(delete(InviteStatus).where(InviteStatus.invite_hash.in_(hashes))).rowcount or 0
-
-
-def delete_invite_map_by_channels(db: Session, chan_ids: List[int]) -> int:
-    if not chan_ids:
-        return 0
-    return db.execute(delete(InviteMap).where(InviteMap.channel_id.in_(chan_ids))).rowcount or 0
-
-
 def delete_owner_conflict_by_channels(db: Session, chan_ids: List[int]) -> int:
     if not chan_ids:
         return 0
@@ -485,13 +487,13 @@ def delete_channels_by_ids(db: Session, chan_ids: List[int]) -> int:
 
 
 def delete_invite_owners_and_links_no_channel(
-    db: Session, owner_disp: Optional[str], owner_user: Optional[str]
+    db: Session, owner_admin_id: Optional[int], owner_user: Optional[str]
 ) -> Tuple[int, int]:
     where_raw = []
     params_raw = {}
-    if owner_disp:
-        where_raw.append("owner_display = :od")
-        params_raw["od"] = owner_disp
+    if owner_admin_id is not None:
+        where_raw.append("owner_admin_id = :oaid")
+        params_raw["oaid"] = owner_admin_id
     if owner_user:
         where_raw.append("owner_username = :ou")
         params_raw["ou"] = owner_user

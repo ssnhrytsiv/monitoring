@@ -43,18 +43,18 @@ def cleanup(db_path: Path, hashes: Iterable[str]) -> dict:
         )
         cur.execute(
             "CREATE TEMP TABLE bad_ids AS "
-            "SELECT channel_id FROM invite_map WHERE invite_hash IN (SELECT invite_hash FROM bad_hashes);"
+            "SELECT channel_id FROM invite_cache WHERE invite_hash IN (SELECT invite_hash FROM bad_hashes);"
         )
 
         # Delete invite-related rows first
         cur.execute(
-            "DELETE FROM invite_status WHERE invite_hash IN (SELECT invite_hash FROM bad_hashes);"
+            "DELETE FROM invite_cache_status WHERE invite_hash IN (SELECT invite_hash FROM bad_hashes);"
         )
         cur.execute(
             "DELETE FROM invite_owners WHERE invite_hash IN (SELECT invite_hash FROM bad_hashes);"
         )
         cur.execute(
-            "DELETE FROM invite_map WHERE invite_hash IN (SELECT invite_hash FROM bad_hashes);"
+            "DELETE FROM invite_cache WHERE invite_hash IN (SELECT invite_hash FROM bad_hashes);"
         )
         invite_deleted = cur.rowcount
 
@@ -65,10 +65,8 @@ def cleanup(db_path: Path, hashes: Iterable[str]) -> dict:
             for table in [
                 "membership",
                 "links",
-                "channel_links",
                 "admin_channels",
                 "network_channels",
-                "subscriptions",
                 "owner_conflicts",
                 "channels",
             ]:

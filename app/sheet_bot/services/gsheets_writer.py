@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import time
 import json
 import logging
 import threading
@@ -9,7 +8,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 
 from app.config import GSHEET_SPREADSHEET_ID, GSHEET_CREDS_FILE
-from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now
+from app.utils.time_utils import moscow_now
 
 log = logging.getLogger("services.gsheets_writer_transport")
 

@@ -4,6 +4,7 @@
 - All DB access must be inside app/DAL/** only.
 - Business logic must not import SessionLocal, engine, Base, or ORM models for querying.
 - Business logic may call DAL functions only.
+- Functions must exchange structured objects with named fields (pydantic/dataclasses/ORM rows); do not pass tuples/lists/None blobs that require positional unpacking in business logic.
 
 ## Single source of DB configuration
 - The ONLY place that defines/creates engine, SessionLocal and Base is app.db.session (session.py re-exports).

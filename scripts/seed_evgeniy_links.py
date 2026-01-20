@@ -50,9 +50,9 @@ def main():
 
     for idx, (cid, title, url, status) in enumerate(records):
         con.execute(
-            "INSERT OR IGNORE INTO channels(channel_id, username, title, owner_display, owner_username, last_status, created_at, updated_at) "
-            "VALUES(?,?,?,?,?,?,datetime('now'),datetime('now'))",
-            (cid, f"demo{idx+1}", title, ADMIN_DISPLAY, ADMIN_USERNAME or "", status),
+            "INSERT OR IGNORE INTO channels(channel_id, username, title, owner_admin_id, owner_username, last_status, created_at, updated_at) "
+            "VALUES(?,?,?,?,?, ?, datetime('now'),datetime('now'))",
+            (cid, f"demo{idx+1}", title, admin_id, ADMIN_USERNAME or "", status),
         )
         con.execute(
             "INSERT OR REPLACE INTO membership(channel_id, account, status, ts) VALUES(?,?,?,?)",
@@ -63,9 +63,9 @@ def main():
             (url, status, now),
         )
         con.execute(
-            "INSERT OR IGNORE INTO links(channel_id, raw_url, kind, batch_msg_id, owner_display, owner_username, added_at) "
+            "INSERT OR IGNORE INTO links(channel_id, raw_url, kind, batch_msg_id, owner_admin_id, owner_username, added_at) "
             "VALUES(?,?,?,?,?,?,datetime('now'))",
-            (cid, url, "seed_demo", 0, ADMIN_DISPLAY, ADMIN_USERNAME or "",),
+            (cid, url, "seed_demo", 0, admin_id, ADMIN_USERNAME or "",),
         )
 
     con.commit()

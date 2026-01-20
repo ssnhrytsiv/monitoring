@@ -4,7 +4,7 @@ import time
 from typing import Optional
 from sqlalchemy.orm import Session
 
-from app.admin_bot.db import models as m
+from app.db import models as m
 
 
 def log_conflict(

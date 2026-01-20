@@ -1,45 +1,46 @@
 from __future__ import annotations
 
 from aiogram import Router, F
-import re
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command, StateFilter
 import logging
 import asyncio
 import time
 import uuid
+import re
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramServerError
 
-from app.admin_bot.db.session import SessionLocal
+from app.db.session import session_scope
 from app.admin_bot.services import admins as svc_admins
 from app.admin_bot.config import ADMIN_ALLOWED_IDS
-from app.admin_bot.bot.states import AddAdminFlow, RefreshChannelsFlow
+from app.admin_bot.bot.states import AddAdminFlow, RefreshChannelsFlow, DedupAdminChannelsFlow
 from app.admin_bot.bot.keyboards import main_menu_kb
-from app.admin_bot.services.queue_worker import process_batch
-from app.admin_bot.services.subscription import refresh_channels_for_admin, finalize_refresh_confirmation
+from app.admin_bot.services.subscription import (
+    refresh_channels_for_admin,
+    finalize_refresh_confirmation,
+    RefreshContext,
+)
 from app.admin_bot.utils.messages import extract_links_from_message
-from app.services import link_queue
 from app.utils.link_parser import extract_bot_username
 from app.services import account_pool
 from app.services.account_pool import iter_pool_clients
 from telethon.tl import types as tl_types
+from app.admin_bot.services import dedup_admin_channels as svc_dedup
 
 router = Router()
 log = logging.getLogger("admin_bot.handlers.admins")
 _DEDUP_PENDING = {}
+_DEDUP_AC_PENDING = {}
 
 
-def _db():
-    db = SessionLocal()
-    try:
-        svc_admins.ensure_admin_schema(db)
-    except Exception:
-        pass
-    try:
-        yield db
-    finally:
-        db.close()
+def _admin_btn_label(admin_obj) -> str:
+    disp = getattr(admin_obj, "display", None) or admin_obj.get("display") if isinstance(admin_obj, dict) else None
+    uname_raw = getattr(admin_obj, "username", None) if not isinstance(admin_obj, dict) else admin_obj.get("username")
+    uname = f"@{uname_raw}" if uname_raw else ""
+    aid = getattr(admin_obj, "id", None) if not isinstance(admin_obj, dict) else admin_obj.get("id")
+    base = (f"{disp} {uname}".strip()) or (f"id={aid}" if aid is not None else "")
+    return base if base else "невідомий"
 
 
 def _is_allowed(user_id: int | None) -> bool:
@@ -69,7 +70,8 @@ def _clean_urls(urls: list[str]) -> list[str]:
             c = u
         c = (c or "").strip()
         # Вирізаємо зайві хвости
-        c = re.sub(r"[^\w\-./:?&=#%+]+$", "", c)
+        # дефіс наприкінці класу символів, щоб уникнути діапазонів
+        c = re.sub(r"[^\w./:?&=#%+/-]+$", "", c)
         c = c.rstrip(").,;'\"<>[]{}")
         is_invite = bool(invite_pattern.match(c))
         bot_username = extract_bot_username(c)
@@ -108,6 +110,36 @@ async def cmd_start(m: Message):
         "• /admins — список адмінів",
         reply_markup=main_menu_kb()
     )
+
+
+async def _render_ac_conflict(cb: CallbackQuery, state: FSMContext, idx: int):
+    data = await state.get_data()
+    conflicts = data.get("conflicts") or []
+    if idx < 0 or idx >= len(conflicts):
+        await state.clear()
+        await cb.message.edit_text("✅ Конфліктів більше немає.", reply_markup=main_menu_kb())
+        await cb.answer()
+        return
+
+    conflict = conflicts[idx]
+    cid = conflict.get("channel_id")
+    title = conflict.get("title") or "—"
+    admins = conflict.get("admins") or []
+    lines = [
+        "Знайдено кількох адмінів для каналу:",
+        f"• {title} (id={cid})",
+        "",
+        "Оберіть, кого залишити:",
+    ]
+    buttons = []
+    for adm in admins:
+        txt = _admin_btn_label(type("Obj", (), adm))
+        buttons.append([InlineKeyboardButton(text=txt, callback_data=f"dedup_ac_keep:{cid}:{adm['id']}")])
+    buttons.append([InlineKeyboardButton(text="Пропустити", callback_data="dedup_ac_skip")])
+    buttons.append([InlineKeyboardButton(text="Завершити", callback_data="dedup_ac_stop")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb, disable_web_page_preview=True)
+    await state.update_data(idx=idx)
 
 
 @router.callback_query(F.data == "dedup_sessions")
@@ -197,51 +229,78 @@ async def cb_dedup_sessions(cb: CallbackQuery):
         "title_map": title_map,
         "keep_map": keep_map,
     }
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Відписати дублікати", callback_data=f"dedup_confirm_yes:{token}"),
-                InlineKeyboardButton(text="❌ Не відписувати", callback_data=f"dedup_confirm_no:{token}"),
-            ]
-        ]
-    )
-    await msg.edit_text("\n".join(preview), reply_markup=kb)
-    await cb.answer()
 
 
-@router.callback_query(F.data.startswith("dedup_confirm_no:"))
-async def cb_dedup_confirm_no(cb: CallbackQuery):
-    token = cb.data.split(":", 1)[1]
-    _DEDUP_PENDING.pop(token, None)
-    await cb.message.edit_text("Відписка скасована.")
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("dedup_confirm_yes:"))
-async def cb_dedup_confirm_yes(cb: CallbackQuery):
-    token = cb.data.split(":", 1)[1]
-    plan = _DEDUP_PENDING.pop(token, None)
-    if not plan:
-        await cb.message.edit_text("Дані для відписки не знайдено. Запусти дедуп знову.")
+@router.callback_query(F.data == "dedup_admin_channels")
+async def cb_dedup_admin_channels(cb: CallbackQuery, state: FSMContext):
+    if not _is_allowed(cb.from_user.id if cb.from_user else None):
         await cb.answer()
         return
-    leave_plan: dict[str, set[int]] = plan.get("leave_plan") or {}
-    title_map: dict[int, str] = plan.get("title_map") or {}
-    keep_map: dict[int, str] = plan.get("keep_map") or {}
+    conflicts = []
+    try:
+        with session_scope() as db:
+            conflicts = svc_dedup.find_conflicts(db)
+    except Exception:
+        log.exception("dedup_admin_channels: failed to load conflicts")
+        await cb.message.answer("Сталася помилка при пошуку дублікатів.")
+        await cb.answer()
+        return
+    if not conflicts:
+        await cb.message.answer("Дублікатів у admin_channels не знайдено.", reply_markup=main_menu_kb())
+        await cb.answer()
+        return
+    await state.set_state(DedupAdminChannelsFlow.browsing)
+    await state.update_data(conflicts=conflicts, idx=0, resolved=0)
+    await cb.answer()
+    await _render_ac_conflict(cb, state, 0)
 
-    stats_lines = []
-    left_total = 0
-    errors_total = 0
-    for sess, cids in leave_plan.items():
-        res = await account_pool.leave_channels(sess, list(cids))
-        left_total += res.get("left", 0) or 0
-        errors_total += res.get("errors", 0) or 0
-        stats_lines.append(f"{account_pool.session_display(sess)}: left={res.get('left',0)} errors={res.get('errors',0)}")
 
-    summary = [f"Відписка завершена. Каналів з дублями: {len(keep_map)}"]
-    summary.extend(stats_lines or ["Не було що відписувати"])
-    summary.append(f"Сумарно відписок: {left_total}, помилок: {errors_total}")
-    await cb.message.edit_text("\n".join(summary))
+@router.callback_query(StateFilter(DedupAdminChannelsFlow.browsing), F.data.startswith("dedup_ac_keep:"))
+async def cb_dedup_ac_keep(cb: CallbackQuery, state: FSMContext):
+    if not _is_allowed(cb.from_user.id if cb.from_user else None):
+        await cb.answer()
+        return
+    try:
+        _, cid_str, aid_str = cb.data.split(":", 2)
+        cid = int(cid_str)
+        aid = int(aid_str)
+    except Exception:
+        await cb.answer("Невірні дані.")
+        return
+    removed = 0
+    try:
+        with session_scope() as db:
+            removed = svc_dedup.resolve_conflict(db, channel_id=cid, keep_admin_id=aid)
+    except Exception:
+        log.exception("dedup_ac_keep: failed channel_id=%s admin_id=%s", cid, aid)
+        await cb.answer("Помилка при видаленні.")
+        return
+    data = await state.get_data()
+    idx = data.get("idx", 0)
+    resolved = data.get("resolved", 0) + 1
+    # пропускаємо далі
+    next_idx = idx + 1
+    await state.update_data(idx=next_idx, resolved=resolved)
+    await cb.answer(f"Залишено admin_id={aid}, видалено {removed}.")
+    await _render_ac_conflict(cb, state, next_idx)
+
+
+@router.callback_query(StateFilter(DedupAdminChannelsFlow.browsing), F.data == "dedup_ac_skip")
+async def cb_dedup_ac_skip(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    idx = data.get("idx", 0)
+    next_idx = idx + 1
+    await state.update_data(idx=next_idx)
+    await cb.answer("Пропущено.")
+    await _render_ac_conflict(cb, state, next_idx)
+
+
+@router.callback_query(StateFilter(DedupAdminChannelsFlow.browsing), F.data == "dedup_ac_stop")
+async def cb_dedup_ac_stop(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    resolved = data.get("resolved", 0)
+    await state.clear()
+    await cb.message.edit_text(f"Готово. Оброблено конфліктів: {resolved}.", reply_markup=main_menu_kb())
     await cb.answer()
 
 
@@ -249,25 +308,23 @@ async def cb_dedup_confirm_yes(cb: CallbackQuery):
 async def cmd_list_admins(m: Message):
     if not _is_allowed(m.from_user.id if m.from_user else None):
         return
-    db = next(_db())
-    admins = svc_admins.list_admins(db)
-    if not admins:
-        await m.answer("Адмінів поки немає.")
-        return
-    lines = []
-    for a in admins:
-        disp = a.display or ""
-        uname = f"@{a.username}" if a.username else ""
-        lines.append(f"{a.id}. {disp} {uname} (tg_id={a.tg_id})")
-    await m.answer("\n".join(lines))
+    with session_scope() as db:
+        admins = svc_admins.list_admins(db)
+        if not admins:
+            await m.answer("Адмінів поки немає.")
+            return
+        lines = []
+        for a in admins:
+            disp = a.display or ""
+            uname = f"@{a.username}" if a.username else ""
+            lines.append(f"{a.id}. {disp} {uname} (tg_id={a.tg_id})")
+        await m.answer("\n".join(lines))
 
 
 @router.message(Command("add_admin"))
 async def cmd_add_admin(m: Message):
     if not _is_allowed(m.from_user.id if m.from_user else None):
         return
-
-    db = next(_db())
 
     parts = (m.text or "").strip().split(maxsplit=3)
 
@@ -293,7 +350,16 @@ async def cmd_add_admin(m: Message):
     if len(parts) >= 4:
         display = parts[3]
 
-    adm = svc_admins.get_or_create_admin(db, tg_id=target_id, username=username, display=display)
+    with session_scope() as db:
+        adm = svc_admins.get_or_create_admin(db, tg_id=target_id, username=username, display=display)
+        msg = (
+            "✅ Адміна додано/оновлено:\n"
+            f"id={adm.id}\n"
+            f"tg_id={adm.tg_id}\n"
+            f"username=@{adm.username or ''}\n"
+            f"display={adm.display or '—'}"
+        )
+    await m.answer(msg)
     await m.answer(
         "✅ Адміна додано/оновлено:\n"
         f"id={adm.id}\n"
@@ -318,7 +384,6 @@ async def cb_add_admin_flow(cb: CallbackQuery, state):
 async def cb_refresh_channels(cb: CallbackQuery, state: FSMContext):
     if not _is_allowed(cb.from_user.id):
         return
-    db = next(_db())
     admin = None
     admin_id = None
     if cb.data and ":" in cb.data:
@@ -326,22 +391,25 @@ async def cb_refresh_channels(cb: CallbackQuery, state: FSMContext):
             admin_id = int(cb.data.split(":", 1)[1])
         except Exception:
             admin_id = None
-    if admin_id:
-        admin = svc_admins.get_admin_by_id(db, admin_id)
-    if admin is None:
-        admin = svc_admins.find_admin(
-            db,
-            tg_id=cb.from_user.id if cb.from_user else None,
-            username=cb.from_user.username if cb.from_user else None,
-            display=None,
-        )
-    if not admin:
-        await cb.message.answer("Спочатку додай себе як адміна (/add_admin).")
-        await cb.answer()
-        return
+    found_admin_id = None
+    with session_scope() as db:
+        if admin_id:
+            admin = svc_admins.get_admin_by_id(db, admin_id)
+        if admin is None:
+            admin = svc_admins.find_admin(
+                db,
+                tg_id=cb.from_user.id if cb.from_user else None,
+                username=cb.from_user.username if cb.from_user else None,
+                display=None,
+            )
+        if not admin:
+            await cb.message.answer("Спочатку додай себе як адміна (/add_admin).")
+            await cb.answer()
+            return
+        found_admin_id = admin.id
     await state.clear()
     await state.set_state(RefreshChannelsFlow.waiting_links)
-    await state.update_data(admin_id=admin.id)
+    await state.update_data(admin_id=found_admin_id)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -450,19 +518,12 @@ async def cb_refresh_collect_go(cb: CallbackQuery, state: FSMContext):
     if not urls:
         await cb.answer("Немає зібраних посилань. Надішли t.me/+ ...", show_alert=True)
         return
-    db = next(_db())
-    admin = None
-    admin_id = data.get("admin_id")
-    if admin_id:
-        admin = svc_admins.get_admin_by_id(db, admin_id)
-    if admin is None:
-        admin = svc_admins.find_admin(
-            db,
-            tg_id=cb.from_user.id if cb.from_user else None,
-            username=cb.from_user.username if cb.from_user else None,
-            display=None,
-        )
-    if not admin:
+    admin_snapshot = svc_admins.get_admin_for_refresh(
+        admin_id=data.get("admin_id"),
+        from_user_id=cb.from_user.id if cb.from_user else None,
+        from_username=cb.from_user.username if cb.from_user and cb.from_user.username else None,
+    )
+    if not admin_snapshot:
         await cb.answer("Адміна не знайдено. Додай через /add_admin", show_alert=True)
         await state.clear()
         return
@@ -478,14 +539,16 @@ async def cb_refresh_collect_go(cb: CallbackQuery, state: FSMContext):
     await cb.answer("Запускаю підписку…", show_alert=False)
     asyncio.create_task(
         refresh_channels_for_admin(
-            batch_id=batch_id,
-            chat_id=cb.message.chat.id if cb.message else 0,
-            reply_msg=cb.message,
-            admin=admin,
-            urls=urls,
-            raw_text=raw_text,
-            raw_html=raw_html,
-            entities=entities,
+            RefreshContext(
+                batch_id=batch_id,
+                chat_id=cb.message.chat.id if cb.message else 0,
+                reply_msg=cb.message,
+                admin=admin_snapshot,
+                urls=urls,
+                raw_text=raw_text,
+                raw_html=raw_html,
+                entities=entities,
+            )
         )
     )
 
@@ -550,18 +613,11 @@ async def on_refresh_links(m: Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    db = next(_db())
-    admin = None
-    admin_id = data.get("admin_id")
-    if admin_id:
-        admin = svc_admins.get_admin_by_id(db, admin_id)
-    if admin is None and m.from_user:
-        admin = svc_admins.find_admin(
-            db,
-            tg_id=m.from_user.id,
-            username=m.from_user.username if m.from_user.username else None,
-            display=None,
-        )
+    admin = svc_admins.get_admin_for_refresh(
+        admin_id=data.get("admin_id"),
+        from_user_id=m.from_user.id if m.from_user else None,
+        from_username=m.from_user.username if m.from_user and m.from_user.username else None,
+    )
     if not admin:
         await m.answer("Адміна не знайдено. Додай його через /add_admin і спробуй ще раз.")
         await state.clear()
@@ -636,34 +692,19 @@ async def on_admin_name(m: Message, state: FSMContext):
         raw_text = data.get("raw_text") or ""
         raw_html = data.get("raw_html") or raw_text
         entities = data.get("entities") or []
-        batch_id = f"adminbot:{m.chat.id}:{int(time.time())}"
+        admin_id, batch_id, added = svc_admins.add_admin_and_enqueue_links(
+            urls=urls,
+            display=display,
+            username=candidate_username,
+            raw_text=raw_text,
+            raw_html=raw_html,
+            entities=entities,
+            chat_id=m.chat.id if m.chat else None,
+            msg_id=m.message_id,
+            reply_msg=m,
+        )
         log.info("on_admin_name: enqueue batch_id=%s urls=%s admin_display=%s username=%s", batch_id, len(urls), display, candidate_username)
-        added = link_queue.enqueue(
-            urls,
-            batch_id=batch_id,
-            origin_chat=m.chat.id if m.chat else None,
-            origin_msg=m.message_id,
-            owner_display=display,
-            owner_username=candidate_username,
-            adopt_existing=True,
-            reset_next_try=True,
-        )
         await _answer_with_retry(m, f"Додано у чергу {added}/{len(urls)} посилань. Починаю обробку…")
-
-        asyncio.create_task(
-            process_batch(
-                batch_id=batch_id,
-                chat_id=m.chat.id,
-                reply_msg=m,
-                admin_display=display,
-                admin_username=candidate_username,
-                admin_tg_id=None,
-                raw_text=raw_text,
-                raw_html=raw_html,
-                entities=entities,
-                original_urls=urls,
-            )
-        )
 
         await state.clear()
     except Exception:

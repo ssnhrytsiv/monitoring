@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Простий скрипт для перегляду квоти Google Drive для service account.
 Використання:

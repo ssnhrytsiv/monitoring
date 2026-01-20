@@ -14,6 +14,7 @@ from app.notificator_bot import formatter
 from app.notificator_bot.config import NOTIFIER_TARGET_IDS
 from app.notificator_bot.models import NotifierMessage
 from app.DAL import SessionLocal
+from app.DAL import session_scope
 from app.DAL import channels_operations as cho
 from app.DAL import bot_links_operations as blo
 from app.DAL import admins_operations as ao
@@ -49,42 +50,39 @@ def _safe_payload(payload_json: str) -> dict:
 
 
 def _fetch_channel(channel_id: int) -> dict | None:
-    db = SessionLocal()
-    try:
-        return cho.find_channel(db, channel_id)
-    except Exception:
-        return None
-    finally:
-        db.close()
+    with session_scope() as db:
+        try:
+            return cho.find_channel(db, channel_id)
+        except Exception:
+            return None
 
 
 def _fetch_channel_link(channel_id: int) -> str | None:
-    db = SessionLocal()
-    try:
-        links = cho.get_links_by_channel_ids([channel_id]) or {}
-        return links.get(channel_id)
-    except Exception:
-        return None
-    finally:
-        db.close()
+    with session_scope() as db:
+        try:
+            links = cho.get_links_by_channel_ids(db, [channel_id]) or {}
+            return links.get(channel_id)
+        except Exception:
+            return None
 
 
 def _admin_label(admin_id: int | None) -> str | None:
     if admin_id is None:
         return None
-    row = ao.get_admin_label(None, admin_id)
+    with session_scope() as db:
+        row = ao.get_admin_label(db, admin_id)
     if not row:
         return str(admin_id)
-    display, username = row
-    if display:
-        return str(display)
-    if username:
-        return str(username)
+    if row.display:
+        return str(row.display)
+    if row.username:
+        return str(row.username)
     return str(admin_id)
 
 
 def _get_watch_info(watch_id: int) -> dict:
-    return watch_posts_db.get_watch_info(watch_id)
+    with session_scope() as db:
+        return watch_posts_db.get_watch_info_db(db, watch_id)
 
 
 def _channel_meta(channel_id: int, fallback_url: str | None) -> Tuple[str, str]:
@@ -94,38 +92,42 @@ def _channel_meta(channel_id: int, fallback_url: str | None) -> Tuple[str, str]:
     title = f"cid={channel_id}"
     link = fallback_url or ""
     # 1) спробуємо звичайний канал
-    db = SessionLocal()
-    try:
-        info = cho.find_channel(db, channel_id)
-    except Exception:
-        info = None
-    finally:
-        db.close()
+    with session_scope() as db:
+        try:
+            info = cho.find_channel(db, channel_id)
+        except Exception:
+            info = None
     if info:
-        if info.get("title"):
-            title = info["title"]
-        username = info.get("username")
+        if info.title:
+            title = info.title
+        username = info.username
         if username:
             link = f"https://t.me/{username}"
 
     # 2) якщо назва ще дефолтна – спробуємо як бота (по посиланню)
-    if (not info or not info.get("title")) and fallback_url:
+    if (not info or not info.title) and fallback_url:
         bot_username = extract_bot_username(fallback_url)
         if bot_username:
-            db = SessionLocal()
-            try:
-                bot_row = blo.get_bot_link_by_username(db, bot_username)
-            except Exception:
-                bot_row = None
-            finally:
-                db.close()
+            with session_scope() as db:
+                try:
+                    bot_row = blo.get_bot_link_by_username(db, bot_username)
+                except Exception:
+                    bot_row = None
             if bot_row:
-                if bot_row.get("title"):
-                    title = bot_row["title"]
-                elif bot_row.get("username"):
-                    title = bot_row["username"]
-                if bot_row.get("username"):
-                    link = f"https://t.me/{bot_row['username']}"
+                if bot_row.title:
+                    title = bot_row.title
+                elif bot_row.username:
+                    title = bot_row.username
+                if bot_row.username:
+                    link = f"https://t.me/{bot_row.username}"
+                # owner info якщо є
+                if bot_row.owner_admin_id:
+                    label = _admin_label(bot_row.owner_admin_id)
+                    if label:
+                        return label, link
+                if bot_row.owner_username and not info:
+                    # якщо нема channel info — використовуємо owner_username як title
+                    title = title or bot_row.owner_username
                 log.debug(
                     "notificator: bot_link resolved username=%s -> title=%s link=%s",
                     bot_username,
@@ -142,32 +144,34 @@ def _channel_meta(channel_id: int, fallback_url: str | None) -> Tuple[str, str]:
 
 
 def _admin_name(channel_info: dict | None, watch_info: dict) -> str:
-    admin_id = watch_info.get("admin_id")
-    label = _admin_label(admin_id) if admin_id is not None else None
-    if label:
-        return label
-
+    # 1) якщо в каналі збережено власника — показуємо його
     if channel_info:
-        if channel_info.get("owner_display"):
-            return channel_info["owner_display"]
-        if channel_info.get("owner_username"):
-            return channel_info["owner_username"]
+        if channel_info.get("owner_admin_id"):
+            label = _admin_label(channel_info.get("owner_admin_id"))
+            if label:
+                return label
 
     # Якщо це бот – пробуємо взяти owner з bot_links
     bot_username = extract_bot_username(watch_info.get("source_url") or "")
     if bot_username:
-        db = SessionLocal()
-        try:
-            bot_row = blo.get_bot_link_by_username(db, bot_username)
-        except Exception:
-            bot_row = None
-        finally:
-            db.close()
+        with session_scope() as db:
+            try:
+                bot_row = blo.get_bot_link_by_username(db, bot_username)
+            except Exception:
+                bot_row = None
         if bot_row:
-            if bot_row.get("owner_display"):
-                return bot_row["owner_display"]
+            if bot_row.get("owner_admin_id"):
+                label = _admin_label(bot_row.get("owner_admin_id"))
+                if label:
+                    return label
             if bot_row.get("owner_username"):
                 return bot_row["owner_username"]
+
+    # 2) fallback — якщо в watch збережений admin_id
+    admin_id = watch_info.get("admin_id")
+    label = _admin_label(admin_id) if admin_id is not None else None
+    if label:
+        return label
 
     created_by = watch_info.get("created_by")
     if created_by:
@@ -286,7 +290,8 @@ def collect_grouped_events(
     Читає unsent events, групує по (project, admin, group_id), повертає (grouped, event_ids).
     Всередині групи по кожному watch_id залишаємо найпріоритетніший запис.
     """
-    events = fetch_unsent_events(limit=1000)
+    with session_scope() as db:
+        events = fetch_unsent_events(db, limit=1000)
     log.debug("notificator: fetched unsent events count=%s", len(events))
     if not events:
         log.debug("notificator: no unsent events")
@@ -354,7 +359,6 @@ def collect_grouped_events(
                 if not chan_id:
                     continue
                 status = (row.get("status") or "").lower()
-                deleted_at = row.get("deleted_at")
                 ev_type = {
                     "matched": "matched",
                     "expired": "expired",
@@ -579,6 +583,7 @@ async def send_notifications(bot: Bot, debounce_sec: int = 60) -> None:
     sent_to = NOTIFIER_TARGET_IDS[0] if NOTIFIER_TARGET_IDS else 0
     for ev_id in dict.fromkeys(event_ids):
         try:
-            mark_event_sent(ev_id, sent_to)
+            with session_scope() as db:
+                mark_event_sent(db, ev_id, sent_to)
         except Exception as e:
             log.error("mark_event_sent failed for event_id=%s: %s", ev_id, e)

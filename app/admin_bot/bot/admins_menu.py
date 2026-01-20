@@ -1,30 +1,32 @@
 from __future__ import annotations
 
-import math
 import logging
-from typing import List, Dict, Any
-from types import SimpleNamespace
-from aiogram import Router, F
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.fsm.context import FSMContext
-from aiogram.exceptions import TelegramBadRequest
-from sqlalchemy import select, func, exists
+import math
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
-from app.admin_bot.db import models as m
-from app.admin_bot.db.session import SessionLocal
-from app.admin_bot.services import admins as svc_admins
-from app.admin_bot.services import networks as svc_networks
-from app.admin_bot.bot.keyboards import page_kb
-from app.admin_bot.bot.states import NetworkFlow, AdminParamsFlow, AdminResultsFlow
-from app.admin_bot.utils.messages import extract_links_from_message
-from app.admin_bot.services.networks import channel_hyperlink
-from app.services import account_pool
-from app.DAL import bot_links_operations as blo
-from app.DAL import watch_groups_operations as watch_groups_db
-from datetime import datetime, timedelta
+from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy import select
 from telethon.tl.functions.contacts import BlockRequest
 from telethon.tl.functions.messages import DeleteHistoryRequest
-from app.admin_bot.bot.keyboards import main_menu_kb
+
+from app.DAL import bot_links_operations as blo
+from app.DAL import watch_groups_operations as watch_groups_db
+from app.DAL.watch_groups_operations import WatchGroupRecord
+from app.admin_bot.bot.keyboards import main_menu_kb, page_kb
+from app.admin_bot.bot.states import AdminParamsFlow, AdminResultsFlow, NetworkFlow
+from app.db import models as m
+from app.db.session import SessionLocal, session_scope
+from app.db import models as sm
+from app.admin_bot.services import admins as svc_admins
+from app.admin_bot.services import networks as svc_networks
+from app.admin_bot.services.networks import channel_hyperlink
+from app.DAL import network_channels_operations as net_db
+from app.admin_bot.utils.messages import extract_links_from_message
+from app.services import account_pool
 
 PARAM_FIELDS = {
     "cpm": "CPM",
@@ -60,10 +62,10 @@ def _load_admins():
     return sorted(admins, key=lambda a: (a.display or "").lower())
 
 
-def _list_bot_links(owner_display=None, owner_username=None):
+def _list_bot_links(owner_admin_id: Optional[int] = None, owner_username: Optional[str] = None):
     db = SessionLocal()
     try:
-        return blo.list_bot_links(db, owner_display=owner_display, owner_username=owner_username)
+        return blo.list_bot_links(db, owner_admin_id=owner_admin_id, owner_username=owner_username)
     finally:
         db.close()
 
@@ -84,17 +86,15 @@ def _admin_label(a) -> str:
 
 async def _render_admin_view(msg, admin, nets, stats):
     label_new = "<code>[NEW]</code>" if getattr(admin, "is_new", 0) else ""
-    bots = _list_bot_links(owner_display=admin.display, owner_username=admin.username)
+    bots = _list_bot_links(owner_admin_id=admin.id, owner_username=admin.username)
     bots_count = len(bots)
     # підрахунок каналів по сітках
     net_lines = []
     total_channels = 0
     if nets:
-        db = next(_db())
         for n in nets:
-            cnt = db.execute(
-                select(func.count(m.NetworkChannel.id)).where(m.NetworkChannel.network_id == n.id)
-            ).scalar() or 0
+            with session_scope() as db:
+                cnt = net_db.count_channels_in_network(db, n.id)
             total_channels += cnt
             # домовлені
             neg_cpm = getattr(n, "cpm_negotiated", None)
@@ -246,6 +246,56 @@ async def cb_admins_back_to_menu(cb: CallbackQuery):
     await cb.answer()
 
 
+@router.callback_query(F.data == "show_requested")
+async def cb_show_requested(cb: CallbackQuery):
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(
+                sm.RequestedCheck.session,
+                sm.RequestedCheck.channel_id,
+                sm.RequestedCheck.noted_at,
+                m.Channel,
+                m.Admin,
+            )
+            .join(m.Channel, m.Channel.channel_id == sm.RequestedCheck.channel_id)
+            .outerjoin(m.Admin, m.Admin.id == m.Channel.owner_admin_id)
+            .order_by(sm.RequestedCheck.noted_at.desc())
+            .all()
+        )
+    finally:
+        db.close()
+
+    if not rows:
+        await cb.message.edit_text(
+            "Немає відправлених заявок.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")]]
+            ),
+        )
+        await cb.answer()
+        return
+
+    db = SessionLocal()
+    try:
+        lines = ["Відправлені заявки:"]
+        for idx, (session, channel_id, noted_at, channel, owner_admin) in enumerate(rows, start=1):
+            link_html = channel_hyperlink(db, channel)
+            owner_label = owner_admin.display if owner_admin and owner_admin.display else "—"
+            dt = datetime.fromtimestamp(noted_at).strftime("%Y-%m-%d %H:%M:%S")
+            lines.append(
+                f"{idx}) {link_html} — акаунт: {session}, власник: {owner_label}, дата: {dt}"
+            )
+    finally:
+        db.close()
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")]]
+    )
+    await cb.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True)
+    await cb.answer()
+
+
 @router.callback_query(F.data.startswith("admin_net_show:"))
 async def cb_admin_net_show(cb: CallbackQuery):
     try:
@@ -265,12 +315,7 @@ async def cb_admin_net_show(cb: CallbackQuery):
 
 
 def _net_channel_pages(db, net_id: int, net_name: str, per_page: int = 25) -> tuple[list[str], int]:
-    rows = db.execute(
-        select(m.Channel)
-        .join(m.NetworkChannel, m.NetworkChannel.channel_id == m.Channel.channel_id)
-        .where(m.NetworkChannel.network_id == net_id)
-        .order_by(m.Channel.title)
-    ).scalars().all()
+    rows = net_db.list_channels_in_network(db, net_id)
     total = len(rows)
     if not rows:
         return [f"Сітка: {net_name} (0)\n(поки без каналів)"], 0
@@ -471,47 +516,53 @@ def _net_select_kb(admin_id: int, nets: List[m.Network]) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _result_groups_for_admin(admin_id: int) -> tuple[list[dict], list[int]]:
+def _result_groups_for_admin(admin_id: int) -> tuple[list[WatchGroupRecord], list[int]]:
     """Повертає групи вотчів, прив'язані до адміна (admin_id або його сітки)."""
-    db = next(_db())
-    nets = svc_networks.list_networks_by_admin(db, admin_id)
-    net_ids = [n.id for n in nets]
-    groups_data = watch_groups_db.list_groups_for_admin(admin_id, net_ids)
+    with session_scope() as db:
+        nets = svc_networks.list_networks_by_admin(db, admin_id)
+        net_ids = [n.id for n in nets]
+        groups_data = watch_groups_db.list_groups_for_admin(db, admin_id, net_ids)
     return groups_data, net_ids
 
 
-def _group_label(group_data: dict) -> str:
-    if group_data.get("title"):
-        return group_data["title"]
-    if group_data.get("created_at"):
-        return str(group_data["created_at"]).split()[0]
-    return f"ID {group_data.get('id')}"
+def _group_label(group_data: WatchGroupRecord) -> str:
+    if group_data.title:
+        return group_data.title
+    if group_data.created_at:
+        return str(group_data.created_at).split()[0]
+    return f"ID {group_data.id}"
 
 
-def _build_results_text(admin, groups: list[dict]) -> str:
+def _build_results_text(admin, groups: list[WatchGroupRecord]) -> str:
     lines = [f"Результати для {_admin_label(admin)}:"]
     if not groups:
         lines.append("Груп немає.")
     for g in groups:
-        line = f"• {_group_label(g)} — CPMф: {g.get('actual_cpm'):.0f}" if g.get("actual_cpm") is not None else f"• {_group_label(g)} — CPMф: —"
-        line += f", Цінаф: {g.get('actual_price'):.2f}" if g.get("actual_price") is not None else ", Цінаф: —"
-        line += f", Перегляди: {g.get('actual_views')}" if g.get("actual_views") is not None else ", Перегляди: —"
-        line += f", Підписники: {g.get('subscribers')}" if g.get("subscribers") is not None else ", Підписники: —"
+        ac_cpm = g.actual_cpm
+        ac_price = g.actual_price
+        ac_views = g.actual_views
+        subs = g.subscribers
+        line = f"• {_group_label(g)} — CPMф: {ac_cpm:.0f}" if ac_cpm is not None else f"• {_group_label(g)} — CPMф: —"
+        line += f", Цінаф: {ac_price:.2f}" if ac_price is not None else ", Цінаф: —"
+        line += f", Перегляди: {ac_views}" if ac_views is not None else ", Перегляди: —"
+        line += f", Підписники: {subs}" if subs is not None else ", Підписники: —"
         lines.append(line)
     return "\n".join(lines)
 
 
 def _sum_actual_price_for_network(net_id: int, days: int = 30) -> float:
     """Сумує actual_price груп для сітки за останні days."""
-    return watch_groups_db.sum_actual_price_for_network(net_id, days)
+    with session_scope() as db:
+        return watch_groups_db.sum_actual_price_for_network(db, net_id, days)
 
 
 def _sum_subscribers_for_network(net_id: int, days: int = 30) -> int:
     """Сумує subscribers груп для сітки за останні days."""
-    return watch_groups_db.sum_subscribers_for_network(net_id, days)
+    with session_scope() as db:
+        return watch_groups_db.sum_subscribers_for_network(db, net_id, days)
 
 
-def _results_kb(admin_id: int, groups: list[dict]) -> InlineKeyboardMarkup:
+def _results_kb(admin_id: int, groups: list[WatchGroupRecord]) -> InlineKeyboardMarkup:
     rows = []
     for g in groups:
         rows.append([InlineKeyboardButton(text=_group_label(g), callback_data=f"admin_result_group:{admin_id}:{g.id}")])
@@ -521,7 +572,8 @@ def _results_kb(admin_id: int, groups: list[dict]) -> InlineKeyboardMarkup:
 
 
 def _render_group_detail(admin_id: int, group_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    group_data, posts_data = watch_groups_db.get_group_detail(group_id)
+    with session_scope() as db:
+        group_data, posts_data = watch_groups_db.get_group_detail(db, group_id)
     if not group_data:
         return "Групу не знайдено.", InlineKeyboardMarkup(
             inline_keyboard=[
@@ -529,12 +581,12 @@ def _render_group_detail(admin_id: int, group_id: int) -> tuple[str, InlineKeybo
                 [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
             ]
         )
-    subscriber_count = group_data.get("subscribers")
+    subscriber_count = group_data.subscribers
     text_lines = [
         f"Реклама: {_group_label(group_data)}",
-        f"CPM факт: {group_data.get('actual_cpm'):.0f}" if group_data.get("actual_cpm") is not None else "CPM факт: —",
-        f"Ціна факт: {group_data.get('actual_price'):.2f}" if group_data.get("actual_price") is not None else "Ціна факт: —",
-        f"Перегляди факт: {group_data.get('actual_views')}" if group_data.get("actual_views") is not None else "Перегляди факт: —",
+        f"CPM факт: {group_data.actual_cpm:.0f}" if group_data.actual_cpm is not None else "CPM факт: —",
+        f"Ціна факт: {group_data.actual_price:.2f}" if group_data.actual_price is not None else "Ціна факт: —",
+        f"Перегляди факт: {group_data.actual_views}" if group_data.actual_views is not None else "Перегляди факт: —",
         f"Підписники: {subscriber_count if subscriber_count is not None else '—'}",
         "Пости:",
     ]
@@ -542,24 +594,24 @@ def _render_group_detail(admin_id: int, group_id: int) -> tuple[str, InlineKeybo
         text_lines.append("• Пости відсутні.")
     else:
         for post_data in posts_data:
-            views = post_data.get("final_views") or post_data.get("views_at_post") or 0
+            views = post_data.final_views or post_data.views_at_post or 0
             price = None
-            if post_data.get("price_at_post") is not None:
-                price = float(post_data.get("price_at_post"))
-            elif post_data.get("cpm_at_post") is not None and views:
-                price = float(post_data.get("cpm_at_post")) * views / 1000.0
+            if post_data.price_at_post is not None:
+                price = float(post_data.price_at_post)
+            elif post_data.cpm_at_post is not None and views:
+                price = float(post_data.cpm_at_post) * views / 1000.0
             cpm = None
             if price is not None and views > 0:
                 cpm = price * 1000.0 / views
-            elif post_data.get("cpm_at_post") is not None:
-                cpm = post_data.get("cpm_at_post")
+            elif post_data.cpm_at_post is not None:
+                cpm = post_data.cpm_at_post
             price_per_sub = None
             if subscriber_count:
                 try:
                     price_per_sub = price / subscriber_count if price is not None else None
                 except Exception:
                     price_per_sub = None
-            line = f"• Post {post_data.get('id')}: "
+            line = f"• Post {post_data.id}: "
             line += f"CPM {cpm:.0f}" if cpm is not None else "CPM —"
             line += f", Перегляди {views}"
             line += f", Ціна {price:.2f}" if price is not None else ", Ціна —"
@@ -774,7 +826,8 @@ async def on_group_subs(m, state: FSMContext):
     except Exception:
         await m.answer("Не вдалося розпізнати число, спробуй ще раз.")
         return
-    watch_groups_db.set_watch_group_subscribers(int(gid), subs)
+    with session_scope() as db:
+        watch_groups_db.set_watch_group_subscribers(db, int(gid), subs)
     await state.clear()
     text, kb = _render_group_detail(int(admin_id), int(gid))
     await m.answer(f"Підписників встановлено: {subs}", reply_markup=InlineKeyboardMarkup(
@@ -796,10 +849,7 @@ def _build_networks_keyboard(db, nets, admin_id: int):
     nets = sorted(nets, key=lambda n: (0 if n.name == "Основные каналы" else 1, n.name.lower()))
     counts = {}
     for n in nets:
-        cnt = db.execute(
-            select(func.count(m.NetworkChannel.id)).where(m.NetworkChannel.network_id == n.id)
-        ).scalar() or 0
-        counts[n.id] = cnt
+        counts[n.id] = net_db.count_channels_in_network(db, n.id)
 
     rows = []
     row = []
@@ -995,28 +1045,18 @@ async def cb_admin_delete_yes(cb: CallbackQuery):
     except Exception:
         await cb.answer()
         return
-    db = next(_db())
-    # 1) збираємо канали та сесії, що підписані
-    chan_ids = [ac.channel_id for ac in db.execute(select(m.AdminChannel).where(m.AdminChannel.admin_id == admin_id)).scalars().all()]
-    # канали із сіток цього адміна
-    net_chan_ids = db.execute(
-        select(m.NetworkChannel.channel_id).join(m.Network, m.NetworkChannel.network_id == m.Network.id).where(m.Network.admin_id == admin_id)
-    ).scalars().all()
-    if net_chan_ids:
-        chan_ids = list(set(chan_ids) | set(net_chan_ids))
-
-    memberships = db.execute(
-        select(m.Membership).where(m.Membership.channel_id.in_(chan_ids), m.Membership.account != "")
-    ).scalars().all()
-    acct_map = {}
-    for mbr in memberships:
-        acct_map.setdefault(mbr.account, set()).add(mbr.channel_id)
+    info = svc_admins.collect_admin_delete_info(admin_id)
+    if not info.get("exists"):
+        await cb.answer("Не знайшов адміна", show_alert=True)
+        return
+    chan_ids = info.get("chan_ids") or []
+    acct_map = info.get("acct_map") or {}
     leave_stats = []
     for acct, cids in acct_map.items():
         stat = await account_pool.leave_channels(acct, list(cids))
         leave_stats.append(stat)
 
-    res = svc_admins.remove_admin_deep(db, admin_id, cleanup_channels=True)
+    res = svc_admins.remove_admin_deep(admin_id, cleanup_channels=True)
     if not res["admin_deleted"]:
         await cb.answer("Не знайшов адміна", show_alert=True)
         return
@@ -1028,7 +1068,7 @@ async def cb_admin_delete_yes(cb: CallbackQuery):
         "Адміна видалено.\n"
         f"Прив'язок каналів: {res['admin_channels_deleted']}\n"
         f"Сіток: {res['networks_deleted']}, каналів у сітках: {res['network_channels_deleted']}\n"
-        f"membership: {res.get('membership_deleted',0)}, invite_map: {res.get('invite_map_deleted',0)}, invite_status: {res.get('invite_status_deleted',0)}, links: {res.get('links_deleted',0)}, channels: {res.get('channels_deleted',0)}\n"
+        f"membership: {res.get('membership_deleted',0)}, links: {res.get('links_deleted',0)}, channels: {res.get('channels_deleted',0)}\n"
         f"link_queue: {res.get('link_queue_deleted',0)}\n"
         f"Відписка: {leaves}"
         + ("" if not leave_errors else "\n⚠️ Помилки відписки: перевірити вручну")
@@ -1053,7 +1093,7 @@ async def cb_admin_bots(cb: CallbackQuery):
     if not admin:
         await cb.answer("Адміна не знайдено", show_alert=True)
         return
-    bots = _list_bot_links(owner_display=admin.display, owner_username=admin.username)
+    bots = _list_bot_links(owner_admin_id=admin.id, owner_username=admin.username)
     text, kb = _build_bots_view(admin, bots, page=0)
     await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
@@ -1071,7 +1111,7 @@ async def cb_admin_unsub_bots(cb: CallbackQuery, state: FSMContext):
     if not admin:
         await cb.answer("Адміна не знайдено", show_alert=True)
         return
-    bots = _list_bot_links(owner_display=admin.display, owner_username=admin.username)
+    bots = _list_bot_links(owner_admin_id=admin.id, owner_username=admin.username)
     if not bots:
         await cb.answer("Немає ботів для відписки", show_alert=True)
         return
@@ -1101,7 +1141,7 @@ async def cb_admin_unsub_bot(cb: CallbackQuery):
     if not username:
         await cb.answer()
         return
-    bots = _list_bot_links()
+    bots = _list_bot_links(owner_admin_id=admin_id)
     bot_row = next((b for b in bots if b.get("username") == username), None)
     sess_name = bot_row.get("session") if bot_row else None
     if not sess_name:
@@ -1159,7 +1199,7 @@ async def cb_admin_bots_page(cb: CallbackQuery):
     if not admin:
         await cb.answer("Адміна не знайдено", show_alert=True)
         return
-    bots = _list_bot_links(owner_display=admin.display, owner_username=admin.username)
+    bots = _list_bot_links(owner_admin_id=admin.id, owner_username=admin.username)
     total_pages = max(1, math.ceil(len(bots) / BOTS_PER_PAGE))
     # поточну сторінку беремо з кнопки пагінації (текст типу 1/3)
     cur_page = _current_page_from_markup(cb.message)

@@ -1,18 +1,15 @@
 from typing import Optional
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 import os
 
-from telethon.tl.types import Message as TgMessage  # тип пересланого поста
+from aiogram.types import Message as AiogramMessage
 from app.DAL.watch_posts_operations import (
     get_watch_channel_id,
     get_watch_source_url,
     manual_mark_matched,
-    set_watch_status_pending,
-    update_watch_time_window,
-    update_watch_source_url,
+    update_watch_time_window as dao_update_watch_time_window,
 )
-from app.services.account_pool import is_already_subscribed
 from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now
 from app import config
 
@@ -59,12 +56,6 @@ def _calc_coverage_at(hours_after: float | None = None) -> Optional[str]:
     return (now_msq + timedelta(hours=hrs)).strftime(MOSCOW_TIME_FORMAT)
 
 
-from aiogram.types import Message as AiogramMessage
-from app.DAL.watch_posts_operations import (
-    get_watch_channel_id,
-    get_watch_source_url,
-    manual_mark_matched,
-)
 async def manual_match_watch_from_message(wid: int, msg: AiogramMessage) -> bool:
     # 1) channel_id з БД
     cid = get_watch_channel_id(wid)
@@ -113,3 +104,11 @@ async def manual_match_watch_from_message(wid: int, msg: AiogramMessage) -> bool
         mid,
     )
     return True
+
+
+def update_watch_time_window(watch_id: int, tw_start: str, tw_end: str) -> bool:
+    """
+    Проксі до DAO для оновлення time_window_start/time_window_end.
+    Використовується у хендлері зміни часу вікна.
+    """
+    return dao_update_watch_time_window(watch_id, tw_start, tw_end)

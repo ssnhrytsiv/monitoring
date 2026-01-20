@@ -9,7 +9,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramNetworkError
 
 from app.admin_bot.config import ADMIN_BOT_TOKEN
-from app.admin_bot.db.session import Base, engine, migrate_admins_nullable
+from app.db.session import Base, engine, migrate_admins_nullable
 from app.admin_bot.bot import router
 
 

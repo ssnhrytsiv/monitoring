@@ -11,7 +11,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
 
 from app.watch_bot.states import EditWatch
-from app.watch_bot.keyboards import main_menu_kb
+from app.watch_bot.keyboards import main_menu_kb, back_button
 from app.services.time_utils import msk_now
 
 from app.watch_bot.services.templates_repo import load_templates_map
@@ -29,10 +29,11 @@ from app.watch_bot.services.active_watches_service import (
     get_group_leader_for_watch,
 )
 from app.watch_bot.services.edit_watch_service import (
-    set_watch_status_pending,
     update_watch_time_window,
     manual_match_watch_from_message,
 )
+from app.DAL.watch_posts_operations import set_watch_status_pending_db
+from app.DAL import session_scope
 from app.DAL.watch_candidates_operations import (
     CANDIDATE_PENDING_STATUS,
     list_watch_candidates,
@@ -48,7 +49,7 @@ try:
     from app.sheet_bot.services import gsheets_buffer as gsb
 except Exception:
     gsb = None
-from app.services.post_matcher import normalize_text, extract_links_norm
+from app.services.post_match import extract_links_norm
 from app.watch_bot.utils.active_watches_formatters import (
     fmt_tw_end_human,
     short_title,
@@ -78,7 +79,8 @@ def _edit_back_kb(wid: int) -> InlineKeyboardBuilder:
     Клавіатура з кнопкою 'Back' для повернення в картку редагування watch'а.
     """
     kb = InlineKeyboardBuilder()
-    kb.button(text="⬅️ Back", callback_data=f"watch:edit:{wid}")
+    bb = back_button(callback_data=f"watch:edit:{wid}")
+    kb.button(text=bb.text, callback_data=bb.callback_data)
     return kb
 
 
@@ -271,7 +273,8 @@ async def watch_group_details(cb: CallbackQuery):
     owners_map: Dict[int, str] = {}
     if cids:
         channel_names_map = get_titles_by_channel_ids(cids) or {}
-        owners_map = get_owners_by_channel_ids(cids) or {}
+        owners_list = get_owners_by_channel_ids(cids) or []
+        owners_map = {o.channel_id: (o.owner_label or "") for o in owners_list if o.owner_label}
 
     # owner у першому рядку таблиці (і в заголовку повідомлення)
     owner_for_header = "—"
@@ -290,7 +293,7 @@ async def watch_group_details(cb: CallbackQuery):
         all_items,
         templates_map=templates_map,
         channel_titles=channel_names_map,
-        owner_display=owner_for_header,
+        owner_name=owner_for_header,
     )
 
     # 6) Клавіатура для поточної сторінки
@@ -317,7 +320,7 @@ async def watch_group_details(cb: CallbackQuery):
             callback_data=f"watch:group_similar:{leader_wid}",
         )
     )
-    kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data=back_cb))
+    kb.row(back_button(callback_data=back_cb))
 
     # 7) Заголовок повідомлення
     tw_txt = fmt_tw_end_human(tw_key)
@@ -381,16 +384,18 @@ async def watch_group_similar(cb: CallbackQuery):
         await cb.answer("Вотчів у групі немає", show_alert=True)
         return
 
-    cands = list_group_watch_candidates(wids, status=CANDIDATE_PENDING_STATUS)
+    with session_scope() as db:
+        cands = list_group_watch_candidates(db, wids, status=CANDIDATE_PENDING_STATUS)
     if not cands:
         kb = InlineKeyboardBuilder()
-        kb.button(text="⬅️ Back", callback_data=f"watch:group:{leader_wid}")
+        bb = back_button(callback_data=f"watch:group:{leader_wid}")
+        kb.button(text=bb.text, callback_data=bb.callback_data)
         await cb.message.edit_text("Схожих постів у групі немає.", reply_markup=kb.as_markup())
         await cb.answer()
         return
 
     # Підготуємо довідники назв/лінків каналів
-    cids = [c.get("channel_id") for c in cands if c.get("channel_id")]
+    cids = [c.channel_id for c in cands if c.channel_id]
     titles_map: Dict[int, str] = {}
     links_map: Dict[int, str] = {}
     if cids:
@@ -404,7 +409,7 @@ async def watch_group_similar(cb: CallbackQuery):
     # Групуємо кандидати за text_hash (одна кнопка на один текст)
     grouped: Dict[str, Dict[str, Any]] = {}
     for cand in cands:
-        key = cand.get("text_hash") or f"id:{cand.get('id')}"
+        key = cand.text_hash or f"id:{cand.id}"
         bucket = grouped.setdefault(key, {"items": [], "repr": cand})
         bucket["items"].append(cand)
 
@@ -413,22 +418,20 @@ async def watch_group_similar(cb: CallbackQuery):
     idx = 1
     for key, group in grouped.items():
         cand = group["repr"]
-        cid = cand.get("id")
-        preview = (cand.get("message_text") or "").strip()
-        preview_short = (preview[:80] + "…") if len(preview) > 80 else preview
+        cid = cand.id
 
         # Канали/вотчі для цього тексту
         titles = []
         wids = []
         for item in group["items"]:
-            channel_id = item.get("channel_id")
+            channel_id = item.channel_id
             title = titles_map.get(channel_id, f"cid={channel_id}") if channel_id else "—"
             link = links_map.get(channel_id)
             if link:
                 titles.append(f"<a href=\"{html.escape(str(link))}\">{html.escape(str(title))}</a>")
             else:
                 titles.append(html.escape(str(title)))
-            wids.append(str(item.get("watch_id")))
+            wids.append(str(item.watch_id))
 
         lines.append(f"Пост #{idx}")
         lines.append("   Канали:")
@@ -440,7 +443,7 @@ async def watch_group_similar(cb: CallbackQuery):
         idx += 1
 
     kb.adjust(2)
-    kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data=f"watch:group:{leader_wid}"))
+    kb.row(back_button(callback_data=f"watch:group:{leader_wid}"))
 
     await cb.message.edit_text("\n".join(lines), reply_markup=kb.as_markup(), parse_mode="HTML")
     await cb.answer()
@@ -497,7 +500,8 @@ async def watch_edit(cb: CallbackQuery):
     owners_map: Dict[int, str] = {}
     if cids:
         channel_names_map = get_titles_by_channel_ids(cids) or {}
-        owners_map = get_owners_by_channel_ids(cids) or {}
+        owners_list = get_owners_by_channel_ids(cids) or []
+        owners_map = {o.channel_id: (o.owner_label or "") for o in owners_list if o.owner_label}
 
     owner_for_header = "—"
     try:
@@ -515,7 +519,7 @@ async def watch_edit(cb: CallbackQuery):
         watch=watch,
         templates_map=templates_map,
         channel_titles=channel_names_map,
-        owner_display=owner_for_header,
+        owner_name=owner_for_header,
     )
 
     # 4) Кнопки: Додати пост, Змінити статус, Back
@@ -524,10 +528,7 @@ async def watch_edit(cb: CallbackQuery):
     kb.button(text="🔄 Змінити статус", callback_data=f"watch:change_status:{wid_i}")
     kb.button(text="🔍 Похожие посты", callback_data=f"watch:similar:{wid_i}")
     kb.row(
-        InlineKeyboardButton(
-            text="⬅️ Back",
-            callback_data="menu:list_active",
-        )
+        back_button(callback_data="menu:list_active")
     )
 
     try:
@@ -551,7 +552,8 @@ async def watch_similar_accept(cb: CallbackQuery):
     if not cid:
         await cb.answer("bad candidate", show_alert=True)
         return
-    cand = get_watch_candidate(cid)
+    with session_scope() as db:
+        cand = get_watch_candidate(db, cid)
     if not cand:
         await cb.answer("кандидат не знайдений", show_alert=True)
         return
@@ -571,18 +573,20 @@ async def watch_similar_accept(cb: CallbackQuery):
                 pass
         return None
 
-    ok = accept_watch_candidate(cid, coverage_hours=_read_coverage_hours())
+    with session_scope() as db:
+        ok = accept_watch_candidate(db, cid, coverage_hours=_read_coverage_hours())
     if not ok:
         await cb.answer("не вдалось заметчити", show_alert=True)
         return
     # Після прийняття кандидата — пишемо в таблицю (для всіх accepted з цим hash)
     if gsb:
         try:
-            text_hash = cand.get("text_hash") or ""
-            accepted = list_candidates_by_hash(text_hash, status="accepted") if text_hash else []
-            target_wids = {c.get("watch_id") for c in accepted if c.get("watch_id")}
-            if not target_wids and cand.get("watch_id"):
-                target_wids = {cand.get("watch_id")}
+            text_hash = cand.text_hash or ""
+            with session_scope() as db:
+                accepted = list_candidates_by_hash(db, text_hash, status="accepted") if text_hash else []
+            target_wids = {c.watch_id for c in accepted if c.watch_id}
+            if not target_wids and cand.watch_id:
+                target_wids = {cand.watch_id}
             for wid in target_wids:
                 try:
                     gsb.record_matched(int(wid))
@@ -591,11 +595,12 @@ async def watch_similar_accept(cb: CallbackQuery):
         except Exception:
             log.exception("watch_similar_accept: gsheets sync failed")
     await cb.answer("Готово, поставлено matched")
-    back_wid = cand.get("watch_id")
+    back_wid = cand.watch_id
     kb = InlineKeyboardBuilder()
     back_cb = _back_to_group_cb(back_wid)
     if back_cb:
-        kb.button(text="⬅️ Back", callback_data=back_cb)
+        bb = back_button(callback_data=back_cb)
+        kb.button(text=bb.text, callback_data=bb.callback_data)
     await cb.message.edit_text("✅ Кандидат заметчено", reply_markup=kb.as_markup() if kb.buttons else None)
 
 
@@ -608,27 +613,31 @@ async def watch_similar_reject(cb: CallbackQuery):
     if not cid:
         await cb.answer("bad candidate", show_alert=True)
         return
-    cand = get_watch_candidate(cid)
+    with session_scope() as db:
+        cand = get_watch_candidate(db, cid)
     if not cand:
         await cb.answer("кандидат не знайдений", show_alert=True)
         return
     # Відхиляємо всі pending з таким самим text_hash, щоб забрати всю групу
-    text_hash = cand.get("text_hash") or ""
+    text_hash = cand.text_hash or ""
     rejected_any = False
     if text_hash:
-        for c in list_candidates_by_hash(text_hash, status="pending"):
-            set_watch_candidate_status(int(c["id"]), "rejected")
-            rejected_any = True
+        with session_scope() as db:
+            for c in list_candidates_by_hash(db, text_hash, status="pending"):
+                set_watch_candidate_status(db, int(c.id), "rejected")
+                rejected_any = True
     else:
-        set_watch_candidate_status(cid, "rejected")
-        rejected_any = True
+        with session_scope() as db:
+            set_watch_candidate_status(db, cid, "rejected")
+            rejected_any = True
 
     await cb.answer("Відхилено")
-    back_wid = cand.get("watch_id")
+    back_wid = cand.watch_id
     kb = InlineKeyboardBuilder()
     back_cb = _back_to_group_cb(back_wid)
     if back_cb:
-        kb.button(text="⬅️ Back", callback_data=back_cb)
+        bb = back_button(callback_data=back_cb)
+        kb.button(text=bb.text, callback_data=bb.callback_data)
     await cb.message.edit_text(
         "❌ Кандидати відхилено" if rejected_any else "Нема що відхиляти",
         reply_markup=kb.as_markup() if kb.buttons else None,
@@ -644,14 +653,16 @@ async def watch_similar_view(cb: CallbackQuery):
     if not cid:
         await cb.answer("bad id", show_alert=True)
         return
-    cand = get_watch_candidate(cid)
+    with session_scope() as db:
+        cand = get_watch_candidate(db, cid)
     if not cand:
         await cb.answer("не знайдено", show_alert=True)
         return
-    wid = cand.get("watch_id")
+    wid = cand.watch_id
 
     # Всі кандидати з тим самим text_hash (щоб показати всі канали разом; тільки pending)
-    same_hash = list_candidates_by_hash(cand.get("text_hash") or "", status=CANDIDATE_PENDING_STATUS) or [cand]
+    with session_scope() as db:
+        same_hash = list_candidates_by_hash(db, cand.text_hash or "", status=CANDIDATE_PENDING_STATUS) or [cand]
 
     # Обмежуємо кандидати лише рамками цієї групи watch'ів
     group_wids: List[int] = []
@@ -665,9 +676,9 @@ async def watch_similar_view(cb: CallbackQuery):
     except Exception:
         group_wids = []
     if group_wids:
-        same_hash = [c for c in same_hash if c.get("watch_id") in group_wids] or [cand]
+        same_hash = [c for c in same_hash if c.watch_id in group_wids] or [cand]
 
-    cids = [c.get("channel_id") for c in same_hash if c.get("channel_id")]
+    cids = [c.channel_id for c in same_hash if c.channel_id]
     links_map: Dict[int, str] = {}
     titles_map: Dict[int, str] = {}
     if cids:
@@ -678,15 +689,16 @@ async def watch_similar_view(cb: CallbackQuery):
             titles_map = {}
             links_map = {}
 
-    msg_text = cand.get("message_text") or "—"
+    msg_text = cand.message_text or "—"
     # Лінки: очікувані (з watch) та фактичні (з поста)
-    expected_links = []
+    expected_links: List[str] = []
     try:
-        expected_html = get_watch_expected_text(wid) if wid else None
-        if expected_html:
-            expected_links = _collect_links(expected_html)
-        if not expected_links:
-            expected_links = get_watch_expected_links(wid) if wid else []
+        with session_scope() as db:
+            expected_html = get_watch_expected_text(db, wid) if wid else None
+            if expected_html:
+                expected_links = _collect_links(expected_html)
+            if not expected_links:
+                expected_links = get_watch_expected_links(db, wid) if wid else []
     except Exception:
         expected_links = []
     cand_links = _collect_links(msg_text)
@@ -694,8 +706,8 @@ async def watch_similar_view(cb: CallbackQuery):
     lines = [
         f"<b>Кандидат #{cid}</b>",
         f"watch_id: {html.escape(str(wid))}",
-        f"Схожість: {int((cand.get('similarity') or 0)*100)}%",
-        f"Створено: {html.escape(str(cand.get('created_at') or '—'))}",
+        f"Схожість: {int((cand.similarity or 0)*100)}%",
+        f"Створено: {html.escape(str(cand.created_at or '—'))}",
         "",
         "<b>Пост:</b>",
         msg_text,
@@ -703,12 +715,12 @@ async def watch_similar_view(cb: CallbackQuery):
         "<b>Канали:</b>",
     ]
     for item in same_hash:
-        channel_id = item.get("channel_id")
+        channel_id = item.channel_id
         title = titles_map.get(channel_id, f"cid={channel_id}") if channel_id else "—"
         link = links_map.get(channel_id, "") if channel_id else ""
         title_safe = html.escape(str(title))
         link_safe = html.escape(str(link)) if link else ""
-        wid_i = item.get("watch_id")
+        wid_i = item.watch_id
         prefix = f"wid={wid_i}: " if wid_i else ""
         if link_safe:
             lines.append(f"- {prefix}<a href=\"{link_safe}\">{title_safe}</a>")
@@ -718,16 +730,16 @@ async def watch_similar_view(cb: CallbackQuery):
     lines.append("")
     lines.append("<b>Очікувані лінки:</b>")
     if expected_links:
-        for l in expected_links:
-            l_safe = html.escape(str(l))
+        for link in expected_links:
+            l_safe = html.escape(str(link))
             lines.append(f"- <a href=\"{l_safe}\">{l_safe}</a>")
     else:
         lines.append("- немає")
 
     lines.append("<b>Лінки кандидата:</b>")
     if cand_links:
-        for l in cand_links:
-            l_safe = html.escape(str(l))
+        for link in cand_links:
+            l_safe = html.escape(str(link))
             lines.append(f"- <a href=\"{l_safe}\">{l_safe}</a>")
     else:
         lines.append("- немає")
@@ -739,7 +751,8 @@ async def watch_similar_view(cb: CallbackQuery):
     kb.button(text="❌ Ні", callback_data=f"watch:similar:reject:{cid}")
     back_cb = _back_to_group_cb(wid)
     if back_cb:
-        kb.button(text="⬅️ Back", callback_data=back_cb)
+        bb = back_button(callback_data=back_cb)
+        kb.button(text=bb.text, callback_data=bb.callback_data)
     await cb.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
 
 
@@ -778,8 +791,8 @@ async def watch_similar_list(cb: CallbackQuery):
     kb = InlineKeyboardBuilder()
     lines = ["Схожі пости:"]
     for idx, cand in enumerate(cands, start=1):
-        cid = cand.get("id")
-        channel_id = cand.get("channel_id")
+        cid = cand.id
+        channel_id = cand.channel_id
         title = titles_map.get(channel_id, f"cid={channel_id}") if channel_id else "—"
         link = links_map.get(channel_id, "")
         title_safe = html.escape(str(title))
@@ -794,7 +807,7 @@ async def watch_similar_list(cb: CallbackQuery):
     kb.adjust(2)
     back_cb = _back_to_group_cb(wid)
     if back_cb:
-        kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data=back_cb))
+        kb.row(back_button(callback_data=back_cb))
 
     await cb.message.edit_text("\n".join(lines), reply_markup=kb.as_markup(), parse_mode="HTML")
     await cb.answer()
@@ -817,7 +830,8 @@ async def watch_change_status(cb: CallbackQuery, state: FSMContext):
         await cb.answer("bad id", show_alert=True)
         return
 
-    ok = set_watch_status_pending(wid)
+    with session_scope() as db:
+        ok = set_watch_status_pending_db(db, wid)
     if not ok:
         await cb.answer("Не зміг змінити статус", show_alert=True)
         return

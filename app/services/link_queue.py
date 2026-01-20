@@ -1,21 +1,13 @@
-import time
 import logging
-from contextlib import contextmanager
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
-from app.DAL import SessionLocal
-from app.DAL.link_queue_operations import LinkQueueDAO
+from sqlalchemy.orm import Session
+
+from app.DAL import session_scope
+from app.DAL import link_queue_operations as lq
+from app.DAL.link_queue_operations import LinkQueueItem
 
 log = logging.getLogger("services.link_queue")
-
-
-@contextmanager
-def _dao():
-    db = SessionLocal()
-    try:
-        yield LinkQueueDAO(db)
-    finally:
-        db.close()
 
 
 def enqueue(
@@ -24,20 +16,21 @@ def enqueue(
     origin_chat: Optional[int],
     origin_msg: Optional[int],
     delay_sec: int = 0,
-    owner_display: Optional[str] = None,
+    owner_admin_id: Optional[int] = None,
     owner_username: Optional[str] = None,
     *,
     adopt_existing: bool = False,
     reset_next_try: bool = True,
 ) -> int:
-    with _dao() as dao:
-        return dao.enqueue(
+    with session_scope() as db:
+        return lq.enqueue(
+            db,
             urls,
             batch_id,
             origin_chat,
             origin_msg,
             delay_sec,
-            owner_display,
+            owner_admin_id,
             owner_username,
             adopt_existing=adopt_existing,
             reset_next_try=reset_next_try,
@@ -47,40 +40,47 @@ def enqueue(
 def fetch_due(
     limit: int = 20,
     exclude_batch_prefixes: Optional[List[str]] = None,
-) -> List[Tuple[int, str, int, Optional[int], Optional[int], Optional[str], Optional[str]]]:
-    with _dao() as dao:
-        return dao.fetch_due(limit=limit, exclude_batch_prefixes=exclude_batch_prefixes)
+) -> List[LinkQueueItem]:
+    with session_scope() as db:
+        return lq.fetch_due(db, limit=limit, exclude_batch_prefixes=exclude_batch_prefixes)
 
 
-def fetch_batch_due(batch_id: str, limit: int = 50) -> List[Tuple[int, str, int, Optional[int], Optional[int], Optional[str], Optional[str]]]:
-    with _dao() as dao:
-        return dao.fetch_batch_due(batch_id, limit=limit)
+def fetch_batch_due(
+    batch_id: str, limit: int = 50
+) -> List[LinkQueueItem]:
+    with session_scope() as db:
+        return lq.fetch_batch_due(db, batch_id, limit=limit)
 
 
 def count_processing() -> int:
-    with _dao() as dao:
-        return dao.count_processing()
+    with session_scope() as db:
+        return lq.count_processing(db)
 
 
 def mark_processing(item_id: int):
-    with _dao() as dao:
-        return dao.mark_processing(item_id)
+    with session_scope() as db:
+        return lq.mark_processing(db, item_id)
 
 
 def mark_done(item_id: int):
-    with _dao() as dao:
-        return dao.mark_done(item_id)
+    with session_scope() as db:
+        return lq.mark_done(db, item_id)
 
 
 def mark_failed(item_id: int, error: str, backoff_sec: int, max_retries: int = 5):
-    with _dao() as dao:
-        return dao.mark_failed(item_id, error, backoff_sec, max_retries)
+    with session_scope() as db:
+        return lq.mark_failed(db, item_id, error, backoff_sec, max_retries)
 
 
 def delete_by_owner(
-    owner_display: Optional[str] = None,
+    owner_admin_id: Optional[int] = None,
     owner_username: Optional[str] = None,
     urls: Optional[list[str]] = None,
 ) -> int:
-    with _dao() as dao:
-        return dao.delete_by_owner(owner_display=owner_display, owner_username=owner_username, urls=urls)
+    with session_scope() as db_sess:
+        return lq.delete_by_owner(
+            db_sess,
+            owner_admin_id=owner_admin_id,
+            owner_username=owner_username,
+            urls=urls,
+        )

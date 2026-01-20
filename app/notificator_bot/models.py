@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from sqlalchemy import Column, Integer, String, Text, PrimaryKeyConstraint, Index, UniqueConstraint
 
-from app.admin_bot.db.session import Base, engine
+from app.db.session import Base, engine
 
 log = logging.getLogger("notificator.models")
 

@@ -21,3 +21,7 @@ class AdminParamsFlow(StatesGroup):
 
 class AdminResultsFlow(StatesGroup):
     waiting_group_subs = State()
+
+
+class DedupAdminChannelsFlow(StatesGroup):
+    browsing = State()

@@ -4,8 +4,8 @@ import time
 from contextlib import contextmanager
 from typing import Optional, Tuple
 
-from app.admin_bot.db.session import SessionLocal
-from app.admin_bot.db import models as m
+from app.db.session import SessionLocal
+from app.db import models as m
 
 _initialized = False
 

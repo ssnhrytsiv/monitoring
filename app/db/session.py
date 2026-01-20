@@ -1,10 +1,113 @@
-"""Unified DB session factory for the project.
+import logging
+from contextlib import contextmanager
+from typing import Iterator
 
-This module re-exports the single SQLAlchemy engine/session/Base that already
-lives in ``app.admin_bot.db.session`` so the rest of the codebase can import from a
-neutral ``app.db`` namespace and avoid multiple factories.
-"""
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
-from app.admin_bot.db.session import Base, SessionLocal, engine, get_session  # re-export
+from app.admin_bot.config import SQLALCHEMY_DATABASE_URL
 
-__all__ = ["Base", "SessionLocal", "engine", "get_session"]
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL,
+    future=True,
+)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+Base = declarative_base()
+
+log = logging.getLogger("db.session")
+
+
+def get_session():
+    """Короткий helper для отримання Session у сервісах/хендлерах."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@contextmanager
+def session_scope() -> Iterator[Session]:
+    """
+    Контекстний менеджер для коротких транзакцій.
+    """
+    session: Session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception as exc:  # pragma: no cover - логування
+        log.exception("[db.session] session rollback due to error: %s", exc)
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+@event.listens_for(engine, "connect")
+def _sqlite_pragmas(dbapi_conn, _):
+    """
+    Застосовує WAL та busy_timeout для SQLite (idempotent).
+    """
+    try:
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA busy_timeout=3000;")
+        cur.close()
+    except Exception as exc:  # pragma: no cover - логування
+        log.warning("[db.session] SQLite PRAGMA apply failed: %s", exc)
+
+
+def init_db() -> None:
+    """
+    Ідempotent create_all за ORM-моделями.
+    """
+    log.info("[db.session] Initializing ORM metadata… (create_all)")
+    Base.metadata.create_all(bind=engine)
+    log.info("[db.session] ORM metadata init done")
+
+
+def migrate_admins_nullable() -> None:
+    """
+    Локальна міграція для admins: tg_id робимо nullable.
+    SQLite не змінює схему автоматично, тож перебудовуємо таблицю, якщо треба.
+    """
+    with engine.begin() as conn:
+        info = list(conn.exec_driver_sql("PRAGMA table_info('admins')"))
+        if not info:
+            return
+        # columns: cid, name, type, notnull, dflt_value, pk
+        tg_col = next((c for c in info if c[1] == "tg_id"), None)
+        if tg_col is None:
+            return
+        notnull = tg_col[3]
+        if notnull == 0:
+            return  # already nullable
+
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE IF NOT EXISTS admins_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tg_id BIGINT UNIQUE,
+                username VARCHAR,
+                display VARCHAR
+            );
+            """
+        )
+        conn.exec_driver_sql(
+            "INSERT OR IGNORE INTO admins_new (id, tg_id, username, display) "
+            "SELECT id, tg_id, username, display FROM admins;"
+        )
+        conn.exec_driver_sql("DROP TABLE admins;")
+        conn.exec_driver_sql("ALTER TABLE admins_new RENAME TO admins;")
+
+
+__all__ = [
+    "Base",
+    "SessionLocal",
+    "engine",
+    "get_session",
+    "session_scope",
+    "init_db",
+    "migrate_admins_nullable",
+]

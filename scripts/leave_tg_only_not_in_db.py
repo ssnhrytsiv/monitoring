@@ -16,7 +16,7 @@ import asyncio
 import glob
 import os
 import sqlite3
-from typing import Dict, List, Set, Tuple
+from typing import List, Set, Tuple
 
 from telethon import TelegramClient
 from telethon.tl.functions.channels import LeaveChannelRequest

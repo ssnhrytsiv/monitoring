@@ -91,11 +91,11 @@ def _update_channel(
     if invite_hash:
         cur.execute(
             """
-            INSERT INTO invite_map (invite_hash, channel_id, title, updated_at)
+            INSERT INTO invite_cache (invite_hash, channel_id, title, updated_at)
             VALUES (?, ?, COALESCE(?, title), strftime('%s','now'))
             ON CONFLICT(invite_hash) DO UPDATE SET
                 channel_id=excluded.channel_id,
-                title=COALESCE(excluded.title, invite_map.title),
+                title=COALESCE(excluded.title, invite_cache.title),
                 updated_at=excluded.updated_at
             """,
             (invite_hash, channel_id, title),

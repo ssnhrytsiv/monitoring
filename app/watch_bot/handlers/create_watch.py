@@ -1,25 +1,35 @@
 from typing import Optional, List, Any, Callable
-import os
 import re
 import logging
 import json
-import math
 import html
 
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
 
 from app.watch_bot.states import CreateWatch
-from app.DAL import SessionLocal
+from app.DAL import session_scope
 from app.DAL import sheet_projects_operations as spo
 from app.DAL import post_templates_operations as post_watch_db
 from app.DAL import watch_posts_operations as watch_posts_db
 from app.DAL import watch_events_operations as watch_events_db
 from app.sheet_bot.services import gsheets_writer as gsw
-from app.sheet_bot.services import gsheets_buffer as gsb
-from app.watch_bot.keyboards import main_menu_kb, back_to_menu_kb, yes_no_kb
+from app.watch_bot.keyboards import (
+    main_menu_kb,
+    back_to_menu_kb,
+    yes_no_kb,
+)
+from app.watch_bot.keyboards_watch import (
+    admins_keyboard,
+    networks_keyboard,
+    project_keyboard,
+    sheet_mgmt_keyboard,
+    sheet_archive_projects_keyboard,
+    sheet_archive_list_keyboard,
+    sheet_archive_empty_keyboard,
+)
 from app.services.time_utils import msk_now
 from app.watch_bot.services.channels_repo import (
     resolve_cid_by_target,
@@ -31,30 +41,17 @@ from app.utils.link_parser import sanitize_link
 from app.admin_bot.services import admins as svc_admins
 from app.admin_bot.services import networks as svc_networks
 from app.admin_bot.services.networks import channel_hyperlink
-from app.admin_bot.db.session import SessionLocal as AdminSession
-from app.admin_bot.db import models as adm_models
+from app.db.session import SessionLocal as AdminSession
+from app.DAL import network_channels_operations as net_db
 
 router = Router()
 log = logging.getLogger("bot_create_watch")
 
 _LINK_RE = re.compile(r'(?i)\b((?:https?://|tg://|t\.me/)[^\s<>"\'\]\)]+)')
-_ADMINS_PER_ROW = 2
-_ADMINS_PER_PAGE = 36
-
 
 def _try_int(s: str) -> Optional[int]:
     try:
         return int(str(s).strip())
-    except Exception:
-        return None
-
-
-def _control_chat_id() -> Optional[int]:
-    raw = os.getenv("CONTROL_CHAT") or os.getenv("CONTROL_PEER")
-    if not raw:
-        return None
-    try:
-        return int(str(raw).strip())
     except Exception:
         return None
 
@@ -67,84 +64,47 @@ def _admin_session():
         db.close()
 
 
+def _list_admins():
+    db = next(_admin_session())
+    try:
+        return svc_admins.list_admins(db)
+    finally:
+        db.close()
+
+
+def _list_networks(admin_id: int):
+    db = next(_admin_session())
+    try:
+        return svc_networks.list_networks_by_admin(db, admin_id)
+    finally:
+        db.close()
+
+
 def _load_template(template_id: int) -> Optional[dict]:
     """
     Завантажує шаблон із SQLite (post_template) і повертає словник із HTML та links_json.
     """
     try:
-        tpl = post_watch_db.get_template_by_id(int(template_id))
+        with session_scope() as db:
+            tpl = post_watch_db.get_template_by_id_db(db, int(template_id))
         if not tpl:
             return None
-        _, tpl_html, tpl_mode, tpl_thr, created_at, tpl_title, tpl_links_json = tpl
         return {
-            "html": tpl_html,
-            "links_json": tpl_links_json,
-            "mode": tpl_mode,
-            "threshold": tpl_thr,
-            "title": tpl_title,
-            "created_at": created_at,
+            "html": tpl.text,
+            "links_json": tpl.links,
+            "mode": tpl.mode,
+            "threshold": tpl.threshold,
+            "title": tpl.title,
+            "created_at": tpl.created_at,
         }
     except Exception:
         log.warning("watch_net: failed to load template id=%s", template_id, exc_info=True)
         return None
 
 
-def _admins_kb(page: int = 0):
-    db = next(_admin_session())
-    admins = svc_admins.list_admins(db)
-    admins = sorted(admins, key=lambda a: (a.display or a.username or f"{a.id}"))
-    total_pages = max(1, math.ceil(len(admins) / _ADMINS_PER_PAGE))
-    page = max(0, min(page, total_pages - 1))
-    start = page * _ADMINS_PER_PAGE
-    end = start + _ADMINS_PER_PAGE
-    admins_page = admins[start:end]
-    rows = []
-    row = []
-    for a in admins_page:
-        label = a.display or a.username or f"id={a.id}"
-        row.append(InlineKeyboardButton(text=label, callback_data=f"watchnet:admin:{a.id}"))
-        if len(row) == _ADMINS_PER_ROW:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    nav = []
-    if total_pages > 1:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"watchnet:page:{(page-1)%total_pages}"))
-        nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"watchnet:page:{(page+1)%total_pages}"))
-        rows.append(nav)
-    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def _networks_kb(admin_id: int):
-    db = next(_admin_session())
-    nets = svc_networks.list_networks_by_admin(db, admin_id)
-    nets = sorted(nets, key=lambda n: (n.name or ""))
-    rows = []
-    row = []
-    for n in nets:
-        row.append(InlineKeyboardButton(text=n.name, callback_data=f"watchnet:net:{admin_id}:{n.id}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([InlineKeyboardButton(text="⬅️ Адміни", callback_data="menu:add_watch_net")])
-    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
 def _targets_from_network(net_id: int) -> List[str]:
     db = next(_admin_session())
-    rows = (
-        db.query(adm_models.Channel)
-        .join(adm_models.NetworkChannel, adm_models.NetworkChannel.channel_id == adm_models.Channel.channel_id)
-        .filter(adm_models.NetworkChannel.network_id == net_id)
-        .order_by(adm_models.Channel.title)
-        .all()
-    )
+    rows = net_db.list_channels_in_network(db, net_id)
     targets: List[str] = []
     seen = set()
     for ch in rows:
@@ -160,13 +120,7 @@ def _targets_from_network(net_id: int) -> List[str]:
 
 def _network_channels_preview(net_id: int) -> tuple[list[str], list[str]]:
     db = next(_admin_session())
-    rows = (
-        db.query(adm_models.Channel)
-        .join(adm_models.NetworkChannel, adm_models.NetworkChannel.channel_id == adm_models.Channel.channel_id)
-        .filter(adm_models.NetworkChannel.network_id == net_id)
-        .order_by(adm_models.Channel.title)
-        .all()
-    )
+    rows = net_db.list_channels_in_network(db, net_id)
     seen = set()
     targets: List[str] = []
     lines: List[str] = []
@@ -181,18 +135,6 @@ def _network_channels_preview(net_id: int) -> tuple[list[str], list[str]]:
         targets.append(target)
         lines.append(f"• {channel_hyperlink(db, ch)}")
     return targets, lines
-
-
-def _project_kb(prefix: str):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="ALI", callback_data=f"{prefix}:ALI"),
-                InlineKeyboardButton(text="PATRON", callback_data=f"{prefix}:PATRON"),
-                InlineKeyboardButton(text="EXPRESS", callback_data=f"{prefix}:EXPRESS"),
-            ]
-        ]
-    )
 
 
 def _extract_urls(text: str) -> List[str]:
@@ -386,12 +328,17 @@ def _extract_targets_from_message(msg: Message) -> List[str]:
 
 
 async def _create_template_from_source(src: Message) -> Optional[int]:
-    html_text = (
-        getattr(src, "html_text", None)
-        or getattr(src, "text_html", None)
-        or getattr(src, "html_caption", None)
-        or getattr(src, "caption_html", None)
-    )
+    # Канонічний HTML: будуємо самі з тексту + entities, щоб він збігався з Telethon-рендером.
+    try:
+        from app.services.html_render import render_html
+        html_text = render_html(src)
+    except Exception:
+        html_text = (
+            getattr(src, "html_text", None)
+            or getattr(src, "text_html", None)
+            or getattr(src, "html_caption", None)
+            or getattr(src, "caption_html", None)
+        )
     plain_text = (getattr(src, "text", None) or getattr(src, "caption", None) or "").strip()
     text_for_template = (html_text or plain_text or "").strip()
 
@@ -456,23 +403,6 @@ async def _create_template_from_source(src: Message) -> Optional[int]:
     return None
 
 
-async def _send_watch_from_links_batch_bot(bot, targets: List[str], mins: int, template_id: int, project: Optional[str]) -> bool:
-    try:
-        control_id = _control_chat_id()
-        if not control_id:
-            return False
-        header = f"/watch_from_links {int(template_id)} --window-min {int(mins)}"
-        if project:
-            header += f" --project {project}"
-        body = "\n".join(targets)
-        cmd = header + "\n" + body if body else header
-        await bot.send_message(control_id, cmd)
-        return True
-    except Exception as e:
-        log.exception(f"send_batch_bot failed: {e}")
-        return False
-
-
 @router.message(F.text == "/start")
 async def start_cmd(m: Message, state: FSMContext):
     await state.clear()
@@ -491,20 +421,13 @@ async def menu_home(cb: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "menu:sheet_mgmt")
 async def menu_sheet_mgmt(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🆕 Створити таблицю для цього місяця", callback_data="sheet:create")],
-            [InlineKeyboardButton(text="📂 Архівні таблиці", callback_data="sheet:archive")],
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")],
-        ]
-    )
-    await cb.message.edit_text("Управління таблицями:", reply_markup=kb)
+    await cb.message.edit_text("Управління таблицями:", reply_markup=sheet_mgmt_keyboard())
 
 
 @router.callback_query(F.data == "sheet:create")
 async def sheet_create_pick(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await cb.message.edit_text("Обери проєкт для створення таблиці цього місяця:", reply_markup=_project_kb("sheet:create_proj"))
+    await cb.message.edit_text("Обери проєкт для створення таблиці цього місяця:", reply_markup=project_keyboard("sheet:create_proj"))
 
 
 def _sheet_title(project: str) -> str:
@@ -532,9 +455,8 @@ async def sheet_create_project(cb: CallbackQuery, state: FSMContext):
     proj = cb.data.split("sheet:create_proj:", 1)[1]
     title = _sheet_title(proj)
     # Якщо вже є активна таблиця з цим самим місяцем/назвою — просто показуємо її
-    db = SessionLocal()
-    try:
-        existing = None
+    existing = None
+    with session_scope() as db:
         rec = spo.get_active_sheet(db, proj)
         if rec:
             existing = {
@@ -543,14 +465,12 @@ async def sheet_create_project(cb: CallbackQuery, state: FSMContext):
                 "title": rec.active_title,
                 "updated_at": rec.updated_at,
             }
-    finally:
-        db.close()
     if existing and (existing.get("title") == title):
         ssid = existing.get("spreadsheet_id")
         url = f"https://docs.google.com/spreadsheets/d/{ssid}"
         await cb.message.edit_text(
             f"Для {proj} вже є активна таблиця цього місяця:\n{title}\n{url}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")]]),
+            reply_markup=back_to_menu_kb(),
             disable_web_page_preview=True,
         )
         return
@@ -560,98 +480,49 @@ async def sheet_create_project(cb: CallbackQuery, state: FSMContext):
         if not res or not res.get("spreadsheet_id"):
             raise RuntimeError("create_spreadsheet returned no id")
         ssid = res["spreadsheet_id"]
-        db = SessionLocal()
-        try:
+        with session_scope() as db:
             spo.set_active_sheet(db, proj, ssid, title)
-        finally:
-            db.close()
         url = f"https://docs.google.com/spreadsheets/d/{ssid}"
         await cb.message.edit_text(
             f"Таблиця створена і встановлена як активна для {proj}:\n{title}\n{url}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")]]),
+            reply_markup=back_to_menu_kb(),
         )
     except Exception as e:
         log.exception("sheet create failed: %s", e)
         await cb.message.edit_text(
             f"Не вдалося створити таблицю: {e}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")]]),
+            reply_markup=back_to_menu_kb(),
         )
 
 
 @router.callback_query(F.data == "sheet:archive")
 async def sheet_archive(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    db = SessionLocal()
-    try:
+    with session_scope() as db:
         projects = sorted(set(spo.list_projects(db) or []))
-    finally:
-        db.close()
     if not projects:
         await cb.message.edit_text(
             "Архів порожній.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")]]),
+            reply_markup=back_to_menu_kb(),
         )
         return
-    row = [InlineKeyboardButton(text=p, callback_data=f"sheet:archive_proj:{p}") for p in projects]
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            row,
-            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")],
-        ]
-    )
-    await cb.message.edit_text("Оберіть проєкт для перегляду архіву:", reply_markup=kb)
+    await cb.message.edit_text("Оберіть проєкт для перегляду архіву:", reply_markup=sheet_archive_projects_keyboard(projects))
 
 
 @router.callback_query(F.data.startswith("sheet:archive_proj:"))
 async def sheet_archive_project(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     proj = cb.data.split("sheet:archive_proj:", 1)[1]
-    db = SessionLocal()
-    try:
+    with session_scope() as db:
         rows = spo.list_archives(db, project=proj)
-    finally:
-        db.close()
     if not rows:
         txt = f"Архів порожній для проєкту {proj}."
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ До проєктів", callback_data="sheet:archive")],
-                [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")],
-            ]
-        )
-        await cb.message.edit_text(txt, reply_markup=kb, disable_web_page_preview=True)
+        await cb.message.edit_text(txt, reply_markup=sheet_archive_empty_keyboard(), disable_web_page_preview=True)
         return
 
-    # Сортуємо за датою архівації (новіші зверху), далі за назвою
-    rows_sorted = sorted(
-        rows,
-        key=lambda r: (r.get("archived_at") or "", r.get("title") or ""),
-        reverse=True,
-    )
-
-    def _btn_label(title: str) -> str:
-        parts = title.strip().split()
-        if len(parts) >= 2:
-            # беремо останні два слова як "місяць рік"
-            return " ".join(parts[-2:])
-        return title[:32]
-
-    buttons = []
-    for r in rows_sorted[:30]:  # максимум 15 рядків по 2 кнопки
-        title = r.get("title") or ""
-        url = f"https://docs.google.com/spreadsheets/d/{r.get('spreadsheet_id')}"
-        buttons.append(InlineKeyboardButton(text=_btn_label(title), url=url))
-
-    kb_rows = []
-    for i in range(0, len(buttons), 2):
-        kb_rows.append(buttons[i:i + 2])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ До проєктів", callback_data="sheet:archive")])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")])
-
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await cb.message.edit_text(
         f"Архівні таблиці для {proj}:\n(кнопки відкривають таблицю)",
-        reply_markup=kb,
+        reply_markup=sheet_archive_list_keyboard(proj, rows),
         disable_web_page_preview=True,
     )
 
@@ -669,9 +540,10 @@ async def menu_add_watch(cb: CallbackQuery, state: FSMContext):
 async def menu_add_watch_net(cb: CallbackQuery, state: FSMContext):
     await state.set_state(CreateWatch.admin_pick)
     log.info("watch_net: start admin pick")
+    admins = _list_admins()
     await cb.message.edit_text(
         "Оберіть адміна для вотчу:",
-        reply_markup=_admins_kb(),
+        reply_markup=admins_keyboard(admins),
         disable_web_page_preview=True,
     )
 
@@ -686,9 +558,10 @@ async def pick_admin_for_watch(cb: CallbackQuery, state: FSMContext):
     log.info("watch_net: admin picked id=%s by user=%s", admin_id, cb.from_user.id if cb.from_user else None)
     await state.update_data(admin_id=admin_id)
     await state.set_state(CreateWatch.network_pick)
+    networks = _list_networks(admin_id)
     await cb.message.edit_text(
         "Оберіть сітку:",
-        reply_markup=_networks_kb(admin_id),
+        reply_markup=networks_keyboard(admin_id, networks),
         disable_web_page_preview=True,
     )
     await cb.answer()
@@ -700,9 +573,10 @@ async def paginate_admins(cb: CallbackQuery):
     except Exception:
         await cb.answer()
         return
+    admins = _list_admins()
     await cb.message.edit_text(
         "Оберіть адміна для вотчу:",
-        reply_markup=_admins_kb(page),
+        reply_markup=admins_keyboard(admins, page),
         disable_web_page_preview=True,
     )
     log.info("watch_net: admin page=%s", page)
@@ -844,18 +718,9 @@ async def step_time_window(m: Message, state: FSMContext):
         f"до: {tw_end}\n"
     )
     await state.set_state(CreateWatch.project_pick)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="ALI", callback_data="watch_proj:ALI"),
-                InlineKeyboardButton(text="PATRON", callback_data="watch_proj:PATRON"),
-                InlineKeyboardButton(text="EXPRESS", callback_data="watch_proj:EXPRESS"),
-            ]
-        ]
-    )
     await m.answer(
         txt + "\nОбери проєкт:",
-        reply_markup=kb,
+        reply_markup=project_keyboard("watch_proj"),
         parse_mode="HTML"
     )
 
@@ -930,7 +795,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
     failed: List[str] = []
     failed_reasons: List[tuple[str, str]] = []
 
-    # Підготуємо нормалізовані посилання для control chat і fallback
+    # Підготуємо нормалізовані посилання для fallback
     cids: List[int] = []
     for t in targets:
         cid = resolve_cid_by_target(t)
@@ -950,131 +815,116 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
         targets_links, targets, links_map,
     )
 
-    # Потік через CONTROL_CHAT більше не використовується — створюємо вотчі одразу локально.
-    control_id = None
-    sent_ok = False
-    if control_id and tid:
-        control_targets = targets_links if targets_links else targets
-        log.info("watch_net: sending to control chat=%s targets=%s", control_id, control_targets)
-        sent_ok = await _send_watch_from_links_batch_bot(cb.bot, control_targets, mins, int(tid), project)
-        if sent_ok:
-            created.extend(control_targets)
+    tpl_html = None
+    tpl_links_json = None
+    tpl_plain_len = None
+    if tid:
+        tpl_meta = _load_template(int(tid))
+        if not tpl_meta:
+            log.warning("watch_net: template not found id=%s", tid)
+            await cb.message.edit_text(f"Не знайшов шаблон #{tid}. Спробуй надіслати інший шаблон або ID.", reply_markup=main_menu_kb())
+            await state.clear()
+            return
+        tpl_html = tpl_meta.get("html")
+        tpl_links_json = tpl_meta.get("links_json")
+        if not tpl_html:
+            log.warning("watch_net: template id=%s has empty html", tid)
         else:
-            failed.extend(control_targets)
+            try:
+                # Використовуємо той самий нормалізатор, що й у слухачі
+                from app.utils.html_normalize import normalize_html_full, strip_tags_to_text
+                tpl_html_norm = normalize_html_full(tpl_html)
+                tpl_plain = strip_tags_to_text(tpl_html_norm)
+                tpl_html = tpl_html_norm
+                tpl_plain_len = len(tpl_plain or "")
+            except Exception:
+                log.exception("watch_net: tpl normalization failed (tid=%s)", tid)
+                tpl_plain_len = len(tpl_html or "")
 
-    if (not control_id) or (control_id and not sent_ok):
-        tpl_html = None
-        tpl_links_json = None
-        if tid:
-            tpl_meta = _load_template(int(tid))
-            if not tpl_meta:
-                log.warning("watch_net: template not found id=%s", tid)
-                await cb.message.edit_text(f"Не знайшов шаблон #{tid}. Спробуй надіслати інший шаблон або ID.", reply_markup=main_menu_kb())
-                await state.clear()
-                return
-            tpl_html = tpl_meta.get("html")
-            tpl_links_json = tpl_meta.get("links_json")
-            if not tpl_html:
-                log.warning("watch_net: template id=%s has empty html", tid)
-            else:
-                try:
-                    # Використовуємо той самий нормалізатор, що й у слухачі
-                    from app.plugins.posts_watch_listener import _normalize_html_full, _strip_tags_to_text  # type: ignore
-                    tpl_html_norm = _normalize_html_full(tpl_html)
-                    tpl_plain = _strip_tags_to_text(tpl_html_norm)
-                    tpl_html = tpl_html_norm
-                    tpl_plain_len = len(tpl_plain or "")
-                except Exception:
-                    log.exception("watch_net: tpl normalization failed (tid=%s)", tid)
-                    tpl_plain_len = len(tpl_html or "")
+    group_id = None
+    try:
+        group_id = watch_posts_db.create_watch_group(
+            project=project,
+            title=None,
+            created_by=cb.from_user.id if cb.from_user else None,
+            created_via="bot_fallback",
+            admin_id=admin_id,
+            network_id=net_id,
+        )
+    except Exception:
+        log.warning("create_watch_group (fallback) failed", exc_info=True)
 
-        group_id = None
+    for t in targets:
+        cid = resolve_cid_by_target(t)
+        if not cid or not tid:
+            failed.append(t)
+            failed_reasons.append((t, "Не вдалося визначити channel_id або відсутній шаблон"))
+            continue
+        if not tpl_html:
+            failed.append(t)
+            failed_reasons.append((t, "Порожній HTML шаблону"))
+            continue
         try:
-            group_id = watch_posts_db.create_watch_group(
+            wid = watch_posts_db.create_watch(
+                channel_id=int(cid),
+                template_id=int(tid),
+                expected_text_hash=tpl_html,
+                expected_text_norm_len=tpl_plain_len if tpl_html else None,
+                expected_links_json=tpl_links_json,
+                expected_media_fingerprint=None,
+                time_window_start=data.get("time_window_start"),
+                time_window_end=data.get("time_window_end"),
+                source_url=links_map.get(int(cid)),
+                created_by=None,
                 project=project,
-                title=None,
-                created_by=cb.from_user.id if cb.from_user else None,
-                created_via="bot_fallback",
                 admin_id=admin_id,
                 network_id=net_id,
+                group_id=group_id,
             )
-        except Exception:
-            log.warning("create_watch_group (fallback) failed", exc_info=True)
-
-        for t in targets:
-            cid = resolve_cid_by_target(t)
-            if not cid or not tid:
-                failed.append(t)
-                failed_reasons.append((t, "Не вдалося визначити channel_id або відсутній шаблон"))
-                continue
-            if not tpl_html:
-                failed.append(t)
-                failed_reasons.append((t, "Порожній HTML шаблону"))
-                continue
+            log.info(
+                "watch_net: created watch wid=%s cid=%s admin=%s net=%s project=%s links=%s",
+                wid,
+                cid,
+                admin_id,
+                net_id,
+                project,
+                links_map.get(int(cid)),
+            )
             try:
-                wid = watch_posts_db.create_watch(
-                    channel_id=int(cid),
-                    template_id=int(tid),
-                    expected_text_hash=tpl_html,
-                    expected_text_norm_len=tpl_plain_len if tpl_html else None,
-                    expected_links_json=tpl_links_json,
-                    expected_media_fingerprint=None,
-                    time_window_start=data.get("time_window_start"),
-                    time_window_end=data.get("time_window_end"),
-                    source_url=links_map.get(int(cid)),
-                    created_by=None,
-                    project=project,
-                    admin_id=admin_id,
-                    network_id=net_id,
-                    group_id=group_id,
-                )
-                log.info(
-                    "watch_net: created watch wid=%s cid=%s admin=%s net=%s project=%s links=%s",
+                watch_events_db.insert_watch_event(
                     wid,
-                    cid,
-                    admin_id,
-                    net_id,
-                    project,
-                    links_map.get(int(cid)),
+                    "created",
+                    json.dumps({"via": "bot_fallback"}),
                 )
+            except Exception:
+                pass
+            if project:
                 try:
-                    watch_events_db.insert_watch_event(
-                        wid,
-                        "created",
-                        json.dumps({"via": "bot_fallback"}),
-                    )
+                    with session_scope() as db:
+                        sheet = spo.get_active_sheet(db, project)
+                    if sheet and getattr(sheet, "active_spreadsheet_id", None):
+                        log.info(
+                            "watch %s bound to project %s sheet=%s",
+                            wid,
+                            project,
+                            getattr(sheet, "active_spreadsheet_id", None),
+                        )
                 except Exception:
-                    pass
-                if project:
-                    try:
-                        db = SessionLocal()
-                        try:
-                            sheet = spo.get_active_sheet(db, project)
-                        finally:
-                            db.close()
-                        if sheet and getattr(sheet, "active_spreadsheet_id", None):
-                            log.info(
-                                "watch %s bound to project %s sheet=%s",
-                                wid,
-                                project,
-                                getattr(sheet, "active_spreadsheet_id", None),
-                            )
-                    except Exception:
-                        log.exception("bind watch to project failed")
-                created.append(
-                    (
-                        int(cid),
-                        links_map.get(int(cid)) or t,
-                        titles_map.get(int(cid)) or t,
-                        wid,
-                    )
+                    log.exception("bind watch to project failed")
+            created.append(
+                (
+                    int(cid),
+                    links_map.get(int(cid)) or t,
+                    titles_map.get(int(cid)) or t,
+                    wid,
                 )
-            except TypeError as e:
-                failed.append(t)
-                failed_reasons.append((t, f"TypeError: {e}"))
-            except Exception as e:
-                failed.append(t)
-                failed_reasons.append((t, f"{e.__class__.__name__}: {e}"))
+            )
+        except TypeError as e:
+            failed.append(t)
+            failed_reasons.append((t, f"TypeError: {e}"))
+        except Exception as e:
+            failed.append(t)
+            failed_reasons.append((t, f"{e.__class__.__name__}: {e}"))
 
     await state.clear()
 

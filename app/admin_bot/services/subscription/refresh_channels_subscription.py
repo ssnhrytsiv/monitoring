@@ -2,30 +2,226 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import List, Optional, Set, Dict
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Set, Tuple
 from types import SimpleNamespace
-
-from sqlalchemy import select, delete
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from app.admin_bot.db.session import SessionLocal
-from app.admin_bot.db import models as m
+from app.db.session import session_scope
+from app.db import models as m
 from app.admin_bot.services import report_cache
 from app.admin_bot.services.subscription import batch_cache
 from app.admin_bot.services import admins as svc_admins
 from app.admin_bot.services.subscription.subscription_report import answer_with_retry
-from app.admin_bot.services.subscription.subscription_menu import split_text_for_telegram, make_report_kb
+from app.admin_bot.services.subscription.subscription_menu import split_text_for_telegram
+from app.admin_bot.services.subscription.subscription_worker import process_batch
+from app.admin_bot.services.subscription.keyboards import (
+    make_report_keyboard,
+    build_confirm_unsubscribe_rows,
+    build_confirm_unsubscribe_keyboard,
+)
 from app.services import link_queue
 from app.services import account_pool
 from app.DAL import channels_operations as cho
-from app.DAL.membership_operations import MembershipDAO
+from app.DAL import membership_operations as mem_db
+from app.DAL import network_channels_operations as net_db
+from app.DAL.refresh_links_operation import (
+    BatchResultDTO,
+    RefreshPlanDTO,
+    build_batch_results,
+    build_refresh_plan,
+    invite_cache_status_get_bulk,
+    bulk_memberships_accounts,
+    bulk_any_session,
+    bulk_owner_conflict,
+    bulk_channel_title_owner,
+    bulk_admin_for_channels,
+    bulk_channel_link_meta,
+)
+from app.DAL.admins_operations import AdminSnapshot
 from app.utils.link_parser import sanitize_link
 from app.admin_bot.services.subscription.subscription_utils import norm_keys as collect_norm_keys
 
 log = logging.getLogger("admin_bot.services.subscription.refresh_channels")
 
 _PENDING_REFRESH_CONFIRMATIONS: Dict[str, Dict] = {}
+
+
+@dataclass(frozen=True)
+class RefreshContext:
+    batch_id: str
+    chat_id: int
+    reply_msg: Any
+    admin: AdminSnapshot
+    urls: List[str]
+    raw_text: str
+    raw_html: str
+    entities: List
+
+
+@dataclass(frozen=True)
+class RefreshPhaseData:
+    plan: RefreshPlanDTO
+    enriched_results: List[BatchResultDTO]
+    removed_link_map: Dict[int, Tuple[Optional[str], Optional[str]]]
+    removed_sessions: Dict[int, Set[str]]
+    no_cid_resolution: bool
+
+
+def _load_current_channel_ids(admin_id: int) -> Set[int]:
+    with session_scope() as db:
+        current_channel_ids = set(cho.list_admin_channel_ids(db, admin_id))
+        network_channel_ids = net_db.list_channel_ids_for_admin_networks(db, admin_id)
+        if network_channel_ids:
+            current_channel_ids |= set(network_channel_ids)
+    return current_channel_ids
+
+
+def _prepare_refresh_phase_data(
+    batch_id: str,
+    urls: List[str],
+    current_channel_ids: Set[int],
+    admin: AdminSnapshot,
+) -> RefreshPhaseData:
+    with session_scope() as db:
+        cache_entry = batch_cache.pop(batch_id) or {}
+        cached_items = cache_entry.get("items") or []
+        batch_results: List[BatchResultDTO] = build_batch_results(urls, cached_items)
+
+        url_keys: Set[str] = set()
+        for batch_result in batch_results:
+            for norm_key in collect_norm_keys(batch_result.clean_url) + collect_norm_keys(batch_result.original_url):
+                if norm_key:
+                    url_keys.add(norm_key)
+
+        channel_ids = [batch_result.channel_id for batch_result in batch_results if batch_result.channel_id is not None]
+        status_by_url = invite_cache_status_get_bulk(db, list(url_keys))
+        titles_map = bulk_channel_title_owner(db, channel_ids)
+        admin_map = bulk_admin_for_channels(db, channel_ids)
+        conflict_map = bulk_owner_conflict(db, channel_ids)
+        membership_accounts = bulk_memberships_accounts(db, channel_ids)
+        session_hint_map = bulk_any_session(db, channel_ids)
+
+        conflict_clear_channel_ids: Set[int] = set()
+        enriched_results: List[BatchResultDTO] = []
+        for batch_result in batch_results:
+            status_raw = (
+                batch_result.status_raw
+                or status_by_url.get(batch_result.clean_url)
+                or status_by_url.get(batch_result.original_url)
+            )
+            title = (
+                batch_result.title
+                or (titles_map.get(int(batch_result.channel_id)) if batch_result.channel_id is not None else None)
+            )
+            session_hint = (
+                batch_result.session_hint
+                or (session_hint_map.get(int(batch_result.channel_id)) if batch_result.channel_id is not None else None)
+            )
+
+            if batch_result.channel_id:
+                channel_id_int = int(batch_result.channel_id)
+                conflict_reason = conflict_map.get(channel_id_int)
+                assigned_admin_id = admin_map.get(channel_id_int)
+                conflict_clear = False
+
+                if conflict_reason:
+                    existing_owner = conflict_reason.strip()
+                    if existing_owner and existing_owner.lower() in ("unknown", "невідомий адмін"):
+                        existing_owner = None
+                    conflict_with = existing_owner
+                    if conflict_with and admin.id and assigned_admin_id == admin.id:
+                        conflict_clear = True
+                        conflict_with = None
+                    if conflict_with:
+                        status_raw = f"owner_conflict(existing={conflict_with})"
+                elif assigned_admin_id and admin.id and assigned_admin_id != admin.id:
+                    status_raw = f"owner_conflict(existing={assigned_admin_id})"
+
+                membership_accounts_for_channel = membership_accounts.get(channel_id_int) or set()
+                first_membership = next(iter(membership_accounts_for_channel), None)
+                if first_membership:
+                    if not session_hint:
+                        session_hint = str(first_membership)
+                    if not status_raw:
+                        status_raw = "already"
+                    elif "joined" in (status_raw or "").lower() and "already" not in (status_raw or "").lower():
+                        status_raw = "already"
+                if not session_hint:
+                    session_hint = session_hint_map.get(channel_id_int)
+
+                if conflict_clear:
+                    conflict_clear_channel_ids.add(channel_id_int)
+
+            enriched_results.append(
+                BatchResultDTO(
+                    original_url=batch_result.original_url,
+                    clean_url=batch_result.clean_url,
+                    channel_id=batch_result.channel_id,
+                    title=title,
+                    status_raw=status_raw,
+                    session_hint=session_hint,
+                )
+            )
+
+        if conflict_clear_channel_ids:
+            try:
+                mem_db.owner_conflict_delete_by_channels(db, list(conflict_clear_channel_ids))
+                db.commit()
+            except Exception:
+                db.rollback()
+
+        plan = build_refresh_plan(set(current_channel_ids), enriched_results)
+        planned_keep_ids = set(plan.keep_cids)
+        planned_to_remove = set(plan.to_remove)
+        planned_order = list(plan.to_remove_order)
+        no_cid_resolution = False
+        if not planned_keep_ids:
+            no_cid_resolution = True
+            planned_keep_ids = set(current_channel_ids)
+            planned_to_remove = set()
+            planned_order = []
+        if planned_to_remove and not planned_order:
+            planned_order = [cid for cid in current_channel_ids if cid in planned_to_remove]
+            for cid in planned_to_remove:
+                if cid not in planned_order:
+                    planned_order.append(cid)
+
+        final_plan = RefreshPlanDTO(
+            keep_cids=planned_keep_ids,
+            to_remove=planned_to_remove,
+            to_remove_order=planned_order,
+            items=list(enriched_results),
+        )
+
+        removed_link_map: Dict[int, Tuple[Optional[str], Optional[str]]] = {}
+        removed_sessions: Dict[int, Set[str]] = {}
+        if planned_to_remove:
+            ordered_remove = planned_order if planned_order else list(planned_to_remove)
+            meta_map = bulk_channel_link_meta(db, ordered_remove)
+            for channel_id, meta in meta_map.items():
+                if not meta:
+                    continue
+                title, href = meta
+                if href and href.startswith("http"):
+                    try:
+                        href = sanitize_link(href) or href
+                    except Exception:
+                        href = href
+                removed_link_map[int(channel_id)] = (title, href)
+            for channel_id in planned_to_remove:
+                session_set = membership_accounts.get(int(channel_id)) or set()
+                if session_set:
+                    removed_sessions[int(channel_id)] = set(session_set)
+
+        return RefreshPhaseData(
+            plan=final_plan,
+            enriched_results=enriched_results,
+            removed_link_map=removed_link_map,
+            removed_sessions=removed_sessions,
+            no_cid_resolution=no_cid_resolution,
+        )
 
 
 def _empty_cleanup_stats() -> Dict[str, int]:
@@ -36,8 +232,6 @@ def _empty_cleanup_stats() -> Dict[str, int]:
         "network_channels_deleted": 0,
         "membership_deleted": 0,
         "membership_status_deleted": 0,
-        "invite_map_deleted": 0,
-        "invite_status_deleted": 0,
         "owner_conflicts_deleted": 0,
         "links_deleted": 0,
         "url_cache_deleted": 0,
@@ -48,7 +242,7 @@ def _empty_cleanup_stats() -> Dict[str, int]:
 
 def _resolve_channel_id(url: str) -> Optional[int]:
     """
-    Визначає channel_id за URL/інвайтом, використовуючи кеш links/invite_map.
+    Визначає channel_id за URL/інвайтом, використовуючи кеш links/invite_cache.
     """
     if not url:
         return None
@@ -57,27 +251,25 @@ def _resolve_channel_id(url: str) -> Optional[int]:
     except Exception:
         clean = url
 
-    db = SessionLocal()
-    dao = MembershipDAO(db)
-    try:
-        for candidate in (url, clean):
-            if not candidate:
-                continue
+    for candidate in (url, clean):
+        if not candidate:
+            continue
+        with session_scope() as db:
             row = cho.find_channel_by_link(db, candidate)
-            if row and row[0]:
-                return row[0]
+            if row and row.channel_id:
+                return row.channel_id
             cid = cho.get_channel_id_by_url(db, candidate)
             if cid:
                 return cid
-            cid_map, _ = dao.map_invite_get(candidate)
-            if cid_map:
-                return cid_map
-        return None
-    finally:
-        db.close()
+            cid_map_title = mem_db.map_invite_get(db, candidate)
+            if cid_map_title:
+                cid_map, _title = cid_map_title
+                if cid_map:
+                    return cid_map
+    return None
 
 
-async def _cleanup_removed_channels(admin: m.Admin, chan_ids: Set[int]) -> Dict[str, int]:
+async def _cleanup_removed_channels(admin: AdminSnapshot, chan_ids: Set[int]) -> Dict[str, int]:
     """
     Відписує сесії від каналів та чистить пов’язані таблиці для каналів, які більше не потрібні цьому адміна.
     """
@@ -85,86 +277,79 @@ async def _cleanup_removed_channels(admin: m.Admin, chan_ids: Set[int]) -> Dict[
     if not chan_ids:
         return stats
 
-    db = SessionLocal()
-
-    # Відписуємо клієнтів
-    memberships = db.execute(
-        select(m.Membership).where(m.Membership.channel_id.in_(chan_ids), m.Membership.account != "")
-    ).scalars().all()
+    # Phase 1: gather data (DB-only)
     acct_map: Dict[str, Set[int]] = {}
-    for mbr in memberships:
-        acct_map.setdefault(mbr.account, set()).add(mbr.channel_id)
+    net_ids: List[int] = []
+    delete_ids: List[int] = []
+    urls_for_cleanup: List[str] = []
+    pre_count = 0
+    with session_scope() as db:
+        memberships = mem_db.list_memberships_for_channels(db, list(chan_ids))
+        for mbr in memberships:
+            acct_map.setdefault(mbr.account, set()).add(mbr.channel_id)
+
+        stats["admin_channels_deleted"] = cho.delete_admin_channels(db, admin.id, list(chan_ids))
+        net_ids = net_db.list_network_ids_for_admin(db, admin.id)
+        if net_ids:
+            stats["network_channels_deleted"] = net_db.delete_network_channels_by_networks(
+                db, net_ids, list(chan_ids)
+            )
+        db.commit()
+
+        keep_ids = set(cho.list_all_admin_channel_ids(db)) | set(net_db.list_channel_ids_for_admin_networks(db, admin.id))
+        delete_ids = [cid for cid in chan_ids if cid not in keep_ids]
+
+        if delete_ids:
+            raw_urls = cho.raw_urls_for_channels(db, delete_ids)
+            for u in raw_urls:
+                urls_for_cleanup.extend(svc_admins._expand_url_variants(u))  # type: ignore[attr-defined]
+            pre_count = svc_admins._count_url_cache(urls_for_cleanup, db) if urls_for_cleanup else 0  # type: ignore[attr-defined]
+
+    # Phase 2: async-only (leave channels)
     for acct, cids in acct_map.items():
         stat = await account_pool.leave_channels(acct, list(cids))
         stats["left_total"] += stat.get("left", 0) or 0
         stats["leave_errors"] += stat.get("errors", 0) or 0
 
-    # Видаляємо прив’язки адміна та його сіток
-    stats["admin_channels_deleted"] = db.execute(
-        delete(m.AdminChannel)
-        .where(m.AdminChannel.admin_id == admin.id, m.AdminChannel.channel_id.in_(chan_ids))
-    ).rowcount or 0
-    net_ids = list(db.execute(select(m.Network.id).where(m.Network.admin_id == admin.id)).scalars().all())
-    if net_ids:
-        stats["network_channels_deleted"] = db.execute(
-            delete(m.NetworkChannel).where(
-                m.NetworkChannel.network_id.in_(net_ids),
-                m.NetworkChannel.channel_id.in_(chan_ids),
-            )
-        ).rowcount or 0
-    db.commit()
-
-    # Перевіряємо, які канали ніде більше не використовуються
-    keep_ids = set(db.execute(select(m.AdminChannel.channel_id)).scalars().all()) | set(
-        db.execute(select(m.NetworkChannel.channel_id)).scalars().all()
-    )
-    delete_ids = [cid for cid in chan_ids if cid not in keep_ids]
-
-    urls_for_cleanup: List[str] = []
-    if delete_ids:
-        for r in db.execute(select(m.Link.raw_url).where(m.Link.channel_id.in_(delete_ids))).all():
-            if r and r[0]:
-                urls_for_cleanup.extend(svc_admins._expand_url_variants(r[0]))  # type: ignore[attr-defined]
-        pre_count = svc_admins._count_url_cache(urls_for_cleanup, db) if urls_for_cleanup else 0  # type: ignore[attr-defined]
-
-        stats["membership_deleted"] = m.delete_memberships_by_channels(db, delete_ids)
-        stats["membership_status_deleted"] = m.delete_membership_status_by_channels(db, delete_ids)
-        hashes = [h for h in db.execute(select(m.InviteMap.invite_hash).where(m.InviteMap.channel_id.in_(delete_ids))).scalars().all()]
-        stats["invite_status_deleted"] = m.delete_invite_status_by_hashes(db, hashes)
-        stats["invite_map_deleted"] = m.delete_invite_map_by_channels(db, delete_ids)
-        stats["owner_conflicts_deleted"] = m.delete_owner_conflict_by_channels(db, delete_ids)
-        stats["links_deleted"] = m.delete_links_by_channels(db, delete_ids)
-
-        try:
-            stats["url_cache_deleted"] = svc_admins._delete_url_cache_db(db, urls_for_cleanup, ["already", "joined"])  # type: ignore[attr-defined]
-        except Exception:
-            stats["url_cache_deleted"] = 0
-        if pre_count > 0 and stats["url_cache_deleted"] == 0:
+    # Phase 3: apply deletes/cleanup (DB-only)
+    with session_scope() as db:
+        if delete_ids:
+            stats["membership_deleted"] = m.delete_memberships_by_channels(db, delete_ids)
+            stats["membership_status_deleted"] = m.delete_membership_status_by_channels(db, delete_ids)
+            stats["owner_conflicts_deleted"] = m.delete_owner_conflict_by_channels(db, delete_ids)
+            stats["links_deleted"] = m.delete_links_by_channels(db, delete_ids)
             try:
-                stats["url_cache_deleted"] = svc_admins._delete_url_cache_db(db, urls_for_cleanup, None)  # type: ignore[attr-defined]
+                stats["invite_cache_deleted"] = mem_db.invite_cache_delete_by_channels(db, delete_ids)
             except Exception:
-                pass
+                stats["invite_cache_deleted"] = 0
 
-        stats["channels_deleted"] = m.delete_channels_by_ids(db, delete_ids)
+            try:
+                stats["url_cache_deleted"] = svc_admins._delete_url_cache_db(db, urls_for_cleanup, ["already", "joined"])  # type: ignore[attr-defined]
+            except Exception:
+                stats["url_cache_deleted"] = 0
+            if pre_count > 0 and stats["url_cache_deleted"] == 0:
+                try:
+                    stats["url_cache_deleted"] = svc_admins._delete_url_cache_db(db, urls_for_cleanup, None)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            stats["channels_deleted"] = m.delete_channels_by_ids(db, delete_ids)
+        db.commit()
 
-    # Чистимо чергу по власнику та URL
+    # Phase 4: cleanup link_queue (separate sqlite access)
     try:
         stats["link_queue_deleted"] = link_queue.delete_by_owner(
-            owner_display=admin.display,
+            owner_admin_id=admin.id,
             owner_username=admin.username,
-            urls=urls_for_cleanup,
+            urls=list(set(urls_for_cleanup)) if urls_for_cleanup else None,
         )
     except Exception:
         stats["link_queue_deleted"] = 0
-
-    db.commit()
-    db.close()
     return stats
 
 
 def _format_removed_lines(
     *,
-    to_remove: Set[int],
+    to_remove: List[int],
     removed_link_map: Dict[int, tuple[Optional[str], Optional[str]]],
     removed_sessions: Dict[int, Set[str]],
     action_text: str,
@@ -174,8 +359,8 @@ def _format_removed_lines(
     for cid in to_remove:
         title, href = removed_link_map.get(cid, (None, None))
         if not title and db is not None:
-            ch = db.execute(select(m.Channel).where(m.Channel.id == cid)).scalar_one_or_none()
-            title = getattr(ch, "title", None)
+            info = cho.get_channel_title_and_owner(db, cid)
+            title = info.title if info else None
         title_txt = title or f"channel_id={cid}"
         sess_txt = ""
         sess_set = removed_sessions.get(cid) or set()
@@ -190,10 +375,11 @@ def _format_removed_lines(
 
 async def _send_refresh_report(
     *,
-    admin: m.Admin,
+    admin: AdminSnapshot,
     reply_msg,
     status_lines: List[str],
     to_remove: Set[int],
+    to_remove_order: Optional[List[int]],
     removed_link_map: Dict[int, tuple[Optional[str], Optional[str]]],
     removed_sessions: Dict[int, Set[str]],
     perform_cleanup: bool,
@@ -211,7 +397,7 @@ async def _send_refresh_report(
             lines.append("Отписались от каналов:")
             lines.extend(
                 _format_removed_lines(
-                    to_remove=to_remove,
+                    to_remove=to_remove_order if to_remove_order else list(to_remove),
                     removed_link_map=removed_link_map,
                     removed_sessions=removed_sessions,
                     action_text="Отписались",
@@ -223,7 +409,7 @@ async def _send_refresh_report(
             lines.append("Відписка скасована — канали залишились закріпленими:")
             lines.extend(
                 _format_removed_lines(
-                    to_remove=to_remove,
+                    to_remove=to_remove_order if to_remove_order else list(to_remove),
                     removed_link_map=removed_link_map,
                     removed_sessions=removed_sessions,
                     action_text="Залишились",
@@ -241,7 +427,7 @@ async def _send_refresh_report(
     lines.append(
         "БД: "
         f"channels {stats['channels_deleted']}, memberships {stats['membership_deleted']}, membership_status {stats['membership_status_deleted']}; "
-        f"invite_map {stats['invite_map_deleted']}, invite_status {stats['invite_status_deleted']}, owner_conflicts {stats['owner_conflicts_deleted']}; "
+        f"owner_conflicts {stats['owner_conflicts_deleted']}; "
         f"links {stats['links_deleted']}, url_cache {stats['url_cache_deleted']}, link_queue {stats['link_queue_deleted']}"
     )
 
@@ -259,7 +445,7 @@ async def _send_refresh_report(
             parse_mode="HTML",
         )
     else:
-        kb = make_report_kb(0, len(pages), has_report=False)
+        kb = make_report_keyboard(0, len(pages), has_report=False)
         sent = await answer_with_retry(
             reply_msg,
             pages[0],
@@ -271,49 +457,36 @@ async def _send_refresh_report(
             report_cache.register(sent.chat.id, sent.message_id, pages, None)  # type: ignore[name-defined]
 
 
-async def refresh_channels_for_admin(
-    *,
-    batch_id: str,
-    chat_id: int,
-    reply_msg,
-    admin: m.Admin,
-    urls: List[str],
-    raw_text: str,
-    raw_html: str,
-    entities: List,
-):
+async def refresh_channels_for_admin(refresh_context: RefreshContext) -> None:
     """
     Оновлює список каналів адміна:
     1) підписує/оновлює за новими URL (process_batch)
     2) визначає канал_id із нових URL
     3) відписує та чистить канали, що не потрапили до нового списку.
     """
-    db = SessionLocal()
-    current_cids = set(
-        db.execute(select(m.AdminChannel.channel_id).where(m.AdminChannel.admin_id == admin.id)).scalars().all()
-    )
-    net_chan_ids = db.execute(
-        select(m.NetworkChannel.channel_id)
-        .join(m.Network, m.NetworkChannel.network_id == m.Network.id)
-        .where(m.Network.admin_id == admin.id)
-    ).scalars().all()
-    if net_chan_ids:
-        current_cids |= set(net_chan_ids)
-    conflict_clear_cids: Set[int] = set()
+    admin_obj = refresh_context.admin
+    if isinstance(admin_obj, m.Admin):
+        admin = AdminSnapshot(
+            id=admin_obj.id,
+            username=admin_obj.username,
+            display=admin_obj.display,
+            tg_id=admin_obj.tg_id,
+        )
+    else:
+        admin = admin_obj
 
-    added = link_queue.enqueue(
-        urls,
-        batch_id=batch_id,
-        origin_chat=chat_id,
-        origin_msg=getattr(reply_msg, "message_id", None),
-        owner_display=admin.display,
+    current_channel_ids = _load_current_channel_ids(admin.id)
+
+    link_queue.enqueue(
+        refresh_context.urls,
+        batch_id=refresh_context.batch_id,
+        origin_chat=refresh_context.chat_id,
+        origin_msg=getattr(refresh_context.reply_msg, "message_id", None),
+        owner_admin_id=admin.id,
         owner_username=admin.username,
         adopt_existing=True,
         reset_next_try=True,
     )
-    # Імпорт всередині, щоб уникнути циклічного імпорту
-    from app.admin_bot.services.queue_worker import process_batch
-
     allowed_markers = (
         "Додано у чергу",
         "Орієнтовний час підписки",
@@ -343,80 +516,29 @@ async def refresh_channels_for_admin(
             return getattr(self._bot, item)
 
     class _FilteredMessage:
-        def __init__(self, orig):
-            self._orig = orig
-            self.bot = _FilteredBot(orig.bot)
-            self.chat = orig.chat
-            self.message_id = getattr(orig, "message_id", None)
+        def __init__(self, original_message):
+            self._original_message = original_message
+            self.bot = _FilteredBot(original_message.bot)
+            self.chat = original_message.chat
+            self.message_id = getattr(original_message, "message_id", None)
 
         async def answer(self, text, *args, **kwargs):
             if any(marker in str(text) for marker in allowed_markers):
-                return await self._orig.answer(text, *args, **kwargs)
+                return await self._original_message.answer(text, *args, **kwargs)
             return SimpleNamespace(message_id=None, chat=self.chat)
 
-    filtered_msg = _FilteredMessage(reply_msg)
-
-    await process_batch(
-        batch_id=batch_id,
-        chat_id=chat_id,
-        reply_msg=filtered_msg,
-        admin_display=admin.display,
-        admin_username=admin.username,
-        admin_tg_id=admin.tg_id,
-        raw_text=raw_text,
-        raw_html=raw_html,
-        entities=entities,
-        original_urls=urls,
-    )
-
-    cache_entry = batch_cache.pop(batch_id) or {}
-    cached_items = cache_entry.get("items") or []
-    cache_map: Dict[str, Dict] = {}
-    keep_from_cache: Set[int] = set()
-    for it in cached_items:
-        nkeys = collect_norm_keys(it.get("url", ""))
-        for nk in nkeys:
-            cache_map[nk] = it
-        cid = it.get("channel_id")
-        if cid:
-            keep_from_cache.add(int(cid))
-
-    keep_cids: Set[int] = set()
-    for u in urls:
-        cid = _resolve_channel_id(u)
-        if cid:
-            keep_cids.add(cid)
-        if not cid:
-            cached = cache_map.get(u) or cache_map.get(sanitize_link(u) or "")
-            if cached and cached.get("channel_id"):
-                keep_cids.add(int(cached["channel_id"]))
-    if keep_from_cache:
-        keep_cids |= keep_from_cache
-    no_cid_resolution = False
-    if not keep_cids:
-        # не вдалося визначити channel_id для нових URL — не відписуємо поточні,
-        # але показуємо статуси з кешу
-        no_cid_resolution = True
-        keep_cids = set(current_cids)
-
-    if not keep_cids:
-        await answer_with_retry(
-            reply_msg,
-            "Не вдалося визначити канали за надісланими посиланнями — видалення пропущено.",
-        )
-        db.close()
-        return
+    filtered_msg = _FilteredMessage(refresh_context.reply_msg)
 
     def _human_status(raw: Optional[str], session_hint: Optional[str] = None) -> str:
         if not raw:
             return "…"
-        s = raw.lower()
+        normalized = raw.lower()
         base = raw
-        sess = None
+        session_value = None
         if "[" in raw and raw.endswith("]"):
-            sess = raw[raw.rfind("[") + 1 : -1]
+            session_value = raw[raw.rfind("[") + 1 : -1]
             base = raw[: raw.rfind("[")].strip()
-        if "owner_conflict" in s:
+        if "owner_conflict" in normalized:
             conflict_with = None
             try:
                 conflict_with = re.search(r"owner_conflict\(existing=([^)]+)\)", base, re.IGNORECASE).group(1)  # type: ignore[arg-type]
@@ -425,272 +547,138 @@ async def refresh_channels_for_admin(
             human = "⚠️ Конфликт"
             if conflict_with:
                 human = f"⚠️ Конфликт (закреплен за {conflict_with})"
-        elif "requested" in s or "заявк" in s:
+        elif "requested" in normalized or "заявк" in normalized:
             human = "✉️ Заявка"
-        elif "duplicate" in s:
+        elif "duplicate" in normalized:
             human = "🔁 Дубликат"
-        elif "joined" in s:
+        elif "joined" in normalized:
             human = "✅ Подписался"
-        elif "already" in s:
+        elif "already" in normalized:
             human = "☑️ Был подписан"
-        elif "flood" in s:
+        elif "flood" in normalized:
             human = "⏳ Флуд"
-        elif any(tok in s for tok in ("invalid", "private", "error", "blocked", "too_many")):
+        elif any(token in normalized for token in ("invalid", "private", "error", "blocked", "too_many")):
             human = "❌ Невалидное"
         else:
             human = base or "…"
-        if sess:
-            human = f"{human} [{account_pool.session_display(sess)}]"
+        if session_value:
+            human = f"{human} [{account_pool.session_display(session_value)}]"
         elif session_hint:
             human = f"{human} [{account_pool.session_display(session_hint)}]"
         return human
 
-    def _is_same_owner(candidate: Optional[str], admin_obj: m.Admin) -> bool:
-        if not candidate:
-            return False
-        cand = candidate.strip().lstrip("@").lower()
-        if admin_obj.display and cand == admin_obj.display.strip().lstrip("@").lower():
-            return True
-        if admin_obj.username and cand == admin_obj.username.strip().lstrip("@").lower():
-            return True
-        if admin_obj.tg_id and cand == str(admin_obj.tg_id):
-            return True
-        return False
+    await process_batch(
+        batch_id=refresh_context.batch_id,
+        chat_id=refresh_context.chat_id,
+        reply_msg=filtered_msg,
+        admin_id=admin.id,
+        admin_display=admin.display,
+        admin_username=admin.username,
+        admin_tg_id=admin.tg_id,
+        raw_text=refresh_context.raw_text,
+        raw_html=refresh_context.raw_html,
+        entities=refresh_context.entities,
+        original_urls=refresh_context.urls,
+    )
 
-    # --- Формуємо список усіх отриманих каналів зі статусами ---
+    phase_data = _prepare_refresh_phase_data(
+        refresh_context.batch_id,
+        refresh_context.urls,
+        current_channel_ids,
+        admin,
+    )
+
+    if not phase_data.plan.keep_cids:
+        await answer_with_retry(
+            refresh_context.reply_msg,
+            "Не вдалося визначити канали за надісланими посиланнями — видалення пропущено.",
+        )
+        return
+
     status_lines: List[str] = ["📋 Обновление списка каналов"]
-    dao = MembershipDAO(db)
-    if no_cid_resolution:
-        status_lines.append("⚠️ Не вдалося визначити channel_id за новими посиланнями; відписка пропущена, показуємо статуси за кешем.")
+    if phase_data.no_cid_resolution:
+        status_lines.append(
+            "⚠️ Не вдалося визначити channel_id за новими посиланнями; відписка пропущена, показуємо статуси за кешем."
+        )
 
-    for idx, url in enumerate(urls, start=1):
-        status_raw = None
-        try:
-            clean = sanitize_link(url) or url
-        except Exception:
-            clean = url
-        cached_item = cache_map.get(clean) or cache_map.get(url)
-        cid, title = None, None
-        cid_title = dao.map_invite_get(clean)
-        cid, title = cid_title
-        if not cid:
-            cid = _resolve_channel_id(clean)
-        if not title and cid:
-            ch = db.execute(select(m.Channel).where(m.Channel.id == cid)).scalar_one_or_none()
-            title = getattr(ch, "title", None)
-        if cached_item:
-            if cached_item.get("channel_id") and not cid:
-                cid = cached_item.get("channel_id")
-            if cached_item.get("title") and not title:
-                title = cached_item.get("title")
-            status_raw = cached_item.get("status")
-        # Підтягуємо статус підписки; інколи кеш зберігається по неочищеному URL,
-        # тому пробуємо і clean, і вихідний url.
-        if not status_raw:
-            for candidate in (clean, url):
-                if not candidate:
-                    continue
-                status_raw = dao.invite_status_get(candidate)
-                if status_raw:
-                    break
+    for idx, batch_result in enumerate(phase_data.enriched_results, start=1):
+        human_status = _human_status(batch_result.status_raw, batch_result.session_hint)
+        title_text = batch_result.title or batch_result.clean_url or batch_result.original_url or "невідомо"
+        href = batch_result.clean_url or batch_result.original_url
+        status_lines.append(f'{idx}. <a href="{href}">{title_text}</a> — {human_status}')
 
-        session_hint = None
-        # Конфлікт власника: читаємо з таблиці, щоб явно відобразити
-        if cid:
-            oc = (
-                db.execute(select(m.OwnerConflict).where(m.OwnerConflict.channel_id == cid).limit(1))
-                .scalars()
-                .first()
-            )
-            # Шукаємо адміна, який уже прив'язаний до цього каналу
-            ac_row = (
-                db.execute(
-                    select(m.Admin.display, m.Admin.username, m.Admin.tg_id, m.Admin.id)
-                    .join(m.AdminChannel, m.AdminChannel.admin_id == m.Admin.id)
-                    .where(m.AdminChannel.channel_id == cid)
-                    .limit(1)
-                ).first()
-            )
-            ac_display = None
-            ac_admin_id = None
-            if ac_row:
-                disp, uname, tg_id, ac_admin_id = ac_row
-                if disp:
-                    ac_display = disp
-                elif uname:
-                    ac_display = f"@{uname}"
-                elif tg_id:
-                    ac_display = str(tg_id)
-            if oc:
-                existing = (
-                    getattr(oc, "owner", None)
-                    or getattr(oc, "reason", None)
-                    or ac_display
-                )
-                conflict_with = "" if existing is None else str(existing).strip()
-                # Якщо у таблиці збережено «unknown», але ми знаємо адміна — показуємо його
-                if (not conflict_with or conflict_with.lower() in ("unknown", "невідомий адмін")) and ac_display:
-                    conflict_with = ac_display
-                # Якщо конфлікт записаний на цього ж адміна — очищаємо і не показуємо
-                if conflict_with and _is_same_owner(conflict_with, admin):
-                    conflict_clear_cids.add(int(cid))
-                    conflict_with = ""
-                if not conflict_with:
-                    conflict_with = None
-                if conflict_with:
-                    if status_raw and "owner_conflict" in status_raw:
-                        status_raw = f"owner_conflict(existing={conflict_with})"
-                    elif not status_raw:
-                        status_raw = f"owner_conflict(existing={conflict_with})"
-            elif ac_admin_id and admin.id and ac_admin_id != admin.id:
-                # Канал уже прив'язаний до іншого адміна, але конфлікт не записаний у таблиці
-                conflict_with = ac_display or str(ac_admin_id) or "невідомий адмін"
-                status_raw = f"owner_conflict(existing={conflict_with})"
-            # Якщо є активна підписка в membership — вважаємо, що був підписаний
-            first_membership = db.execute(
-                select(m.Membership.account).where(m.Membership.channel_id == cid).limit(1)
-            ).scalar_one_or_none()
-            if first_membership:
-                if not session_hint:
-                    session_hint = str(first_membership)
-                if not status_raw:
-                    status_raw = "already"
-                elif "joined" in (status_raw or "").lower() and "already" not in (status_raw or "").lower():
-                    status_raw = "already"
-            if not session_hint:
-                try:
-                    session_hint = dao.get_any_session_for_channel(int(cid))
-                except Exception:
-                    session_hint = None
-        human = _human_status(status_raw, session_hint)
+    to_remove = set(phase_data.plan.to_remove)
+    to_remove_order = list(phase_data.plan.to_remove_order)
+    if not to_remove_order and to_remove:
+        to_remove_order = list(to_remove)
 
-        title_txt = title or clean or url or "невідомо"
-        href = clean or url
-        status_lines.append(f"{idx}. <a href=\"{href}\">{title_txt}</a> — {human}")
-
-    if conflict_clear_cids:
-        try:
-            db.execute(delete(m.OwnerConflict).where(m.OwnerConflict.channel_id.in_(conflict_clear_cids)))
-            db.commit()
-        except Exception:
-            pass
-
-    to_remove = {cid for cid in current_cids if cid not in keep_cids}
-
-    # Готуємо лінки/назви для видалених каналів, щоб відобразити як у списку
-    removed_link_map: Dict[int, tuple[Optional[str], Optional[str]]] = {}
-    if to_remove:
-        rows = db.execute(
-            select(m.Channel.id, m.Channel.title, m.Link.raw_url)
-            .join(m.Link, m.Link.channel_id == m.Channel.id, isouter=True)
-            .where(m.Channel.id.in_(to_remove))
-        ).all()
-        for cid, title, raw_url in rows:
-            if cid not in removed_link_map:
-                href = None
-                if raw_url:
-                    try:
-                        href = sanitize_link(raw_url) or raw_url
-                    except Exception:
-                        href = raw_url
-                removed_link_map[cid] = (title, href)
-        # Якщо немає посилання в links – пробуємо витягти з invite_map
-        invite_rows = db.execute(
-            select(m.InviteMap.channel_id, m.InviteMap.title, m.InviteMap.invite_hash)
-            .where(m.InviteMap.channel_id.in_(to_remove))
-        ).all()
-        for cid, title, inv_hash in invite_rows:
-            if cid in removed_link_map and removed_link_map[cid][1]:
-                continue
-            href = None
-            if inv_hash:
-                href = f"https://t.me/+{inv_hash}"
-            prev_title, prev_href = removed_link_map.get(cid, (None, None))
-            if not prev_title and title:
-                prev_title = title
-            removed_link_map[cid] = (prev_title or title, prev_href or href)
-
-    # Фіксуємо сесії, що були підписані на ці канали (до чистки), щоб показати у звіті
-    removed_sessions: Dict[int, Set[str]] = {}
-    if to_remove:
-        try:
-            rows = (
-                db.query(m.Membership.channel_id, m.Membership.account)
-                .filter(m.Membership.channel_id.in_([int(cid) for cid in to_remove]))
-                .all()
-            )
-            for cid_val, acc in rows:
-                removed_sessions.setdefault(int(cid_val), set()).add(str(acc))
-        except Exception:
-            removed_sessions = {}
+    removed_link_map = phase_data.removed_link_map
+    removed_sessions = phase_data.removed_sessions
 
     if to_remove:
-        _PENDING_REFRESH_CONFIRMATIONS.pop(batch_id, None)
-        _PENDING_REFRESH_CONFIRMATIONS[batch_id] = {
+        _PENDING_REFRESH_CONFIRMATIONS.pop(refresh_context.batch_id, None)
+        _PENDING_REFRESH_CONFIRMATIONS[refresh_context.batch_id] = {
             "admin_id": admin.id,
             "status_lines": list(status_lines),
             "to_remove": set(to_remove),
+            "to_remove_order": list(to_remove_order),
             "removed_link_map": removed_link_map,
             "removed_sessions": removed_sessions,
         }
+
         preview_lines = [
             "Знайшли канали, яких немає у новому списку. Відписати від них?",
             "",
         ]
         preview_lines.extend(
             _format_removed_lines(
-                to_remove=to_remove,
+                to_remove=to_remove_order if to_remove_order else list(to_remove),
                 removed_link_map=removed_link_map,
                 removed_sessions=removed_sessions,
                 action_text="Потенційна відписка",
-                db=db,
+                db=None,
             )
         )
         preview_lines.append("")
         preview_lines.append("Підтвердити відписку?")
-        confirm_rows = [
-            [
-                InlineKeyboardButton(text="Так", callback_data=f"refresh_unsub_yes:{batch_id}"),
-                InlineKeyboardButton(text="Ні", callback_data=f"refresh_unsub_no:{batch_id}"),
-            ]
-        ]
-        kb_confirm = InlineKeyboardMarkup(inline_keyboard=confirm_rows)
+        confirm_rows = build_confirm_unsubscribe_rows(refresh_context.batch_id)
+        preview_keyboard = build_confirm_unsubscribe_keyboard(refresh_context.batch_id)
         text_preview = "\n".join(preview_lines)
-        pages = split_text_for_telegram(text_preview, max_len=5000)
-        if len(pages) == 1:
+        preview_pages = split_text_for_telegram(text_preview, max_len=5000)
+
+        if len(preview_pages) == 1:
             await answer_with_retry(
-                reply_msg,
-                pages[0],
+                refresh_context.reply_msg,
+                preview_pages[0],
                 disable_web_page_preview=True,
-                reply_markup=kb_confirm,
+                reply_markup=preview_keyboard,
                 parse_mode="HTML",
             )
         else:
-            kb = make_report_kb(0, len(pages), has_report=False, extra_rows=confirm_rows)
+            keyboard = make_report_keyboard(0, len(preview_pages), has_report=False, extra_rows=confirm_rows)
             sent = await answer_with_retry(
-                reply_msg,
-                pages[0],
+                refresh_context.reply_msg,
+                preview_pages[0],
                 disable_web_page_preview=True,
                 parse_mode="HTML",
-                reply_markup=kb,
+                reply_markup=keyboard,
             )
             if sent:
-                report_cache.register(sent.chat.id, sent.message_id, pages, None, confirm_rows)
-        db.close()
+                report_cache.register(sent.chat.id, sent.message_id, preview_pages, None, confirm_rows)
         return
 
     await _send_refresh_report(
         admin=admin,
-        reply_msg=reply_msg,
+        reply_msg=refresh_context.reply_msg,
         status_lines=status_lines,
         to_remove=to_remove,
+        to_remove_order=to_remove_order,
         removed_link_map=removed_link_map,
         removed_sessions=removed_sessions,
         perform_cleanup=True,
-        db=db,
+        db=None,
     )
-    db.close()
-
+    return
 
 async def finalize_refresh_confirmation(batch_id: str, approve_unsubscribe: bool, reply_msg) -> None:
     """
@@ -702,25 +690,23 @@ async def finalize_refresh_confirmation(batch_id: str, approve_unsubscribe: bool
         return
 
     admin_id = ctx.get("admin_id")
-    db = SessionLocal()
-    admin = svc_admins.get_admin_by_id(db, admin_id) if admin_id else None
-    db.close()
+    admin = None
+    if admin_id:
+        with session_scope() as db:
+            admin = svc_admins.get_admin_snapshot_by_id(db, admin_id)
 
     if not admin:
         await answer_with_retry(reply_msg, "Адміна не знайдено. Спробуй запустити оновлення ще раз.")
         return
 
-    report_db = SessionLocal()
-    try:
-        await _send_refresh_report(
-            admin=admin,
-            reply_msg=reply_msg,
-            status_lines=ctx.get("status_lines") or [],
-            to_remove=set(ctx.get("to_remove") or []),
-            removed_link_map=ctx.get("removed_link_map") or {},
-            removed_sessions=ctx.get("removed_sessions") or {},
-            perform_cleanup=approve_unsubscribe,
-            db=report_db,
-        )
-    finally:
-        report_db.close()
+    await _send_refresh_report(
+        admin=admin,
+        reply_msg=reply_msg,
+        status_lines=ctx.get("status_lines") or [],
+        to_remove=set(ctx.get("to_remove") or []),
+        to_remove_order=ctx.get("to_remove_order"),
+        removed_link_map=ctx.get("removed_link_map") or {},
+        removed_sessions=ctx.get("removed_sessions") or {},
+        perform_cleanup=approve_unsubscribe,
+        db=None,
+    )

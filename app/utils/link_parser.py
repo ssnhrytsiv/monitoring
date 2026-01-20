@@ -1,7 +1,8 @@
 from __future__ import annotations
 import re
-from typing import Iterable, List, Optional, Union
+from typing import Iterable, List, Union, Any
 from urllib.parse import SplitResult, urlsplit, urlunsplit
+import html as _html_mod
 
 try:
     # Імпортимо типи тільки якщо є telethon (щоб утиліта жила і без нього)
@@ -10,6 +11,11 @@ try:
 except Exception:  # pragma: no cover
     tg_types = None
     TgMessage = None  # type: ignore
+
+try:
+    from aiogram.types import Message as AiogramMessage  # type: ignore
+except Exception:  # pragma: no cover
+    AiogramMessage = None  # type: ignore
 
 # --- Регулярки ---
 # 1) Markdown: [label](https://t.me/...)
@@ -34,6 +40,8 @@ RE_TG_RAW = re.compile(
 # Допоміжне: прибрати невидимі символи/окантовку і «хвости» пунктуації
 _INVIS = ("\u200b", "\u200e", "\u200f")
 _TRAIL_PUNCT = ".,;:)]}>"
+_AI0G_LINK_RE = re.compile(r"(?i)\b((?:https?://|tg://|t\.me/)[^\s<>'\"\\]+)")
+_AI0G_MENTION_RE = re.compile(r"@[\w\d_]{4,}")
 
 
 def _clean(s: str) -> str:
@@ -279,7 +287,7 @@ def _extract_from_entities(text: str, entities: Iterable) -> List[str]:
     return out
 
 
-def extract_links_any(msg_or_text: Union[str, "TgMessage"]) -> List[str]:
+def extract_links_any(msg_or_text: Union[str, Any]) -> List[str]:
     """
     Універсальний витягувач:
       • якщо дали Telethon Message — бере і regex із тексту, і з entities
@@ -301,6 +309,133 @@ def extract_links_any(msg_or_text: Union[str, "TgMessage"]) -> List[str]:
 
     # випадок звичайного тексту
     return extract_links(str(msg_or_text or ""))
+
+
+def _clean_url_generic(u: str) -> str:
+    """
+    Санітує та обрізає хвости для aiogram-повідомлень.
+    Використовує sanitize_link + прибирає хвости неприйнятних символів.
+    """
+    try:
+        u = sanitize_link(u) or u
+    except Exception:
+        u = u
+    u = (u or "").strip()
+    # залишаємо лише ASCII-частину посилання (щоб обрізати випадкові кириличні символи вкінці)
+    # ставимо "-" у кінці класу, щоб не ловити "bad character range"
+    m = re.match(r"^((?:https?://|tg://|t\.me/)[A-Za-z0-9_.:/?&=#%+@-]+)", u)
+    if m:
+        u = m.group(1)
+    # дефіс наприкінці, щоб уникнути діапазонів у [] для re
+    u = re.sub(r"[^A-Za-z0-9_.:/?&=#%+@-]+$", "", u)
+    u = u.rstrip(').,;\'"<>[]{}')
+    return u
+
+
+def extract_links_aiogram(msg: Any) -> List[str]:
+    """
+    Витягує всі лінки/mention з aiogram Message (text/caption + entities).
+    Повертає унікальні нормалізовані URL у порядку появи.
+    """
+    if AiogramMessage is None or not isinstance(msg, AiogramMessage):
+        return []
+
+    urls: List[str] = []
+    entities = msg.entities or msg.caption_entities or []
+    txt = msg.text or msg.caption or ""
+
+    for ent in entities:
+        et = getattr(ent, "type", "")
+        if et == "text_link":
+            u = getattr(ent, "url", None)
+            if u:
+                urls.append(_clean_url_generic(u))
+        elif et == "url":
+            off = int(getattr(ent, "offset", 0))
+            ln = int(getattr(ent, "length", 0))
+            piece = txt[off : off + ln].strip()
+            if piece:
+                urls.append(_clean_url_generic(piece))
+        elif et == "mention":  # @username
+            off = int(getattr(ent, "offset", 0))
+            ln = int(getattr(ent, "length", 0))
+            piece = txt[off : off + ln].strip()
+            if piece:
+                urls.append(_clean_url_generic(piece))
+
+    for m_ in _AI0G_LINK_RE.finditer(txt):
+        urls.append(_clean_url_generic(m_.group(1)))
+    for m_ in _AI0G_MENTION_RE.finditer(txt):
+        urls.append(_clean_url_generic(m_.group(0)))
+
+    cleaned = [_clean_url_generic(u) for u in urls if u]
+    uniq = []
+    seen = set()
+    for u in cleaned:
+        if not u:
+            continue
+        norm = sanitize_link(u)
+        if norm and norm not in seen:
+            uniq.append(norm)
+            seen.add(norm)
+    return uniq
+
+
+def extract_links_norm(text: str) -> List[str]:
+    """
+    Витягує всі лінки з довільного нормалізованого тексту
+    (http/https/tg/t.me та @mention) і повертає унікальні
+    санітізовані URL у порядку появи.
+    """
+    if not text:
+        return []
+
+    raw: List[str] = []
+    for m in _AI0G_LINK_RE.finditer(text):
+        raw.append(m.group(1))
+    for m in _AI0G_MENTION_RE.finditer(text):
+        raw.append(m.group(0))
+
+    seen = set()
+    out: List[str] = []
+    for u in raw:
+        cleaned = _clean_url_generic(u)
+        if not cleaned:
+            continue
+        norm = sanitize_link(cleaned)
+        if norm and norm not in seen:
+            out.append(norm)
+            seen.add(norm)
+    return out
+
+
+def extract_links_from_html(html_text: str) -> List[str]:
+    """
+    Витягує унікальні посилання з HTML:
+      • href із тегів <a>
+      • голі URL/@mention з тексту після видалення тегів
+    """
+    if not html_text:
+        return []
+
+    seen = set()
+    out: List[str] = []
+
+    def _add(u_raw: str) -> None:
+        u = sanitize_link(_clean_url_generic(u_raw))
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+
+    unescaped = _html_mod.unescape(html_text)
+    for m_ in re.findall(r'href\s*=\s*(?:"|\')([^"\']+)(?:"|\')', unescaped, flags=re.IGNORECASE):
+        _add(m_)
+
+    plain = re.sub(r"<[^>]+>", " ", unescaped)
+    for u in extract_links_norm(plain):
+        _add(u)
+
+    return out
 
 
 async def collect_links(evt) -> List[str]:

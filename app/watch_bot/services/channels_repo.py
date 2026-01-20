@@ -3,7 +3,7 @@ import re
 import logging
 
 from app.DAL import channels_operations as channels_db
-from app.admin_bot.db.session import SessionLocal
+from app.DAL import session_scope
 
 log = logging.getLogger("channels_repo")
 
@@ -42,7 +42,8 @@ def resolve_cid_by_target(target: str) -> Optional[int]:
     if match_username:
         username = match_username.group(1)
         try:
-            cid = channels_db.get_channel_id_by_username(username)
+            with session_scope() as db:
+                cid = channels_db.get_channel_id_by_username(db, username)
             if cid:
                 return cid
         except Exception as e:
@@ -51,46 +52,42 @@ def resolve_cid_by_target(target: str) -> Optional[int]:
     match_invite = _INV_RE.search(s)
     if match_invite:
         invite_hash = match_invite.group(1)
-        try:
-            cid = channels_db.get_channel_id_by_invite_hash(invite_hash)
-            if cid:
-                return cid
-        except Exception as e:
-            log.exception("resolve_cid invite_map lookup failed: %s", e)
+        # invite_hash lookup handled via invite_cache in joiner/subscription paths
+        log.debug("resolve_cid: invite hash %s detected, not resolved in repo", invite_hash)
 
     try:
-        db = SessionLocal()
-        try:
-            cid = channels_db.get_channel_id_by_url(db, s)
-        finally:
-            db.close()
-        if cid:
-            return cid
+        with session_scope() as db:
+            cid = channels_db.get_channel_id_by_url_any(db, s)
+            if cid:
+                return cid
     except Exception as e:
-        log.exception("resolve_cid channel_links lookup failed: %s", e)
+        log.exception("resolve_cid link lookup failed: %s", e)
 
     return None
 
 def get_links_by_channel_ids(cids: List[int]) -> Dict[int, str]:
     try:
-        return channels_db.get_links_by_channel_ids(cids)
+        with session_scope() as db:
+            return channels_db.get_links_by_channel_ids(db, cids)
     except Exception as e:
         log.exception("get_links_by_channel_ids failed: %s", e)
         return {}
 
-def get_owners_by_channel_ids(cids: List[int]) -> Dict[int, str]:
+def get_owners_by_channel_ids(cids: List[int]) -> List[channels_db.ChannelOwnerLabel]:
     try:
-        return channels_db.get_owners_by_channel_ids(cids)
+        with session_scope() as db:
+            return channels_db.get_owners_by_channel_ids(db, cids)
     except Exception as e:
         log.exception("get_owners_by_channel_ids failed: %s", e)
-        return {}
+        return []
 
 def get_titles_by_channel_ids(cids: List[int]) -> Dict[int, str]:
     """
     Повертає map channel_id -> title (Telegram-назва каналу) з таблиці channels.
     """
     try:
-        return channels_db.get_titles_by_channel_ids(cids)
+        with session_scope() as db:
+            return channels_db.get_titles_by_channel_ids(db, cids)
     except Exception as e:
         log.exception("get_titles_by_channel_ids failed: %s", e)
         return {}

@@ -32,7 +32,7 @@
 - **Повні назви**: Назви змінних мають бути повними та описовими.
   - ✅ `user_id`, `channel_title`, `message_text`
   - ❌ `uid`, `ch_ttl`, `msg`
-- **Класи**: `CamelCase` (наприклад, `Channel`, `MembershipDAO`).
+- **Класи**: `CamelCase` (наприклад, `Channel`, `LinkQueueRecord`).
 - **Константи**: `UPPER_CASE` (наприклад, `MAX_RETRIES`).
 
 ## 5. Робота з Базою Даних (DAL)

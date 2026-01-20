@@ -23,13 +23,11 @@ from aiogram import Router
 from app.watch_bot.handlers.create_watch import router as create_watch_router
 from app.watch_bot.handlers.active_watches_menu import router as active_watches_menu_router
 from app.watch_bot.handlers.active_watches_group import router as active_watches_group_router
-from app.watch_bot.handlers.join_channels import router as join_channels_router
 
 router = Router()
 router.include_router(create_watch_router)
 router.include_router(active_watches_menu_router)
 router.include_router(active_watches_group_router)
-router.include_router(join_channels_router)
 ```
 
 ---
@@ -182,7 +180,7 @@ async def watch_group_details(cb: CallbackQuery):
        all_items,
        templates_map=templates_map,
        channel_titles=channel_names_map,
-       owner_display=owner_for_header,
+      owner_name=owner_for_header,
    )
    ```
 
@@ -323,7 +321,7 @@ GroupItem = Tuple[int, int, str, str, int]
   - `cancelled` → ❌
   - інше → ❔
 
-- `build_group_table(all_items, templates_map, channel_titles, owner_display) -> str`  
+- `build_group_table(all_items, templates_map, channel_titles, owner_name) -> str`  
   Будує моноширинну таблицю з усіма елементами групи й повертає готовий Markdown‑code‑block.
 
 ---

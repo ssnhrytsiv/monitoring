@@ -9,23 +9,23 @@ from dotenv import load_dotenv
 # Load env before importing modules that read os.getenv at import time
 load_dotenv()
 
-from app.telethon_client import client, load_plugins
-from app.services.account_pool import start_pool, stop_pool
-from app.logging_json import configure_logging, get_logger
-from app.services.requested_reconciler import run_requested_reconciler
-from app.services.models import init_db as orm_init_db
-from app.services.owner_conflict_guard import init as owner_guard_init
+from app.telethon_client import client, load_plugins  # noqa: E402
+from app.services.account_pool import start_pool, stop_pool  # noqa: E402
+from app.logging_json import configure_logging, get_logger  # noqa: E402
+from app.services.requested_reconciler import run_requested_reconciler  # noqa: E402
+from app.db.session import init_db as orm_init_db  # noqa: E402
+from app.services.owner_conflict_guard import init as owner_guard_init  # noqa: E402
 
-from app.services.googlesheets.channels_export_service import (
+from app.services.googlesheets.channels_export_service import (  # noqa: E402
     start_channels_exporter,
     stop_channels_exporter,
 )
 
-from app.watch_bot.run import run_bot
-from app.admin_bot.run import run_admin_bot
-from app.admin_bot.config import ADMIN_BOT_TOKEN
-from scripts.forward_bot import start_forward_bot
-from app.notificator_bot.run import start_notificator_bot
+from app.watch_bot.run import run_bot  # noqa: E402
+from app.admin_bot.run import run_admin_bot  # noqa: E402
+from app.admin_bot.config import ADMIN_BOT_TOKEN  # noqa: E402
+from scripts.forward_bot import start_forward_bot  # noqa: E402
+from app.notificator_bot.run import start_notificator_bot  # noqa: E402
 
 
 def setup_logging():

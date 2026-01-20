@@ -7,7 +7,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from app.admin_bot.config import ADMIN_BOT_TOKEN
-from app.admin_bot.db.session import Base, engine
+from app.db.session import Base, engine
 from app.admin_bot.bot import router
 import logging
 

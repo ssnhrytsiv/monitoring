@@ -9,8 +9,6 @@ from app.admin_bot.services.subscription.subscription_menu import split_text_for
 
 
 def demo_success():
-    raw_text = "Demo raw text\nSecond line"
-    raw_html = None  # підкинь html_text, якщо треба перевірити анкорі
     original_urls = [
         "https://t.me/+demo1",
         "https://t.me/+demo2",

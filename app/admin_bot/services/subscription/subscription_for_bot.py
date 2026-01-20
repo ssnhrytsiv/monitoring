@@ -6,26 +6,24 @@ from telethon.tl.functions.contacts import UnblockRequest
 
 from app.utils.throttle import throttle_bot
 from app.utils.link_parser import extract_bot_username
-from app.DAL import SessionLocal
 from app.DAL import bot_links_operations as blo
+from app.DAL import session_scope
 from app.services.account_pool import session_name
 
 log = logging.getLogger("subscription.subscription_for_bot")
 
 
 def _upsert_bot_link(**kwargs) -> None:
-    db = SessionLocal()
-    try:
+    # NB: використовуємо короткий session_scope, щоб не витікали з'єднання
+    with session_scope() as db:
         blo.upsert_bot_link(db, **kwargs)
-    finally:
-        db.close()
 
 
 async def ensure_bot_started(
     client,
     url: str,
     *,
-    owner_display: Optional[str] = None,
+    owner_admin_id: Optional[int] = None,
     owner_username: Optional[str] = None,
     batch_id: Optional[str] = None,
 ) -> Tuple[str, Optional[str]]:
@@ -59,7 +57,7 @@ async def ensure_bot_started(
             raw_url=url,
             status="bot_started",
             session=sess,
-            owner_display=owner_display,
+            owner_admin_id=owner_admin_id,
             owner_username=owner_username,
             batch_id=batch_id,
             error=None,
@@ -72,7 +70,7 @@ async def ensure_bot_started(
             raw_url=url,
             status=f"bot_flood_wait_{e.seconds}",
             session=None,
-            owner_display=owner_display,
+            owner_admin_id=owner_admin_id,
             owner_username=owner_username,
             batch_id=batch_id,
             error=str(e),
@@ -85,7 +83,7 @@ async def ensure_bot_started(
             raw_url=url,
             status="bot_invalid",
             session=None,
-            owner_display=owner_display,
+            owner_admin_id=owner_admin_id,
             owner_username=owner_username,
             batch_id=batch_id,
             error="username_not_found",
@@ -97,7 +95,7 @@ async def ensure_bot_started(
             raw_url=url,
             status="bot_error",
             session=None,
-            owner_display=owner_display,
+            owner_admin_id=owner_admin_id,
             owner_username=owner_username,
             batch_id=batch_id,
             error=str(e),

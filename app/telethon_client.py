@@ -21,7 +21,6 @@ MONITOR_BUFFER = SimpleNamespace(
     needle=None,
     monitors=[],
     owner_username=None,
-    owner_display=None,
     pending_batch=None,
 )
 
@@ -109,6 +108,5 @@ async def load_plugins():
                 log.debug("Module %s has no setup() – skipped", full)
         except Exception as e:
             log.exception("Failed to load plugin %s: %s", full, e)
-
 
 

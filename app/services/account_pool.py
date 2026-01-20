@@ -44,7 +44,8 @@ def _parse_accounts_env() -> List[str]:
     seen, out = set(), []
     for n in names:
         if n not in seen:
-            out.append(n); seen.add(n)
+            out.append(n)
+            seen.add(n)
     out = [n for n in out if n != PRIMARY]
     return out
 
@@ -138,7 +139,8 @@ def bump_cooldown(client: TelegramClient, seconds: int) -> None:
     Короткий локальний кулдаун для клієнта (не FLOOD).
     """
     slot = _find_slot(client)
-    if not slot: return
+    if not slot:
+        return
     _set_ready_after(slot, max(0, int(seconds)))
     log.debug("bump_cooldown: %s +%ss (ready @ %.0f)", slot.name, seconds, slot.next_ready)
 
@@ -147,7 +149,8 @@ def mark_flood(client: TelegramClient, seconds: int) -> None:
     Позначає клієнт як "сплячий" через FLOOD_WAIT.
     """
     slot = _find_slot(client)
-    if not slot: return
+    if not slot:
+        return
     _set_ready_after(slot, max(0, int(seconds)))
     log.warning("mark_flood: %s sleeps until %.0f (+%ss)", slot.name, slot.next_ready, seconds)
 
@@ -156,7 +159,8 @@ def mark_limit(client_or_slot: Union[TelegramClient, ClientSlot], days: int = 2)
     Довгий "сон" при ліміті каналів (Too many channels).
     """
     slot = _find_slot(client_or_slot)
-    if not slot: return
+    if not slot:
+        return
     seconds = int(days * 86400)
     _set_ready_after(slot, seconds)
     log.warning("mark_limit: %s sleeps until %.0f (+%ss, ~%d days)", slot.name, slot.next_ready, seconds, days)
@@ -239,7 +243,8 @@ async def _ensure_connected(slot: ClientSlot) -> None:
     Переконуємось, що клієнт під'єднаний та авторизований.
     З ретраями від sqlite 'database is locked'.
     """
-    retries = 5; delay = 0.6
+    retries = 5
+    delay = 0.6
     connected = False
     for attempt in range(retries):
         try:
@@ -250,16 +255,18 @@ async def _ensure_connected(slot: ClientSlot) -> None:
             connected = True
             break
         except sqlite3.OperationalError as e:
-            if "database is locked" in str(e).lower() and attempt < retries-1:
+            if "database is locked" in str(e).lower() and attempt < retries - 1:
                 wait = delay * (attempt + 1)
                 log.warning("sqlite locked for %s; retry in %.1fs", slot.name, wait)
-                await asyncio.sleep(wait); continue
+                await asyncio.sleep(wait)
+                continue
             raise
         except Exception as e:
-            if attempt < retries-1:
+            if attempt < retries - 1:
                 wait = delay * (attempt + 1)
                 log.warning("connect failed for %s: %s; retry in %.1fs", slot.name, e, wait)
-                await asyncio.sleep(wait); continue
+                await asyncio.sleep(wait)
+                continue
             raise
 
     if not connected:
@@ -298,7 +305,9 @@ async def start_pool() -> None:
     """
     global _POOL, _limits_checker_task
     if not POOL_SESSIONS:
-        log.info("Accounts pool is empty (ACCOUNTS not set)."); _POOL = []; return
+        log.info("Accounts pool is empty (ACCOUNTS not set).")
+        _POOL = []
+        return
     if not API_ID or not API_HASH:
         raise RuntimeError("API_ID/API_HASH must be set in .env for pool")
     if PRIMARY in POOL_SESSIONS:
@@ -340,9 +349,12 @@ async def stop_pool() -> None:
             pass
         _health_checker_task = None
     for s in _POOL:
-        try: await s.client.disconnect()
-        except Exception: pass
-    _POOL.clear(); log.info("account_pool stopped")
+        try:
+            await s.client.disconnect()
+        except Exception:
+            pass
+    _POOL.clear()
+    log.info("account_pool stopped")
 
 def iter_pool_clients() -> List[ClientSlot]:
     """
@@ -366,23 +378,29 @@ async def _lease_ctx(slot: ClientSlot):
     Контекст для позначки busy під час короткої «оренди» клієнта.
     """
     slot.busy = True
-    try: yield slot.client
-    finally: slot.busy = False
+    try:
+        yield slot.client
+    finally:
+        slot.busy = False
 
 async def lease() -> Optional[asyncio.AbstractAsyncContextManager]:
     """
     Видає async context manager з "найближчим" готовим клієнтом.
     Повертає None, якщо наразі *усі* сплять або зайняті.
     """
-    if not _POOL: return None
+    if not _POOL:
+        return None
     now = time.time()
     async with _POOL_LOCK:
-        n = len(_POOL); global _rr
+        n = len(_POOL)
+        global _rr
         for k in range(n):
             idx = (_rr + k) % n
             s = _POOL[idx]
-            if s.busy: continue
-            if s.next_ready > now: continue
+            if s.busy:
+                continue
+            if s.next_ready > now:
+                continue
             _rr = (idx + 1) % n
             return _lease_ctx(s)
     return None
@@ -392,7 +410,8 @@ async def is_already_subscribed(url: str) -> Optional[str]:
     Перевіряє, чи хоча б один акаунт з пулу вже підписаний на канал (за url).
     Повертає session_name клієнта, якщо знайдено, інакше None.
     """
-    if not _POOL: return None
+    if not _POOL:
+        return None
     for slot in _POOL:
         try:
             client = slot.client

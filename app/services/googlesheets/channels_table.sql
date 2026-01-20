@@ -8,14 +8,14 @@
 
 WITH
 invites_cl AS (
-  SELECT cl.channel_id, cl.link_url_norm AS url, cl.first_seen_ts, cl.last_seen_ts
-  FROM channel_links cl
-  WHERE cl.link_url_norm LIKE 'https://t.me/+%'
+  SELECT l.channel_id, l.url_norm AS url, NULL AS first_seen_ts, NULL AS last_seen_ts
+  FROM links l
+  WHERE l.url_norm LIKE 'https://t.me/+%'
 ),
 invites_map AS (
-  SELECT im.channel_id, 'https://t.me/' || '+' || im.invite_hash AS url, NULL AS first_seen_ts, NULL AS last_seen_ts
-  FROM invite_map im
-  WHERE im.channel_id IS NOT NULL
+  SELECT ic.channel_id, 'https://t.me/' || '+' || ic.invite_hash AS url, NULL AS first_seen_ts, NULL AS last_seen_ts
+  FROM invite_cache ic
+  WHERE ic.channel_id IS NOT NULL
 ),
 invites_union AS (
   SELECT channel_id, url, MIN(first_seen_ts) AS first_ts, MAX(last_seen_ts) AS last_ts
@@ -66,17 +66,16 @@ links_agg AS (
 -- Кандидати у власники (за invite_owners), НОВИЙ пріоритет owner_key: DISPLAY -> USERNAME
 owner_candidates AS (
   SELECT
-    im.channel_id,
-    LOWER(REPLACE(COALESCE(NULLIF(io.owner_display, ''), io.owner_username), '@', '')) AS owner_key,
+    ic.channel_id,
+    LOWER(REPLACE(COALESCE(NULLIF(io.owner_username, ''), io.owner_username), '@', '')) AS owner_key,
     MAX(io.owner_username) AS owner_username,
-    MAX(io.owner_display)  AS owner_display,
     COUNT(*)               AS tries,
     MIN(strftime('%s', NULLIF(io.created_at, ''))) AS first_ts,
     MAX(strftime('%s', NULLIF(io.created_at, ''))) AS last_ts
-  FROM invite_map im
-  JOIN invite_owners io ON io.invite_hash = im.invite_hash
-  WHERE im.channel_id IS NOT NULL
-  GROUP BY im.channel_id, owner_key
+  FROM invite_cache ic
+  JOIN invite_owners io ON io.invite_hash = ic.invite_hash
+  WHERE ic.channel_id IS NOT NULL
+  GROUP BY ic.channel_id, owner_key
 ),
 
 -- Офіційні конфлікти: нормалізуємо ключ і РЕЗОЛВИМО channel_id (бо у owner_conflicts може бути id або channel_id)
@@ -106,7 +105,7 @@ conflicts_names_official AS (
   FROM (
     SELECT DISTINCT
       obk.channel_id,
-      COALESCE(NULLIF(TRIM(cand.owner_display), ''), NULLIF(TRIM(obk.display_from_conflicts), '')) AS name
+      COALESCE(NULLIF(TRIM(cand.owner_username), ''), NULLIF(TRIM(obk.display_from_conflicts), '')) AS name
     FROM owner_conflicts_by_key obk
     LEFT JOIN owner_candidates cand
       ON cand.channel_id = obk.channel_id AND cand.owner_key = obk.owner_key
@@ -130,11 +129,11 @@ conflicts_names_derived AS (
   FROM (
     SELECT DISTINCT
       oc.channel_id,
-      NULLIF(TRIM(oc.owner_display), '') AS name
+      NULLIF(TRIM(oc.owner_username), '') AS name
     FROM owner_candidates oc
     JOIN channels_with_derived_conflict d
       ON d.channel_id = oc.channel_id
-    WHERE NULLIF(TRIM(oc.owner_display), '') IS NOT NULL
+    WHERE NULLIF(TRIM(oc.owner_username), '') IS NOT NULL
   ) AS s
   GROUP BY s.channel_id
 ),
@@ -144,7 +143,7 @@ fallback_owner AS (
   SELECT DISTINCT
     oce.channel_id,
     FIRST_VALUE(ece.owner_username) OVER w AS owner_username,
-    FIRST_VALUE(ece.owner_display)  OVER w AS owner_display
+    FIRST_VALUE(ece.owner_username)  OVER w AS owner_username
   FROM owner_candidates AS ece
   JOIN owner_candidates AS oce
     ON oce.channel_id = ece.channel_id
@@ -163,7 +162,7 @@ owner_final AS (
   SELECT
     c.channel_id,
     COALESCE(NULLIF(c.owner_username,''), fb.owner_username, '') AS owner_username,
-    COALESCE(NULLIF(c.owner_display,''), fb.owner_display,  '') AS owner_display
+    COALESCE(NULLIF(c.owner_username,''), fb.owner_username,  '') AS owner_username
   FROM channels c
   LEFT JOIN fallback_owner fb ON fb.channel_id = c.channel_id
 )
@@ -172,7 +171,7 @@ SELECT
   c.title                                                          AS title,
   COALESCE(la.links_all, '')                                       AS links_all,      -- тільки URL-и, кожен з нового рядка
   (CASE WHEN of.owner_username <> '' THEN '@' || of.owner_username ELSE '' END) ||
-  (CASE WHEN of.owner_display <> '' THEN (CASE WHEN of.owner_username <> '' THEN ' / ' ELSE '' END) || of.owner_display ELSE '' END)
+  (CASE WHEN of.owner_username <> '' THEN (CASE WHEN of.owner_username <> '' THEN ' / ' ELSE '' END) || of.owner_username ELSE '' END)
                                                                    AS admin_text,
   COALESCE(cno.names, cnd.names, '')                               AS duplicates_names, -- лише display name'и (без '@'), кожен з нового рядка
   ''                                                               AS notes,

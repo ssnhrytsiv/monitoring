@@ -2,11 +2,12 @@ from typing import List, Any, Dict, Optional, Tuple
 import logging
 
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, InlineKeyboardButton
+from aiogram.types import CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 
-from app.watch_bot.keyboards import main_menu_kb
+from app.watch_bot.keyboards import main_menu_kb, build_pager_row, back_button
+from app.watch_bot.keyboards_watch import active_status_picker_keyboard
 from app.watch_bot.services.templates_repo import load_templates_map
 from app.watch_bot.services.channels_repo import get_owners_by_channel_ids
 from app.DAL.watch_posts_operations import list_active_watches, group_active
@@ -106,20 +107,14 @@ async def menu_list_active(cb: CallbackQuery, status_key: Optional[str] = None, 
         page = page_parsed or 1
     preset = STATUS_PRESETS.get(status_key or "", None)
     if not preset:
-        kb = InlineKeyboardBuilder()
-        kb.button(text="Активні", callback_data="menu:list_active:pending")
-        kb.button(text="Відслідковуються перегляди", callback_data="menu:list_active:matched")
-        kb.button(text="Вийшли з терміну", callback_data="menu:list_active:expired")
-        kb.adjust(1)
-        kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data="menu:home"))
         text = (
             "Виберіть, котрий тип вотчу ви хочете бачити, "
             "активні чи ті що вийшли з терміну"
         )
         try:
-            await cb.message.edit_text(text, reply_markup=kb.as_markup())
+            await cb.message.edit_text(text, reply_markup=active_status_picker_keyboard())
         except TelegramBadRequest:
-            await cb.message.answer(text, reply_markup=kb.as_markup())
+            await cb.message.answer(text, reply_markup=active_status_picker_keyboard())
         return
 
     templates_map = load_templates_map()
@@ -197,7 +192,8 @@ async def menu_list_active(cb: CallbackQuery, status_key: Optional[str] = None, 
         tw_txt = _fmt_tw_end(tw_end_s)
         chans_n = len(items)
 
-        owners_map: Dict[int, str] = get_owners_by_channel_ids(cids)
+        owners_list = get_owners_by_channel_ids(cids)
+        owners_map: Dict[int, str] = {o.channel_id: (o.owner_label or "") for o in owners_list if o.owner_label}
         owners: List[str] = []
         seen = set()
         for cid in cids:
@@ -228,19 +224,13 @@ async def menu_list_active(cb: CallbackQuery, status_key: Optional[str] = None, 
     kb.adjust(3)
 
     # навігація
-    nav_row = []
-    if page > 1:
-        nav_row.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"menu:list_active:{status_key}:{page-1}"))
-    else:
-        nav_row.append(InlineKeyboardButton(text=" ", callback_data="watch:noop"))
-    nav_row.append(InlineKeyboardButton(text=f"Page {page}/{total_pages}", callback_data="watch:noop"))
-    if page < total_pages:
-        nav_row.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"menu:list_active:{status_key}:{page+1}"))
-    else:
-        nav_row.append(InlineKeyboardButton(text=" ", callback_data="watch:noop"))
-    kb.row(*nav_row)
+    if total_pages > 1:
+        prev_cb = f"menu:list_active:{status_key}:{page-1}" if page > 1 else None
+        next_cb = f"menu:list_active:{status_key}:{page+1}" if page < total_pages else None
+        nav_row = build_pager_row(page, total_pages, prev_cb, next_cb, noop_cb="watch:noop")
+        kb.row(*nav_row)
 
-    kb.row(InlineKeyboardButton(text="⬅️ Back", callback_data="menu:list_active"))
+    kb.row(back_button(callback_data="menu:list_active"))
 
     text = (
         f"{preset['title']} — № | Template | Channels | Owner | Window\n\n"

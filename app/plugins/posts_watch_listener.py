@@ -5,7 +5,6 @@ import logging
 import os
 from datetime import datetime, timedelta
 from typing import Callable, Optional, Dict, Any
-import re
 from difflib import SequenceMatcher
 import json
 
@@ -14,20 +13,26 @@ from sqlalchemy import update
 from telethon import events
 from telethon.tl.types import Message
 
-from app.telethon_client import client as MAIN_CLIENT
 from app.logging_json import get_logger
 from app.DAL import watch_posts_operations as watch_posts_db
 from app.DAL import watch_events_operations as watch_events_db
 from app.DAL import watch_processing_operations as watch_proc_db
 from app.DAL import watch_candidates_operations as watch_candidates_db
+from app.DAL import session_scope
 from app.services.html_match import exact_html_equal
+from app.services.html_render import render_html
 from app.services.account_pool import iter_pool_clients, session_name
 from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now
-from app.services.post_matcher import normalize_text, extract_links_norm
-from app.admin_bot.db import models as m
-from app.admin_bot.db.session import SessionLocal
+from app.utils.link_parser import extract_links_from_html
+from app.db import models as m
 from app import config
-import html as _html_mod
+from app.utils.html_normalize import (
+    normalize_html_full,
+    normalize_html_for_edit,
+    strip_tags_to_text,
+    strip_simple_tags,
+    normalize_html_links,
+)
 
 try:
     from app.DAL.post_templates_operations import list_templates_full
@@ -57,6 +62,20 @@ NEAR_IDENTICAL_TEXT_THRESHOLD = 0.99
 GROUP_NEAR_IDENTICAL_THRESHOLD = 0.95
 # Редагування: дрібні відмінності не вважаємо суттєвими, якщо ratio майже 1.0
 EDIT_NEAR_THRESHOLD = 0.99
+
+
+def _short_diff(a: str | None, b: str | None, context: int = 40) -> str:
+    """
+    Повертає короткий опис першої відмінності між рядками (для дебагу).
+    """
+    if not a or not b:
+        return "one is empty"
+    sm = SequenceMatcher(None, a, b)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        return f"{tag}: exp[{i1}:{i2}]=`{a[i1:i2][:context]}` vs msg[{j1}:{j2}]=`{b[j1:j2][:context]}`"
+    return "equal"
 
 
 def _now_monotonic() -> float:
@@ -92,59 +111,34 @@ def _calc_coverage_at(hours_after: float | None = None) -> Optional[str]:
     return _human(now_msq + timedelta(hours=hrs))
 
 
-_HTML_RENDER: Optional[Callable[[Message], str]] = None
-_HTML_RENDER_SRC = None
-
-
-def _init_html_renderer():
-    global _HTML_RENDER, _HTML_RENDER_SRC
+def _render_message_html(msg: Message) -> str:
+    """
+    Єдиний спосіб побудови HTML з повідомлення: через наш render_html з app.services.html_render.
+    Якщо щось пішло не так, повертаємо екранований plain-text.
+    """
     try:
-        from app.plugins.post_templates import _extract_message_html as _rh  # type: ignore
-        _HTML_RENDER = _rh
-        _HTML_RENDER_SRC = "app.plugins.post_templates._extract_message_html"
-        return
+        return render_html(msg)
     except Exception:
-        pass
-    try:
-        from app.services.html_render import render_html as _rh  # type: ignore
-        _HTML_RENDER = _rh
-        _HTML_RENDER_SRC = "app.services.html_render.render_html"
-        return
-    except Exception:
-        pass
-    for mod, attr in [
-        ("app.services.post_match", "render_html"),
-        ("app.services.post_matcher", "render_html"),
-        ("app.services.post_match", "message_to_html"),
-        ("app.services.html_match", "message_to_html"),
-    ]:
-        try:
-            _HTML_RENDER = getattr(__import__(mod, fromlist=[attr]), attr)  # type: ignore
-            _HTML_RENDER_SRC = f"{mod}.{attr}"
-            return
-        except Exception:
-            pass
-
-    def _fallback_render(m: Message) -> str:
-        txt = getattr(m, "message", "") or ""
+        txt = getattr(msg, "message", "") or ""
         return txt.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    _HTML_RENDER = _fallback_render
-    _HTML_RENDER_SRC = "fallback_plaintext_no_br"
 
-
-_init_html_renderer()
+_HTML_RENDER: Callable[[Message], str] = _render_message_html
+_HTML_RENDER_SRC = "app.services.html_render.render_html"
 
 
 def _db_get_watch_core(wid: int) -> Optional[Dict[str, Any]]:
     try:
-        info = watch_posts_db.get_watch_info(wid)
+        with session_scope() as db:
+            info = watch_posts_db.get_watch_info_db(db, wid)
         if not info:
             return None
+        expected_raw = info.get("expected_text_hash") or ""
+        expected_norm = normalize_html_full(expected_raw) if expected_raw else ""
         return {
             "channel_id": int(info["channel_id"]),
             "template_id": int(info["template_id"]) if info.get("template_id") is not None else None,
-            "expected_text_hash": info.get("expected_text_hash"),
+            "expected_text_hash": expected_norm,
             "expected_links_json": info.get("expected_links_json"),
             "time_window_start": info.get("time_window_start"),
             "time_window_end": info.get("time_window_end"),
@@ -156,180 +150,24 @@ def _db_get_watch_core(wid: int) -> Optional[Dict[str, Any]]:
 
 # --- HTML normalization ------------------------------------------------------
 
-_A_TAG_RE = re.compile(r'<a\s+href=(?P<q1>"|\')(?P<href>.+?)(?P=q1)>(?P<body>.*?)</a>', re.DOTALL | re.IGNORECASE)
-
 
 def _strip_simple_tags(html_fragment: str) -> str:
-    """
-    Видаляє прості теги форматування (<b>, <u>, <i>, <strong>, <em>) з фрагмента,
-    залишаючи тільки текст усередині.
-    """
-    # прибираємо відкриваючі/закриваючі теги b/u/i/strong/em (без атрибутів)
-    return re.sub(r'</?(?:b|u|i|strong|em)>', '', html_fragment, flags=re.IGNORECASE)
-
-def _collect_links_from_html(text: str) -> list[str]:
-    """
-    Витягує унікальні посилання: href з HTML + голі URL із очищеного тексту.
-    """
-    links: list[str] = []
-    seen = set()
-    if not text:
-        return links
-
-    def _clean(u: str) -> str:
-        u = _html_mod.unescape(u or "").strip()
-        u = u.strip(" '\"<>")
-        return u
-
-    for m in re.findall(r'href\s*=\s*(?:"|\')([^"\']+)(?:"|\')', text, flags=re.IGNORECASE):
-        u = _clean(m)
-        if u and u not in seen:
-            seen.add(u)
-            links.append(u)
-
-    plain = re.sub(r"<[^>]+>", " ", _html_mod.unescape(text))
-    try:
-        for u in extract_links_norm(normalize_text(plain)):
-            u = _clean(u)
-            if u and u not in seen:
-                seen.add(u)
-                links.append(u)
-    except Exception:
-        pass
-
-    return links
-
+    return strip_simple_tags(html_fragment)
 
 def _normalize_html_full(html_text: str) -> str:
-    """
-    Розширена нормалізація HTML для вотчів:
-      - застосовує _normalize_html_links (розкриває <a>, приводить &amp; -> &);
-      - декодує HTML-ентіті (&quot; -> ", &nbsp; -> пробіл, ...);
-      - прибирає службові символи/zero-width/variation selectors;
-      - конвертує <br>/<p> у переводи рядків;
-      - трохи чистить пробіли/переводи рядків.
-
-    Це якраз фіксить кейси типу:
-      <i>&quot;Бывший коллега</i> ...
-      <i>"Бывший коллега</i> ...
-    щоб вони вважалися однаковими.
-    """
-    if not html_text:
-        return ""
-
-    # 0) нормалізуємо переводи рядків
-    html_text = html_text.replace("\r\n", "\n")
-
-    # 1) твоя існуюча нормалізація лінків
-    s = _normalize_html_links(html_text)
-
-    # 2) декодуємо HTML-ентіті (&quot; -> ", &nbsp; -> пробіл, &amp; -> &, ...)
-    s = _html_mod.unescape(s)
-
-    # 2.1) ігноруємо службовий хештег #реклама (будь-який регістр, з/без лінка)
-    s = re.sub(r"<a[^>]*>\s*#\s*реклама\s*</a>", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"#\s*реклама\b", "", s, flags=re.IGNORECASE)
-
-    # 3) перетворюємо <br>/<p> у переводи рядків, щоб зрівняти рендери
-    s = re.sub(r"<\s*br\s*/?>", "\n", s, flags=re.IGNORECASE)
-    s = re.sub(r"</\s*p\s*>", "\n", s, flags=re.IGNORECASE)
-    s = re.sub(r"<\s*p\s*>", "", s, flags=re.IGNORECASE)
-
-    # 4) прибираємо невидимі/службові символи (zero-width, variation selectors, BOM)
-    s = re.sub(r"[\u200b\u200c\u200d\uFEFF\uFE0F]", "", s)
-
-    # 5) &nbsp; → пробіл (ще раз, якщо лишилось після unescape)
-    s = s.replace("\xa0", " ")
-
-    # 6) легка нормалізація пробілів/переводів рядків
-    s = re.sub(r"[ \t]{2,}", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    s = s.strip()
-
-    return s
+    return normalize_html_full(html_text)
 
 
 def _normalize_html_for_edit(html_text: str) -> str:
-    """
-    Нормалізація для порівняння редагувань: мінімально прибираємо шум,
-    але НЕ стискаємо пробіли/переноси, щоб будь-яка правка (навіть пробіл) фіксувалася.
-    """
-    if not html_text:
-        return ""
-
-    s = html_text.replace("\r\n", "\n")
-    s = _normalize_html_links(s)
-    s = _html_mod.unescape(s)
-    s = re.sub(r"<a[^>]*>\s*#\s*реклама\s*</a>", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"#\s*реклама\b", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"<\s*br\s*/?>", "\n", s, flags=re.IGNORECASE)
-    s = re.sub(r"</\s*p\s*>", "\n", s, flags=re.IGNORECASE)
-    s = re.sub(r"<\s*p\s*>", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"[\u200b\u200c\u200d\uFEFF\uFE0F]", "", s)
-    s = s.replace("\xa0", " ")
-    # спеціально не стискаємо пробіли/переноси
-    return s
+    return normalize_html_for_edit(html_text)
 
 
 def _strip_tags_to_text(html_text: str) -> str:
-    """
-    Грубо прибирає теги і декодує HTML-ентіті, щоб порівняти лише текст.
-    """
-    try:
-        txt = re.sub(r"<[^>]+>", " ", html_text)
-        txt = _html_mod.unescape(txt)
-        return re.sub(r"\s+", " ", txt).strip()
-    except Exception:
-        return html_text
+    return strip_tags_to_text(html_text)
 
 
 def _normalize_html_links(html: str) -> str:
-    """
-    Нормалізує HTML так, щоб такі варіанти вважалися однаковими:
-
-      X
-      <u>X</u>
-      <b><u>X</u></b>
-      <a href="X">X</a>
-      <a href="X"><u>X</u></a>
-      <a href="X"><b><u>X</u></b></a>
-      та подібні комбінації форматування навколо X.
-
-    Якщо весь текст усередині <a> після видалення простих тегів дорівнює href,
-    ми розкриваємо <a> і залишаємо лише його тіло (з форматуванням).
-    """
-    if not html:
-        return html
-
-    def _replace_a(m: re.Match) -> str:
-        href = m.group("href")
-        body = m.group("body")
-
-        # Текст усередині <a> без b/u/i/strong/em
-        inner_plain = _strip_simple_tags(body)
-        # Також прибираємо зайві пробіли
-        inner_plain_stripped = inner_plain.strip()
-        href_stripped = href.strip()
-
-        if inner_plain_stripped == href_stripped:
-            # href і (розформатований) текст однакові → прибираємо сам <a>,
-            # але зберігаємо внутрішні теги форматування (<b>, <u>, ...)
-            return body
-        else:
-            # інакше залишаємо <a> як є
-            return m.group(0)
-
-    # 1) Нормалізація <a href="X">...</a>, де ... по суті X з простим форматуванням
-    html = _A_TAG_RE.sub(_replace_a, html)
-
-    # 2) &amp; → &
-    html = html.replace("&amp;", "&")
-
-    # 3) Прибрати зайві пробіли навколо <a> (якщо ще лишилися)
-    html = re.sub(r">\s+([^<])", r">\1", html)  # <a ...>  X -> <a ...>X
-    html = re.sub(r"([^>])\s+</a>", r"\1</a>", html)  # X  </a> -> X</a>
-
-    return html
+    return normalize_html_links(html)
 
 
 # --- Workers -----------------------------------------------------------------
@@ -350,7 +188,8 @@ async def _views_worker():
             pool_map = {session_name(s.client): s.client for s in slots}
             any_cli = next(iter(pool_map.values()))
 
-            due = watch_proc_db.list_due_coverage()
+            with session_scope() as db:
+                due = watch_proc_db.list_due_coverage_db(db)
             for watch_id, channel_id, msg_id, matched_session in due:
                 cli = pool_map.get(matched_session) if matched_session else None
                 if cli is None:
@@ -390,20 +229,22 @@ async def _views_worker():
                     # якщо не змогли отримати entity — вважаємо покритим, щоб не зациклитись
                     if msg is None:
                         try:
-                            watch_proc_db.mark_done_views(watch_id, 0)
-                            watch_events_db.insert_watch_event(
-                                watch_id,
-                                "views",
-                                json.dumps(
-                                    {
-                                        "watch_id": watch_id,
-                                        "channel_id": channel_id,
-                                        "message_id": msg_id,
-                                        "views": 0,
-                                        "status": "entity_miss",
-                                    }
-                                ),
-                            )
+                            with session_scope() as db:
+                                watch_proc_db.mark_done_views_db(db, watch_id, 0)
+                                watch_events_db.insert_watch_event(
+                                    db,
+                                    watch_id,
+                                    "views",
+                                    json.dumps(
+                                        {
+                                            "watch_id": watch_id,
+                                            "channel_id": channel_id,
+                                            "message_id": msg_id,
+                                            "views": 0,
+                                            "status": "entity_miss",
+                                        }
+                                    ),
+                                )
                         except Exception:
                             _pylog.exception("views: mark_done_views failed (wid=%s) after entity miss", watch_id)
                         msg = None
@@ -413,19 +254,21 @@ async def _views_worker():
 
                 views = int(getattr(msg, "views", 0) or 0)
                 try:
-                    watch_proc_db.mark_done_views(watch_id, views)
-                    watch_events_db.insert_watch_event(
-                        watch_id,
-                        "views",
-                        json.dumps(
-                            {
-                                "watch_id": watch_id,
-                                "channel_id": channel_id,
-                                "message_id": msg_id,
-                                "views": views,
-                            }
-                        ),
-                    )
+                    with session_scope() as db:
+                        watch_proc_db.mark_done_views_db(db, watch_id, views)
+                        watch_events_db.insert_watch_event(
+                            db,
+                            watch_id,
+                            "views",
+                            json.dumps(
+                                {
+                                    "watch_id": watch_id,
+                                    "channel_id": channel_id,
+                                    "message_id": msg_id,
+                                    "views": views,
+                                }
+                            ),
+                        )
                     log.info("views: wid=%s views=%s -> done", watch_id, views)
                 except Exception:
                     _pylog.exception("views: mark_done_views failed (wid=%s)", watch_id)
@@ -449,16 +292,19 @@ async def _pending_expire_worker():
     log.info("posts_watch_listener: pending-expire worker started (tick=%ss)", COVERAGE_POLL_TICK_SEC)
     while True:
         try:
-            due_ids = watch_proc_db.list_due_pending_expire()
+            with session_scope() as db:
+                due_ids = watch_proc_db.list_due_pending_expire_db(db)
             for wid in due_ids:
                 try:
-                    watch_proc_db.mark_expired(wid)
-                    watch_events_db.insert_watch_event(
-                        wid,
-                        "expired",
-                        json.dumps({"watch_id": wid}),
-                    )
-                    log.info("expire: wid=%s -> expired", wid)
+                    with session_scope() as db:
+                        watch_proc_db.mark_expired_db(db, wid)
+                        watch_events_db.insert_watch_event(
+                            db,
+                            wid,
+                            "expired",
+                            json.dumps({"watch_id": wid}),
+                        )
+                        log.info("expire: wid=%s -> expired", wid)
                 except Exception:
                     _pylog.exception("expire: mark_expired failed (wid=%s)", wid)
 
@@ -480,8 +326,7 @@ async def _pending_expire_worker():
 def _mark_done_edited_other(wid: int) -> str:
     now_str = _human(moscow_now())
     try:
-        db = SessionLocal()
-        try:
+        with session_scope() as db:
             db.execute(
                 update(m.WatchPost)
                 .where(
@@ -490,17 +335,8 @@ def _mark_done_edited_other(wid: int) -> str:
                 )
                 .values(status="edited", updated_at=now_str)
             )
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
     except Exception:
         _pylog.exception("mark edited-other failed (wid=%s)", wid)
-    finally:
-        try:
-            db.close()
-        except Exception:
-            pass
     return now_str
 
 
@@ -533,7 +369,8 @@ def _attach_listener_for_client(tag: str, cli) -> None:
         #_pylog.info("listen: NEW_MESSAGE cid=%s mid=%s session=%s", cid, mid, tag)
 
         try:
-            pending = watch_proc_db.get_pending_by_channel(cid)
+            with session_scope() as db:
+                pending = watch_proc_db.get_pending_by_channel_db(db, cid)
         except Exception:
             _pylog.exception("listen: get_pending_by_channel failed (cid=%s)", cid)
             return
@@ -544,18 +381,15 @@ def _attach_listener_for_client(tag: str, cli) -> None:
         _pylog.info("listen: found %s pending watches for cid=%s mid=%s sess=%s", len(pending), cid, mid, tag)
 
         try:
-            msg_html = _HTML_RENDER(m) if _HTML_RENDER else (getattr(m, "message", "") or "")
+            msg_html = _HTML_RENDER(m)
         except Exception:
             _pylog.exception("listen: HTML render failed (cid=%s mid=%s)", cid, mid)
             msg_html = (getattr(m, "message", "") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-        matched_any = False
 
         for row in pending:
             wid = int(row["id"])
             expected_html = row.get("expected_text_hash")
             expected_links_json = row.get("expected_links_json")
-            group_id = row.get("group_id")
             if not expected_html:
                 _pylog.warning("listen: wid=%s cid=%s mid=%s has no expected_html, skip", wid, cid, mid)
                 continue
@@ -575,9 +409,10 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             ratio_text = 0.0
 
             try:
-                # Строга нормалізація: мінімальні правки (пробіл/перенос) не ігноруються.
-                msg_html_norm = _normalize_html_for_edit(msg_html)
-                expected_html_norm = _normalize_html_for_edit(expected_html)
+                # Використовуємо той самий нормалізатор, що й при записі шаблону,
+                # щоб HTML-представлення були ідентичними на етапі match.
+                msg_html_norm = _normalize_html_full(msg_html)
+                expected_html_norm = _normalize_html_full(expected_html)
                 ok = exact_html_equal(msg_html_norm, expected_html_norm)
             except Exception:
                 _pylog.exception("listen: exact_html_equal failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
@@ -604,11 +439,11 @@ def _attach_listener_for_client(tag: str, cli) -> None:
 
             if not ok:
                 try:
-                    exp_links_dbg = _collect_links_from_html(expected_html_norm)
+                    exp_links_dbg = extract_links_from_html(expected_html_norm)
                 except Exception:
                     exp_links_dbg = []
                 try:
-                    msg_links_dbg = _collect_links_from_html(msg_html_norm)
+                    msg_links_dbg = extract_links_from_html(msg_html_norm)
                 except Exception:
                     msg_links_dbg = []
                 try:
@@ -640,10 +475,34 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                     msg_plain = _strip_tags_to_text(msg_html_norm)
                     expected_plain = _strip_tags_to_text(expected_html_norm)
                     ratio_text = SequenceMatcher(None, msg_plain, expected_plain).ratio()
+                    # якщо plain-текст повністю збігається — вважаємо схожість ідеальною
+                    if msg_plain == expected_plain:
+                        ratio_text = 1.0
                 except Exception:
                     ratio_text = 0.0
 
-                if ratio >= CANDIDATE_SIM_THRESHOLD or ratio_text >= CANDIDATE_SIM_THRESHOLD:
+                combined_ratio = max(ratio, ratio_text)
+
+                if combined_ratio < 0.99:
+                    _pylog.debug(
+                        "diff_html wid=%s cid=%s mid=%s ratio=%.3f ratio_text=%.3f %s",
+                        wid,
+                        cid,
+                        mid,
+                        ratio,
+                        ratio_text,
+                        _short_diff(expected_html_norm, msg_html_norm),
+                    )
+                    if ratio_text < 1.0:
+                        _pylog.debug(
+                            "diff_plain wid=%s cid=%s mid=%s %s",
+                            wid,
+                            cid,
+                            mid,
+                            _short_diff(expected_plain, msg_plain),
+                        )
+
+                if combined_ratio >= CANDIDATE_SIM_THRESHOLD:
                     _pylog.debug(
                         "listen: fuzzy_candidate wid=%s cid=%s mid=%s ratio=%.3f ratio_text=%.3f",
                         wid,
@@ -653,7 +512,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                         ratio_text,
                     )
                     # якщо лінки не збігаються — відправляємо у foreign
-                    exp_links = _collect_links_from_html(expected_html_norm)
+                    exp_links = extract_links_from_html(expected_html_norm)
                     if not exp_links and expected_links_json:
                         try:
                             data = json.loads(expected_links_json)
@@ -661,7 +520,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                                 exp_links = [str(x) for x in data if x]
                         except Exception:
                             pass
-                    cand_links = _collect_links_from_html(msg_html_norm)
+                    cand_links = extract_links_from_html(msg_html_norm)
 
                     links_mismatch = False
                     if exp_links and cand_links and sorted(exp_links) != sorted(cand_links):
@@ -687,7 +546,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                                 watch_id=wid,
                                 channel_id=cid,
                                 message_id=mid,
-                                similarity=ratio,
+                                similarity=combined_ratio,
                                 message_text=msg_html,
                                 text_hash="",
                                 ttl_days=1.0,
@@ -702,16 +561,69 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                                             "watch_id": wid,
                                             "channel_id": cid,
                                             "message_id": mid,
-                                            "similarity": ratio,
+                                            "similarity": combined_ratio,
                                             "reason": "links_mismatch",
                                         }
                                     ),
                                 )
                             except Exception:
-                                _pylog.exception("similar: insert foreign event failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
-                            log.info("similar: wid=%s cid=%s mid=%s ratio=%.3f -> foreign (links mismatch)", wid, cid, mid, ratio)
+                                _pylog.exception(
+                                    "similar: insert foreign event failed (wid=%s cid=%s mid=%s)", wid, cid, mid
+                                )
+                            log.info(
+                                "similar: wid=%s cid=%s mid=%s ratio=%.3f -> foreign (links mismatch)",
+                                wid,
+                                cid,
+                                mid,
+                                combined_ratio,
+                            )
                         except Exception:
-                            _pylog.exception("similar: insert foreign candidate failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
+                            _pylog.exception(
+                                "similar: insert foreign candidate failed (wid=%s cid=%s mid=%s)", wid, cid, mid
+                            )
+                        continue
+
+                    text_close_enough = ratio_text >= NEAR_IDENTICAL_TEXT_THRESHOLD
+                    html_close_enough = ratio >= NEAR_IDENTICAL_TEXT_THRESHOLD
+
+                    # Вважаємо matched лише якщо збігається і HTML, і plain (форматування не втрачено)
+                    if html_close_enough and text_close_enough:
+                        coverage_at = _calc_coverage_at()
+                        matched_session = tag
+                        matched_ok = True
+                        try:
+                            with session_scope() as db:
+                                watch_proc_db.mark_matched_db(
+                                    db, wid, mid, coverage_at, matched_session=matched_session
+                                )
+                            watch_events_db.insert_watch_event(
+                                wid,
+                                "matched",
+                                json.dumps(
+                                    {
+                                        "watch_id": wid,
+                                        "channel_id": cid,
+                                        "message_id": mid,
+                                        "session": matched_session,
+                                    }
+                                ),
+                            )
+                        except Exception:
+                            matched_ok = False
+
+                        if matched_ok and SHEETS_OK and gsheets_buffer:
+                            try:
+                                gsheets_buffer.record_matched(wid)
+                            except Exception:
+                                _pylog.exception("gsheets_buffer.record_matched failed (wid=%s)", wid)
+                        log.info(
+                            "matched (html+text): wid=%s cid=%s mid=%s ratio=%.3f ratio_text=%.3f",
+                            wid,
+                            cid,
+                            mid,
+                            ratio,
+                            ratio_text,
+                        )
                         continue
 
                     text_hash_input = msg_plain or msg_html_norm
@@ -723,18 +635,20 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                         _GLOBAL_CANDIDATE_SEEN[key] = now_m
 
                         try:
-                            watch_proc_db.insert_watch_candidate(
-                                watch_id=wid,
-                                channel_id=cid,
-                                message_id=mid,
-                                similarity=ratio,
-                                message_text=msg_html,
-                                text_hash=text_hash,
-                                ttl_days=1.0,
-                                status=watch_candidates_db.CANDIDATE_PENDING_STATUS,
-                            )
-                            try:
+                            with session_scope() as db:
+                                watch_proc_db.insert_watch_candidate_db(
+                                    db,
+                                    watch_id=wid,
+                                    channel_id=cid,
+                                    message_id=mid,
+                                    similarity=combined_ratio,
+                                    message_text=msg_html,
+                                    text_hash=text_hash,
+                                    ttl_days=1.0,
+                                    status=watch_candidates_db.CANDIDATE_PENDING_STATUS,
+                                )
                                 watch_events_db.insert_watch_event(
+                                    db,
                                     wid,
                                     "candidate",
                                     json.dumps(
@@ -742,14 +656,12 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                                             "watch_id": wid,
                                             "channel_id": cid,
                                             "message_id": mid,
-                                            "similarity": ratio,
+                                            "similarity": combined_ratio,
                                             "text_hash": text_hash,
                                         }
                                     ),
                                 )
-                            except Exception:
-                                _pylog.exception("similar: insert candidate event failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
-                            log.info("similar: wid=%s cid=%s mid=%s ratio=%.3f -> candidate", wid, cid, mid, ratio)
+                            log.info("similar: wid=%s cid=%s mid=%s ratio=%.3f -> candidate", wid, cid, mid, combined_ratio)
                         except Exception:
                             _pylog.exception("similar: insert_watch_candidate failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                 else:
@@ -769,7 +681,8 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             matched_session = tag
             matched_ok = True
             try:
-                watch_proc_db.mark_matched(wid, mid, coverage_at, matched_session=matched_session)
+                with session_scope() as db:
+                    watch_proc_db.mark_matched_db(db, wid, mid, coverage_at, matched_session=matched_session)
                 watch_events_db.insert_watch_event(
                     wid,
                     "matched",
@@ -785,13 +698,11 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             except Exception:
                 matched_ok = False
 
-            if matched_ok:
-                matched_any = True
-                if SHEETS_OK and gsheets_buffer:
-                    try:
-                        gsheets_buffer.record_matched(wid)
-                    except Exception:
-                        _pylog.exception("gsheets_buffer.record_matched failed (wid=%s)", wid)
+            if matched_ok and SHEETS_OK and gsheets_buffer:
+                try:
+                    gsheets_buffer.record_matched(wid)
+                except Exception:
+                    _pylog.exception("gsheets_buffer.record_matched failed (wid=%s)", wid)
 
     @cli.on(events.MessageEdited())
     async def _on_edited(ev: events.MessageEdited.Event):
@@ -814,17 +725,19 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             return
 
         try:
-            wids = watch_proc_db.find_matched_by_message(cid, mid)
+            with session_scope() as db:
+                wids = watch_proc_db.find_matched_by_message_db(db, cid, mid)
         except Exception:
             _pylog.exception("edited: find_matched_by_message failed (cid=%s mid=%s)", cid, mid)
             return
 
-        candidate_entries: list[Dict[str, Any]] = []
+        candidate_entries: list[Any] = []
         if not wids:
             try:
-                candidate_entries = watch_candidates_db.find_candidates_by_channel_message(
-                    cid, mid, status=watch_candidates_db.CANDIDATE_PENDING_STATUS
-                )
+                with session_scope() as db:
+                    candidate_entries = watch_candidates_db.find_candidates_by_channel_message(
+                        db, cid, mid, status=watch_candidates_db.CANDIDATE_PENDING_STATUS
+                    )
             except Exception:
                 _pylog.exception("edited: find_candidates_by_channel_message failed (cid=%s mid=%s)", cid, mid)
                 candidate_entries = []
@@ -832,12 +745,12 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 return
 
         try:
-            msg_html = _HTML_RENDER(m) if _HTML_RENDER else (getattr(m, "message", "") or "")
+            msg_html = _HTML_RENDER(m)
         except Exception:
             _pylog.exception("edited: HTML render failed (cid=%s mid=%s)", cid, mid)
             msg_html = (getattr(m, "message", "") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-        target_wids = wids if wids else [int(c.get("watch_id")) for c in candidate_entries if c.get("watch_id")]
+        target_wids = wids if wids else [int(c.watch_id) for c in candidate_entries if c.watch_id]
 
         for wid in target_wids:
             wc = _db_get_watch_core(int(wid))
@@ -856,8 +769,8 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 links_same = True
                 if not ok:
                     try:
-                        exp_links = sorted(_collect_links_from_html(expected_html_norm))
-                        msg_links = sorted(_collect_links_from_html(msg_html_norm))
+                        exp_links = sorted(extract_links_from_html(expected_html_norm))
+                        msg_links = sorted(extract_links_from_html(msg_html_norm))
                         links_same = exp_links == msg_links
                     except Exception:
                         links_same = True
@@ -916,7 +829,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
 
             if wid not in wids and candidate_entries:
                 for c in candidate_entries:
-                    if int(c.get("watch_id") or 0) != int(wid):
+                    if int(c.watch_id or 0) != int(wid):
                         continue
                     try:
                         msg_plain = _strip_tags_to_text(msg_html_norm)
@@ -925,15 +838,17 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                     except Exception:
                         sim_val = 0.0
                     try:
-                        watch_candidates_db.merge_watch_candidate(
-                            int(c.get("id")),
-                            mid,
-                            watch_proc_db.calc_text_hash(msg_html_norm),
-                            sim_val,
-                            msg_html_norm,
-                        )
+                        with session_scope() as db:
+                            watch_candidates_db.merge_watch_candidate(
+                                db,
+                                int(c.id),
+                                mid,
+                                watch_proc_db.calc_text_hash(msg_html_norm),
+                                sim_val,
+                                msg_html_norm,
+                            )
                     except Exception:
-                        _pylog.exception("edited: merge_watch_candidate failed (cid=%s mid=%s cand_id=%s)", cid, mid, c.get("id"))
+                        _pylog.exception("edited: merge_watch_candidate failed (cid=%s mid=%s cand_id=%s)", cid, mid, c.id)
 
             log.info("edited: wid=%s cid=%s mid=%s -> edited_other at=%s", wid, cid, mid, now_str)
 
@@ -969,7 +884,8 @@ def _attach_listener_for_client(tag: str, cli) -> None:
 
         for mid in (ev.deleted_ids or []):
             try:
-                wids = watch_proc_db.find_matched_by_message(cid, int(mid))
+                with session_scope() as db:
+                    wids = watch_proc_db.find_matched_by_message_db(db, cid, int(mid))
             except Exception:
                 _pylog.exception("deleted: DB lookup failed (cid=%s mid=%s)", cid, mid)
                 continue
@@ -986,31 +902,28 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 _GLOBAL_DELETED_SEEN[wid] = now_m
 
                 try:
-                    prev_status = watch_proc_db.mark_done_deleted(wid)
-                except Exception:
-                    _pylog.exception("deleted: mark_done_deleted failed (wid=%s)", wid)
-                    continue
+                    with session_scope() as db:
+                        prev_status = watch_proc_db.mark_done_deleted_db(db, wid)
+                        # Якщо пост уже відстояв перегляди (status=done), не шлемо повторну подію
+                        if prev_status == "done":
+                            log.info("deleted: wid=%s cid=%s mid=%s -> status done, event skipped", wid, cid, mid)
+                            continue
 
-                # Якщо пост уже відстояв перегляди (status=done), не шлемо повторну подію
-                if prev_status == "done":
-                    log.info("deleted: wid=%s cid=%s mid=%s -> status done, event skipped", wid, cid, mid)
-                    continue
-
-                try:
-                    watch_events_db.insert_watch_event(
-                        wid,
-                        "deleted",
-                        json.dumps(
-                            {
-                                "watch_id": wid,
-                                "channel_id": cid,
-                                "message_id": int(mid),
-                            }
-                        ),
-                    )
-                    log.info("deleted: wid=%s cid=%s mid=%s -> deleted", wid, cid, mid)
+                        watch_events_db.insert_watch_event(
+                            db,
+                            wid,
+                            "deleted",
+                            json.dumps(
+                                {
+                                    "watch_id": wid,
+                                    "channel_id": cid,
+                                    "message_id": int(mid),
+                                }
+                            ),
+                        )
+                        log.info("deleted: wid=%s cid=%s mid=%s -> deleted", wid, cid, mid)
                 except Exception:
-                    _pylog.exception("deleted: insert_watch_event failed (wid=%s)", wid)
+                    _pylog.exception("deleted: mark_done_deleted/insert_event failed (wid=%s)", wid)
 
                 if SHEETS_OK and gsheets_buffer:
                     try:
@@ -1023,7 +936,8 @@ def _attach_listener_for_client(tag: str, cli) -> None:
 
 
 def setup(client=None, control_peer=None, monitor_buffer=None, **_):
-    active_channels = set(watch_proc_db.list_active_channels())
+    with session_scope() as db:
+        active_channels = set(watch_proc_db.list_active_channels_db(db))
     log.info("posts_watch_listener: active_channels=%s", len(active_channels))
 
     if SHEETS_OK and gsheets_buffer:
@@ -1056,8 +970,13 @@ def setup(client=None, control_peer=None, monitor_buffer=None, **_):
     log.info("posts_watch_listener: pending-expire worker scheduled")
 
     try:
-        missing = watch_proc_db.list_pending_without_expected(limit=50)
-        if missing:
-            _pylog.warning("health-check: pending watches without expected_html: count=%s sample=%s", len(missing), missing[:10])
+        with session_scope() as db:
+            missing = watch_proc_db.list_pending_without_expected_db(db, limit=50)
+            if missing:
+                _pylog.warning(
+                    "health-check: pending watches without expected_html: count=%s sample=%s",
+                    len(missing),
+                    missing[:10],
+                )
     except Exception:
         _pylog.exception("health-check: list_pending_without_expected failed")

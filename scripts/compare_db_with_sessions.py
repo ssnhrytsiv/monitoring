@@ -19,12 +19,12 @@ import sys
 from typing import Dict, Iterable, List, Set
 
 from telethon import TelegramClient, types
-from sqlalchemy import delete, select
+from sqlalchemy import delete
 
 from app.config import API_HASH, API_ID
 from app.services.account_pool import iter_pool_clients, session_name, start_pool, stop_pool
-from app.admin_bot.db.session import SessionLocal
-from app.admin_bot.db import models as m
+from app.db.session import SessionLocal
+from app.db import models as m
 
 DEFAULT_SESSIONS = [
     "tg_session.session",
@@ -115,15 +115,22 @@ def _report(known: Set[int], per_session: Dict[str, Set[int]]) -> None:
     db = SessionLocal()
     try:
         rows = (
-            db.query(m.Channel.id, m.Channel.title, m.Channel.owner_display, m.Channel.owner_username)
+            db.query(
+                m.Channel.id,
+                m.Channel.title,
+                m.Channel.owner_admin_id,
+                m.Channel.owner_username,
+                m.Admin.display,
+            )
+            .outerjoin(m.Admin, m.Admin.id == m.Channel.owner_admin_id)
             .filter(m.Channel.id.in_(missing))
             .all()
         )
     finally:
         db.close()
     print("Details (cid, title, owner):")
-    for cid, title, od, ou in rows:
-        owner = od or (f"@{ou}" if ou else "—")
+    for cid, title, owner_admin_id, ou, adm_display in rows:
+        owner = adm_display or (f"@{ou}" if ou else (f"id={owner_admin_id}" if owner_admin_id else "—"))
         print(f"  {cid}: {title or '—'} (owner: {owner})")
 
     # Видалення з БД, якщо не DRY_RUN
@@ -144,12 +151,6 @@ def _purge_channels(missing_ids: List[int]) -> None:
 
     db = SessionLocal()
     try:
-        hashes = list(
-            db.execute(
-                select(m.InviteMap.invite_hash).where(m.InviteMap.channel_id.in_(missing_ids))
-            ).scalars().all()
-        )
-
         counts = {}
         counts["admin_channels"] = db.execute(
             delete(m.AdminChannel).where(m.AdminChannel.channel_id.in_(missing_ids))
@@ -160,13 +161,8 @@ def _purge_channels(missing_ids: List[int]) -> None:
         counts["membership"] = db.execute(
             delete(m.Membership).where(m.Membership.channel_id.in_(missing_ids))
         ).rowcount or 0
-        counts["invite_status"] = (
-            db.execute(delete(m.InviteStatus).where(m.InviteStatus.invite_hash.in_(hashes))).rowcount or 0
-            if hashes
-            else 0
-        )
-        counts["invite_map"] = db.execute(
-            delete(m.InviteMap).where(m.InviteMap.channel_id.in_(missing_ids))
+        counts["invite_cache"] = db.execute(
+            delete(m.InviteCache).where(m.InviteCache.channel_id.in_(missing_ids))
         ).rowcount or 0
         counts["owner_conflicts"] = db.execute(
             delete(m.OwnerConflict).where(m.OwnerConflict.channel_id.in_(missing_ids))

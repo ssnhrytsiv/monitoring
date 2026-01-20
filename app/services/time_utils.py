@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+# ruff: noqa: E402
+
 """
 Сумісний шар: усі функції роботи з московським часом винесені в app.utils.time_utils.
-Не додавайте нову логіку сюди, використовуйте time_utils як єдиний джерело.
+Не додавайте нову логіку сюди, використовуйте time_utils як єдине джерело.
 """
 
 from app.utils.time_utils import (  # noqa: F401

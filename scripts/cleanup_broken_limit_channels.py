@@ -2,8 +2,8 @@
 """
 Remove "broken" channel rows caused by "You have joined too many channels/supergroups".
 Deletes matching channel_ids from related tables:
-  channels, membership, links, channel_links, admin_channels,
-  network_channels, subscriptions, owner_conflicts, invite_map, invite_status, invite_owners.
+  channels, membership, links, admin_channels,
+  network_channels, owner_conflicts, invite_cache, invite_cache_status, invite_owners.
 
 Usage:
     python scripts/cleanup_broken_limit_channels.py [--db path/to/post_watchdog.sqlite3]
@@ -25,17 +25,15 @@ CREATE TEMP TABLE bad_ids AS
 
 DELETE FROM membership        WHERE channel_id IN (SELECT channel_id FROM bad_ids);
 DELETE FROM links             WHERE channel_id IN (SELECT channel_id FROM bad_ids);
-DELETE FROM channel_links     WHERE channel_id IN (SELECT channel_id FROM bad_ids);
 DELETE FROM admin_channels    WHERE channel_id IN (SELECT channel_id FROM bad_ids);
 DELETE FROM network_channels  WHERE channel_id IN (SELECT channel_id FROM bad_ids);
-DELETE FROM subscriptions     WHERE channel_id IN (SELECT channel_id FROM bad_ids);
 DELETE FROM owner_conflicts   WHERE channel_id IN (SELECT channel_id FROM bad_ids);
--- invite maps (capture hashes before deleting invite_map)
+-- invite maps (capture hashes before deleting invite_cache)
 CREATE TEMP TABLE bad_hashes AS
-    SELECT invite_hash FROM invite_map WHERE channel_id IN (SELECT channel_id FROM bad_ids);
-DELETE FROM invite_status     WHERE invite_hash IN (SELECT invite_hash FROM bad_hashes);
+    SELECT invite_hash FROM invite_cache WHERE channel_id IN (SELECT channel_id FROM bad_ids);
+DELETE FROM invite_cache_status     WHERE invite_hash IN (SELECT invite_hash FROM bad_hashes);
 DELETE FROM invite_owners     WHERE invite_hash IN (SELECT invite_hash FROM bad_hashes);
-DELETE FROM invite_map        WHERE invite_hash IN (SELECT invite_hash FROM bad_hashes);
+DELETE FROM invite_cache        WHERE invite_hash IN (SELECT invite_hash FROM bad_hashes);
 DROP TABLE bad_hashes;
 
 DELETE FROM channels          WHERE channel_id IN (SELECT channel_id FROM bad_ids);

@@ -7,11 +7,12 @@ from datetime import datetime
 
 from app.utils.link_parser import extract_bot_username
 from app.sheet_bot.services import gsheets_writer as gw
-from app.DAL import SessionLocal
 from app.DAL import bot_links_operations as blo
 from app.DAL import sheet_projects_operations as spo
 from app.DAL import watch_posts_operations as watch_posts_db
 from app.DAL import channels_operations as channels_db
+from app.DAL import admins_operations as ao
+from app.DAL import session_scope
 import logging
 from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now
 
@@ -86,7 +87,10 @@ def _mk_key(sheet: str, ssid: Optional[str]) -> Tuple[str, str]:
 
 
 def _db_get_watch_core(wid: int):
-    info = watch_posts_db.get_watch_info(int(wid))
+    from app.DAL import session_scope
+
+    with session_scope() as db:
+        info = watch_posts_db.get_watch_info_db(db, int(wid))
     if not info:
         return None
     return {
@@ -103,7 +107,10 @@ def _db_get_watch_core(wid: int):
 
 def _db_get_channel_title_and_owner(channel_id: int):
     try:
-        return channels_db.get_channel_title_and_owner(int(channel_id))
+        rec = channels_db.get_channel_title_and_owner(int(channel_id))
+        if not rec:
+            return None, None
+        return rec.title, rec.owner_label
     except Exception:
         return None, None
 
@@ -112,35 +119,41 @@ def _resolve_title_and_owner(channel_id: int, source_url: str | None):
     """
     Повертаємо title/owner з таблиці channels або, якщо це бот, з bot_links.
     """
-    ch_title, owner_display = _db_get_channel_title_and_owner(channel_id)
-    if ch_title or owner_display:
-        return ch_title, owner_display
+    ch_title, owner_label = _db_get_channel_title_and_owner(channel_id)
+    if ch_title or owner_label:
+        return ch_title, owner_label
 
     username = extract_bot_username(source_url or "")
     if username:
-        db = SessionLocal()
-        try:
+        with session_scope() as db:
             bot = blo.get_bot_link_by_username(db, username)
             if bot:
-                title = bot.get("title") or username
-                owner = bot.get("owner_display") or bot.get("owner_username")
-                return title, owner
-        finally:
-            db.close()
-    return ch_title, owner_display
+                title = bot.title or username
+                owner_label = None
+                if bot.owner_admin_id:
+                    adm = ao.get_admin_label(db, bot.owner_admin_id)
+                    if adm and adm.display:
+                        owner_label = adm.display
+                    elif adm and adm.username:
+                        owner_label = adm.username
+                if not owner_label:
+                    owner_label = bot.owner_username
+                return title, owner_label
+    return ch_title, owner_label
 
 
 def _db_get_template_title(tid: int | None):
     if not tid:
         return None
     try:
-        conn = raw_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT title FROM post_template WHERE id = ? LIMIT 1", (int(tid),))
-        row = cur.fetchone()
-        if not row:
-            return None
-        return str(row[0]) if row[0] else None
+        with session_scope() as db:
+            conn = db.connection().connection
+            cur = conn.cursor()
+            cur.execute("SELECT title FROM post_template WHERE id = ? LIMIT 1", (int(tid),))
+            row = cur.fetchone()
+            if not row:
+                return None
+            return str(row[0]) if row[0] else None
     except Exception:
         return None
 
@@ -172,8 +185,7 @@ def _select_sheet_for_watch(wc: dict) -> Tuple[Optional[str], Optional[str]]:
     ssid_override = None
     project = wc.get("project")
     if project:
-        db = SessionLocal()
-        try:
+        with session_scope() as db:
             rec = spo.get_active_sheet(db, project)
             if rec and rec.active_spreadsheet_id:
                 ssid_override = rec.active_spreadsheet_id
@@ -182,10 +194,6 @@ def _select_sheet_for_watch(wc: dict) -> Tuple[Optional[str], Optional[str]]:
                     project,
                     ssid_override,
                 )
-        except Exception:
-            ssid_override = None
-        finally:
-            db.close()
     return sheet_title_override, ssid_override
 
 
@@ -195,7 +203,7 @@ def _build_row_for_matched(wid: int) -> Tuple[str, List[str], Optional[str]]:
         date_str = gw.sheet_title_from_time_window_start(None)
         return date_str, [""] * 9, None
     date_str = gw.sheet_title_from_time_window_start(wc.get("time_window_start"))
-    ch_title, owner_display = _resolve_title_and_owner(wc["channel_id"], wc.get("source_url"))
+    ch_title, owner_label = _resolve_title_and_owner(wc["channel_id"], wc.get("source_url"))
     t_title = _db_get_template_title(wc.get("template_id"))
     links_text = _links_text_from_json(wc.get("expected_links_json"))
     posted_at = wc.get("matched_at") or _human(moscow_now())
@@ -210,7 +218,7 @@ def _build_row_for_matched(wid: int) -> Tuple[str, List[str], Optional[str]]:
         "",
         t_title or "",
         links_text,
-        owner_display or "",
+        owner_label or "",
         wid,
     ]
     return sheet_title_override or date_str, row, ssid_override
@@ -222,7 +230,7 @@ def _build_row_for_expired(wid: int) -> Tuple[str, List[str], Optional[str]]:
         date_str = gw.sheet_title_from_time_window_start(None)
         return date_str, [""] * 9, None
     date_str = gw.sheet_title_from_time_window_start(wc.get("time_window_start"))
-    ch_title, owner_display = _resolve_title_and_owner(wc["channel_id"], wc.get("source_url"))
+    ch_title, owner_label = _resolve_title_and_owner(wc["channel_id"], wc.get("source_url"))
     t_title = _db_get_template_title(wc.get("template_id"))
     links_text = _links_text_from_json(wc.get("expected_links_json"))
     source_url = wc.get("source_url") or ""
@@ -235,7 +243,7 @@ def _build_row_for_expired(wid: int) -> Tuple[str, List[str], Optional[str]]:
         "",
         t_title or "",
         links_text,
-        owner_display or "",
+        owner_label or "",
         wid,
     ]
     return sheet_title_override or date_str, row, ssid_override
@@ -247,7 +255,7 @@ def _build_row_for_edited_other(wid: int, when_str: str | None) -> Tuple[str, Li
         date_str = gw.sheet_title_from_time_window_start(None)
         return date_str, [""] * 9, None
     date_str = gw.sheet_title_from_time_window_start(wc.get("time_window_start"))
-    ch_title, owner_display = _resolve_title_and_owner(wc["channel_id"], wc.get("source_url"))
+    ch_title, owner_label = _resolve_title_and_owner(wc["channel_id"], wc.get("source_url"))
     t_title = _db_get_template_title(wc.get("template_id"))
     links_text = _links_text_from_json(wc.get("expected_links_json"))
     source_url = wc.get("source_url") or ""
@@ -260,7 +268,7 @@ def _build_row_for_edited_other(wid: int, when_str: str | None) -> Tuple[str, Li
         "",
         t_title or "",
         links_text,
-        owner_display or "",
+        owner_label or "",
         wid,
     ]
     return sheet_title_override or date_str, row, ssid_override

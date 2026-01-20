@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from aiogram import Router, F
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import CallbackQuery
 
 from app.admin_bot.services import report_cache
 from app.admin_bot.bot.keyboards import main_menu_kb
+from app.admin_bot.services.subscription.keyboards import make_report_keyboard
 
 router = Router()
 
@@ -43,38 +44,6 @@ async def _safe_answer(cb: CallbackQuery, text: str | None = None) -> None:
         if "query is too old" in str(e):
             return
         raise
-
-
-def make_report_kb(
-    page: int,
-    total: int,
-    has_report: bool,
-    extra_rows: list | None = None,
-) -> InlineKeyboardMarkup:
-    """
-    Клавіатура навігації по звіту: стрілки + кнопка повернення в меню.
-    Додатково може містити extra_rows (наприклад, кнопки підтвердження).
-    """
-    buttons = []
-
-    if total > 1:
-        buttons.append(
-            [
-                InlineKeyboardButton(text="⬅️", callback_data="report_page_prev"),
-                InlineKeyboardButton(text=f"{page+1}/{total}", callback_data="report_page_noop"),
-                InlineKeyboardButton(text="➡️", callback_data="report_page_next"),
-            ]
-        )
-
-    if extra_rows:
-        buttons.extend(extra_rows)
-
-    buttons.append(
-        [
-            InlineKeyboardButton(text="В меню", callback_data="report_back_to_menu"),
-        ]
-    )
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 @router.callback_query(F.data == "report_page_noop")
@@ -116,7 +85,7 @@ async def cb_report_page_nav(cb: CallbackQuery) -> None:
     else:
         cur = (cur + 1) % total
     entry["page"] = cur
-    kb = make_report_kb(
+    kb = make_report_keyboard(
         cur,
         total,
         has_report=entry.get("report_idx") is not None,
@@ -134,5 +103,5 @@ async def cb_report_page_nav(cb: CallbackQuery) -> None:
 __all__ = [
     "router",
     "split_text_for_telegram",
-    "make_report_kb",
+    "make_report_keyboard",
 ]

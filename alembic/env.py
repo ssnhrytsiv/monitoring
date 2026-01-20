@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import logging
 from logging.config import fileConfig
-
-import os
 import sys
 from pathlib import Path
 
@@ -17,14 +15,14 @@ if str(BASE_DIR) not in sys.path:
 
 """
 Alembic env configured to use the shared ORM Base.
-We point target_metadata to app.admin_bot.db.models.Base, which now includes
+We point target_metadata to app.db.models.Base, which now includes
 all common tables (channels, links, networks, sheet_projects, etc.) and
 additional service-specific models (InviteCheck, RequestedCheck) via
 app.services.models.
 """
 
-from app.admin_bot.db import models as shared_models
-from app.services import models as service_models
+from app.db import models as shared_models  # noqa: E402
+from app.db.session import engine as shared_engine  # noqa: E402
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -44,11 +42,8 @@ def get_url() -> str:
         from app.admin_bot.config import SQLALCHEMY_DATABASE_URL
         return SQLALCHEMY_DATABASE_URL
     except Exception:
-        # Fallback to service models engine URL if needed
-        try:
-            return service_models.get_engine().url
-        except Exception:
-            raise
+        # Fallback to shared engine URL if available
+        return str(shared_engine.url)
 
 
 def run_migrations_offline() -> None:

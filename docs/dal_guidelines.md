@@ -22,7 +22,7 @@
 ## Заборони / пам’ятки
 - Не використовувати нові `sqlite3.connect` і `_lock` — тільки ORM/SessionLocal.
 - Назви інстансів DAO робити за сутністю (наприклад, `membership_db`, `invite_owner_db`), не generic `dao`.
-- Відкривати `SessionLocal()` один раз на шар обробки (наприклад, у хендлері/воркері) і на цій сесії створювати DAO: `with SessionLocal() as db: membership_db = MembershipDAO(db); channels_db = ChannelsDAO(db); ...`. Не відкривати сесію кожним методом і не використовувати `next(get_db())`, щоб не губити close/commit.
+- Відкривати `SessionLocal()` один раз на шар обробки (наприклад, у хендлері/воркері) і на цій сесії викликати функції DAL напряму: `with SessionLocal() as db: ...`. Не відкривати сесію кожним методом і не використовувати `next(get_db())`, щоб не губити close/commit.
 - Перед додаванням моделі/DAO: перевір `docs/db-schema.md` і `app/DAL/`, щоб не дублювати.
 - Якщо потрібен raw_connection — брати через `SessionLocal().get_bind().raw_connection()`, а не створювати новий engine.
 
@@ -37,10 +37,10 @@
    - Іменувати змінні за сутністю, а не generic `row`: напр. у `set_invite_owner` → `invite_owner`.
    - Дозволено залишати функціональні обгортки `module.method(...)`, але вони мають делегувати в клас DAO і НЕ відкривати нову сесію щоразу — сесію інжектимо зовні.
    - Допускається використовувати `@dataclass` для DAO (поле `db: Session`) як цукор для конструкторів без явного `__init__`.
-   - Після завершення міграцій прибрати локальні обгортки в коді (наприклад, у `joiner`) і прокидати `MembershipDAO`/`db` зверху, викликаючи методи DAO напряму.
+   - Після завершення міграцій прибрати локальні обгортки в коді (наприклад, у `joiner`) і прокидати `db` зверху, викликаючи функції DAL напряму.
 3) Оновити/перегенерувати `docs/PROJECT_MAP.md` після видалення `app/services/channel_db.py`.
 
 ## Нотатки по звітам/сесіях
-- Статуси типу `already/joined` доповнюємо сесією через `MembershipDAO.get_session_by_channel`; якщо статус уже містить `[sess]`, не перетираємо.
+- Статуси типу `already/joined` доповнюємо сесією через `get_any_session_for_channel`; якщо статус уже містить `[sess]`, не перетираємо.
 - `link_queue` має унікальний `url`; `enqueue` оновлює існуючі рядки замість падіння на `IntegrityError`.
 - Якщо не вистачає title/session у звіті — спершу гідрація: `find_channel_by_link`, `map_invite_get`, `get_session_by_channel`.

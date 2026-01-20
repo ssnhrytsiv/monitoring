@@ -6,7 +6,7 @@ DB_PATH = Path("post_watchdog.sqlite3")
 
 CHAT_ID = 300851736
 BATCH_ID = "adminbot:300851736:seed_demo"
-OWNER_DISPLAY = "Евгений"
+OWNER_ADMIN_ID = None
 OWNER_USERNAME = ""
 
 
@@ -22,9 +22,9 @@ def main():
 
     for idx, url in enumerate(urls, start=1):
         con.execute(
-            "INSERT INTO link_queue(url, state, tries, added_ts, next_try_ts, last_error, batch_id, origin_chat, origin_msg, owner_display, owner_username) "
+            "INSERT INTO link_queue(url, state, tries, added_ts, next_try_ts, last_error, batch_id, origin_chat, origin_msg, owner_admin_id, owner_username) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (url, "queued", 0, now, now, None, BATCH_ID, CHAT_ID, 0, OWNER_DISPLAY, OWNER_USERNAME),
+            (url, "queued", 0, now, now, None, BATCH_ID, CHAT_ID, 0, OWNER_ADMIN_ID, OWNER_USERNAME),
         )
 
     con.commit()

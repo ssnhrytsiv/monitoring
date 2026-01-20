@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import func, select, update, distinct, and_
+from sqlalchemy import func, select, update, distinct
+from sqlalchemy.orm import Session
 
-from app.admin_bot.db import models as m
-from app.admin_bot.db.session import SessionLocal
+from app.db import models as m
 from app.DAL import channels_operations as cho
-from app.DAL.membership_operations import MembershipDAO
+from app.DAL.membership_operations import get_any_session_for_channel
 from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now, moscow_now_str
 
 
@@ -34,115 +34,98 @@ def _candidate_expires_at(days: float = 1.0) -> str:
         return _now_str()
 
 
-def list_active_channels() -> List[int]:
-    db = SessionLocal()
-    try:
-        rows = db.execute(
-            select(distinct(m.WatchPost.channel_id)).where(m.WatchPost.status.in_(["pending", "matched"]))
-        ).all()
-        return [int(r[0]) for r in rows if r[0] is not None]
-    finally:
-        db.close()
+def list_active_channels_db(db: Session) -> List[int]:
+    rows = db.execute(
+        select(distinct(m.WatchPost.channel_id)).where(m.WatchPost.status.in_(["pending", "matched"]))
+    ).all()
+    return [int(r[0]) for r in rows if r[0] is not None]
 
 
-def get_pending_by_channel(channel_id: int) -> List[Dict[str, Any]]:
-    db = SessionLocal()
-    try:
-        rows = db.execute(
-            select(
-                m.WatchPost.id,
-                m.WatchPost.template_id,
-                m.WatchPost.expected_text_hash,
-                m.WatchPost.expected_text_norm_len,
-                m.WatchPost.expected_links_json,
-                m.WatchPost.expected_media_fingerprint,
-                m.WatchPost.time_window_start,
-                m.WatchPost.time_window_end,
-                m.WatchPost.group_id,
-            ).where(m.WatchPost.channel_id == channel_id, m.WatchPost.status == "pending")
-        ).all()
-        return [
-            {
-                "id": int(r.id),
-                "template_id": r.template_id,
-                "expected_text_hash": r.expected_text_hash,
-                "expected_text_norm_len": r.expected_text_norm_len,
-                "expected_links_json": r.expected_links_json,
-                "expected_media_fingerprint": r.expected_media_fingerprint,
-                "time_window_start": r.time_window_start,
-                "time_window_end": r.time_window_end,
-                "group_id": r.group_id,
-            }
-            for r in rows
-        ]
-    finally:
-        db.close()
+def get_pending_by_channel_db(db: Session, channel_id: int) -> List[Dict[str, Any]]:
+    rows = db.execute(
+        select(
+            m.WatchPost.id,
+            m.WatchPost.template_id,
+            m.WatchPost.expected_text_hash,
+            m.WatchPost.expected_text_norm_len,
+            m.WatchPost.expected_links_json,
+            m.WatchPost.expected_media_fingerprint,
+            m.WatchPost.time_window_start,
+            m.WatchPost.time_window_end,
+            m.WatchPost.group_id,
+        ).where(m.WatchPost.channel_id == channel_id, m.WatchPost.status == "pending")
+    ).all()
+    return [
+        {
+            "id": int(r.id),
+            "template_id": r.template_id,
+            "expected_text_hash": r.expected_text_hash,
+            "expected_text_norm_len": r.expected_text_norm_len,
+            "expected_links_json": r.expected_links_json,
+            "expected_media_fingerprint": r.expected_media_fingerprint,
+            "time_window_start": r.time_window_start,
+            "time_window_end": r.time_window_end,
+            "group_id": r.group_id,
+        }
+        for r in rows
+    ]
 
 
-def list_due_coverage(now_ts: Optional[str] = None) -> List[Tuple[int, int, int, Optional[str]]]:
+def list_due_coverage_db(db: Session, now_ts: Optional[str] = None) -> List[Tuple[int, int, int, Optional[str]]]:
     now_val = now_ts or _now_str()
-    db = SessionLocal()
-    try:
-        rows = db.execute(
-            select(
-                m.WatchPost.id,
-                m.WatchPost.channel_id,
-                m.WatchPost.matched_message_id,
-                m.WatchPost.matched_session,
-            ).where(
-                m.WatchPost.status == "matched",
-                m.WatchPost.coverage_check_at <= now_val,
+    rows = db.execute(
+        select(
+            m.WatchPost.id,
+            m.WatchPost.channel_id,
+            m.WatchPost.matched_message_id,
+            m.WatchPost.matched_session,
+        ).where(
+            m.WatchPost.status == "matched",
+            m.WatchPost.coverage_check_at <= now_val,
+        )
+    ).all()
+    out: List[Tuple[int, int, int, Optional[str]]] = []
+    for r in rows:
+        if r.matched_message_id is None:
+            continue
+        out.append(
+            (
+                int(r.id),
+                int(r.channel_id),
+                int(r.matched_message_id),
+                r.matched_session if r.matched_session is not None else None,
             )
-        ).all()
-        out: List[Tuple[int, int, int, Optional[str]]] = []
-        for r in rows:
-            if r.matched_message_id is None:
-                continue
-            out.append(
-                (
-                    int(r.id),
-                    int(r.channel_id),
-                    int(r.matched_message_id),
-                    r.matched_session if r.matched_session is not None else None,
-                )
-            )
-        return out
-    finally:
-        db.close()
+        )
+    return out
 
 
-def mark_matched(
+
+
+def mark_matched_db(
+    db: Session,
     watch_id: int,
     message_id: int,
     coverage_check_at: Optional[str],
     matched_session: Optional[str] = None,
 ) -> None:
     now_val = _now_str()
-    db = SessionLocal()
-    try:
-        db.execute(
-            update(m.WatchPost)
-            .where(m.WatchPost.id == watch_id, m.WatchPost.status == "pending")
-            .values(
-                matched_message_id=message_id,
-                matched_at=now_val,
-                coverage_check_at=coverage_check_at,
-                matched_session=matched_session,
-                status="matched",
-                updated_at=now_val,
-            )
+    db.execute(
+        update(m.WatchPost)
+        .where(m.WatchPost.id == watch_id, m.WatchPost.status == "pending")
+        .values(
+            matched_message_id=message_id,
+            matched_at=now_val,
+            coverage_check_at=coverage_check_at,
+            matched_session=matched_session,
+            status="matched",
+            updated_at=now_val,
         )
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+    )
+    db.commit()
 
 
-def mark_done_views(watch_id: int, final_views: Optional[int]) -> None:
+def mark_done_views_db(db: Session, watch_id: int, final_views: Optional[int]) -> None:
     now_val = _now_str()
-    db = SessionLocal()
     try:
         wp = db.execute(
             select(m.WatchPost.network_id, m.WatchPost.admin_id, m.WatchPost.group_id).where(m.WatchPost.id == watch_id).limit(1)
@@ -229,17 +212,12 @@ def mark_done_views(watch_id: int, final_views: Optional[int]) -> None:
     except Exception:
         db.rollback()
         raise
-    finally:
-        db.close()
 
 
-def mark_done_deleted(watch_id: int) -> Optional[str]:
+def mark_done_deleted_db(db: Session, watch_id: int) -> Optional[str]:
     now_val = _now_str()
-    db = SessionLocal()
     try:
-        row = db.execute(
-            select(m.WatchPost.status).where(m.WatchPost.id == watch_id).limit(1)
-        ).first()
+        row = db.execute(select(m.WatchPost.status).where(m.WatchPost.id == watch_id).limit(1)).first()
         if not row:
             return None
         status = (row[0] or "").lower()
@@ -261,28 +239,21 @@ def mark_done_deleted(watch_id: int) -> Optional[str]:
     except Exception:
         db.rollback()
         raise
-    finally:
-        db.close()
 
 
-def find_matched_by_message(channel_id: int, message_id: int) -> List[int]:
-    db = SessionLocal()
-    try:
-        rows = db.execute(
-            select(m.WatchPost.id).where(
-                m.WatchPost.status.in_(["matched", "done", "deleted", "edited"]),
-                m.WatchPost.channel_id == channel_id,
-                m.WatchPost.matched_message_id == message_id,
-            )
-        ).all()
-        return [int(r.id) for r in rows]
-    finally:
-        db.close()
+def find_matched_by_message_db(db: Session, channel_id: int, message_id: int) -> List[int]:
+    rows = db.execute(
+        select(m.WatchPost.id).where(
+            m.WatchPost.status.in_(["matched", "done", "deleted", "edited"]),
+            m.WatchPost.channel_id == channel_id,
+            m.WatchPost.matched_message_id == message_id,
+        )
+    ).all()
+    return [int(r.id) for r in rows]
 
 
-def mark_expired(watch_id: int) -> None:
+def mark_expired_db(db: Session, watch_id: int) -> None:
     now_val = _now_str()
-    db = SessionLocal()
     try:
         db.execute(
             update(m.WatchPost)
@@ -293,48 +264,39 @@ def mark_expired(watch_id: int) -> None:
     except Exception:
         db.rollback()
         raise
-    finally:
-        db.close()
 
 
-def list_due_pending_expire(now_ts: Optional[str] = None) -> List[int]:
+def list_due_pending_expire_db(db: Session, now_ts: Optional[str] = None) -> List[int]:
     now_val = now_ts or _now_str()
-    db = SessionLocal()
-    try:
-        rows = db.execute(
-            select(m.WatchPost.id).where(
-                m.WatchPost.status == "pending",
-                m.WatchPost.time_window_end.is_not(None),
-                m.WatchPost.time_window_end != "",
-                m.WatchPost.time_window_end <= now_val,
-            )
-        ).all()
-        return [int(r.id) for r in rows]
-    finally:
-        db.close()
+    rows = db.execute(
+        select(m.WatchPost.id).where(
+            m.WatchPost.status == "pending",
+            m.WatchPost.time_window_end.is_not(None),
+            m.WatchPost.time_window_end != "",
+            m.WatchPost.time_window_end <= now_val,
+        )
+    ).all()
+    return [int(r.id) for r in rows]
 
 
-def list_pending_without_expected(limit: int = 200) -> List[int]:
+def list_pending_without_expected_db(db: Session, limit: int = 200) -> List[int]:
     """
     Повертає pending watch_id, у яких немає expected_text_hash (для health-check).
     """
-    db = SessionLocal()
-    try:
-        rows = db.execute(
-            select(m.WatchPost.id)
-            .where(
-                m.WatchPost.status == "pending",
-                (m.WatchPost.expected_text_hash.is_(None)) | (m.WatchPost.expected_text_hash == ""),
-            )
-            .order_by(m.WatchPost.id.desc())
-            .limit(int(limit))
-        ).all()
-        return [int(r.id) for r in rows]
-    finally:
-        db.close()
+    rows = db.execute(
+        select(m.WatchPost.id)
+        .where(
+            m.WatchPost.status == "pending",
+            (m.WatchPost.expected_text_hash.is_(None)) | (m.WatchPost.expected_text_hash == ""),
+        )
+        .order_by(m.WatchPost.id.desc())
+        .limit(int(limit))
+    ).all()
+    return [int(r.id) for r in rows]
 
 
-def insert_watch_candidate(
+def insert_watch_candidate_db(
+    db: Session,
     watch_id: int,
     channel_id: int,
     message_id: int,
@@ -344,7 +306,7 @@ def insert_watch_candidate(
     status: str = "pending_candidate",
     expires_days: Optional[float] = None,
     ttl_days: Optional[float] = None,
-) -> None:
+) -> int:
     """
     Додає запис у watch_candidates.
     expires_days / ttl_days взаємозамінні; за замовчуванням 1.0.
@@ -352,50 +314,38 @@ def insert_watch_candidate(
     exp_days_val = expires_days if expires_days is not None else ttl_days
     if exp_days_val is None:
         exp_days_val = 1.0
-    db = SessionLocal()
     try:
-        db.add(
-            m.WatchCandidate(
-                watch_id=int(watch_id),
-                channel_id=int(channel_id),
-                message_id=int(message_id),
-                text_hash=text_hash,
-                similarity=similarity,
-                message_text=message_text,
-                status=status,
-                created_at=_now_str(),
-                expires_at=_candidate_expires_at(exp_days_val),
-            )
+        obj = m.WatchCandidate(
+            watch_id=int(watch_id),
+            channel_id=int(channel_id),
+            message_id=int(message_id),
+            text_hash=text_hash,
+            similarity=similarity,
+            message_text=message_text,
+            status=status,
+            created_at=_now_str(),
+            expires_at=_candidate_expires_at(exp_days_val),
         )
+        db.add(obj)
         db.commit()
+        return int(obj.id)
     except Exception:
         db.rollback()
         raise
-    finally:
-        db.close()
 
 
-def get_session_for_source_url(source_url: str) -> Optional[str]:
+def get_session_for_source_url_db(db: Session, source_url: str) -> Optional[str]:
     """
     Знаходить сесію, яка вже працювала з каналом для цього source_url:
       source_url -> channel_id -> account (membership.account).
     """
     if not source_url:
         return None
+    cid = None
     try:
-        db = SessionLocal()
         cid = cho.get_channel_id_by_url(db, source_url)
     except Exception:
         cid = None
-    finally:
-        db.close()
     if not cid:
         return None
-    try:
-        db = SessionLocal()
-        membership_db = MembershipDAO(db)
-        return membership_db.get_any_session_for_channel(cid)
-    except Exception:
-        return None
-    finally:
-        db.close()
+    return get_any_session_for_channel(db, cid)

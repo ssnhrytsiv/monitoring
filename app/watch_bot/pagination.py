@@ -6,6 +6,8 @@ from typing import Dict, List, Optional
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from app.watch_bot.keyboards import menu_home_button
+
 
 class _Session:
     __slots__ = ("pages", "user_id", "created_at", "labels")
@@ -92,6 +94,6 @@ def build_keyboard(sid: str, idx: int, total: int) -> Optional[InlineKeyboardMar
             rows.append(cat_btns[start:start+2])
 
     # Додаємо рядок з поверненням у меню (окремий callback для пагінації)
-    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="blmenu:home")])
+    rows.append([menu_home_button()])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)

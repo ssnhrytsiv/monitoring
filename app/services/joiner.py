@@ -14,8 +14,9 @@ from telethon.errors import (
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest,CheckChatInviteRequest
 
-from app.DAL import SessionLocal
-from app.DAL.membership_operations import MembershipDAO, FINAL_GLOBAL
+from app.DAL import session_scope
+from app.DAL import membership_operations as mem_db
+from app.DAL.membership_operations import FINAL_GLOBAL
 from app.utils.link_parser import sanitize_link
 from app.DAL import channels_operations as cho
 from app.services.account_pool import is_already_subscribed, session_name
@@ -70,74 +71,66 @@ def _plausible_invite_hash(h: str | None) -> bool:
 
 
 @contextmanager
-def _membership():
-    db = SessionLocal()
-    try:
-        yield MembershipDAO(db)
-    finally:
-        db.close()
+def _db():
+    with session_scope() as db:
+        yield db
 
 
-# DAO helpers (зберігають старі назви, але працюють через класовий DAO)
-def map_invite_get(invite_hash: str):
-    with _membership() as mem_dao:
-        return mem_dao.map_invite_get(invite_hash)
+# DAO helpers
+def invite_cache_get(invite_hash: str):
+    with _db() as db:
+        return mem_db.invite_cache_get(db, invite_hash)
 
 
-def map_invite_set(invite_hash: str, channel_id: int, title: str | None = None):
-    with _membership() as mem_dao:
-        return mem_dao.map_invite_set(invite_hash, channel_id, title)
-
-
-def invite_status_get(invite_hash: str):
-    with _membership() as mem_dao:
-        return mem_dao.invite_status_get(invite_hash)
-
-
-def invite_status_put(invite_hash: str, status: str):
-    with _membership() as mem_dao:
-        return mem_dao.invite_status_put(invite_hash, status)
+def invite_cache_upsert(
+    invite_hash: str,
+    *,
+    channel_id: int | None = None,
+    title: str | None = None,
+    status: str | None = None,
+    session: str | None = None,
+    last_error: str | None = None,
+):
+    with _db() as db:
+        return mem_db.invite_cache_upsert(
+            db,
+            invite_hash,
+            channel_id=channel_id,
+            title=title,
+            status=status,
+            session=session,
+            last_error=last_error,
+        )
 
 
 def any_final_for_channel(channel_id: int):
-    with _membership() as mem_dao:
-        return mem_dao.any_final_for_channel(channel_id)
+    with _db() as db:
+        return mem_db.any_final_for_channel(db, channel_id)
 
 
 def url_put(url: str, status: str):
-    with _membership() as mem_dao:
-        return mem_dao.url_put(url, status)
+    with _db() as db:
+        return mem_db.url_put(db, url, status)
 
 
 def bump_requested_attempt(invite_hash: str) -> int:
-    with _membership() as mem_dao:
-        return mem_dao.bump_requested_attempt(invite_hash)
+    with _db() as db:
+        return mem_db.bump_requested_attempt(db, invite_hash)
 
 
 def invite_check_last_session(invite_hash: str):
-    with _membership() as mem_dao:
-        return mem_dao.invite_check_last_session(invite_hash)
-
-
-def _membership_dao():
-    db = SessionLocal()
-    return MembershipDAO(db), db
+    with _db() as db:
+        return mem_db.invite_check_last_session(db, invite_hash)
 
 
 def _find_channel(channel_id: int):
-    db = SessionLocal()
-    try:
+    with _db() as db:
         return cho.find_channel(db, channel_id)
-    finally:
-        db.close()
 
 
 def _find_channel_by_link(raw_url: str):
-    db = SessionLocal()
-    try:
+    with _db() as db:
         return cho.find_channel_by_link(db, raw_url)
-    finally:
-        db.close()
 
 
 def _upsert_channel_basic(cid: int, ent, status: str) -> None:
@@ -151,11 +144,8 @@ def _upsert_channel_basic(cid: int, ent, status: str) -> None:
         if not username or getattr(ent, "bot", False):
             return
         title = getattr(ent, "title", None)
-        db = SessionLocal()
-        try:
-            cho.upsert_channel(db, cid, username, title, None, None, status)
-        finally:
-            db.close()
+        with _db() as db:
+            cho.upsert_channel(db, cid, username, title, owner_admin_id=None, last_status=status)
     except Exception:
         _log_exc("_upsert_channel_basic")
 
@@ -180,11 +170,10 @@ async def probe_channel_id(client, url: str):
 
         # 1) кеш відповідності: hash -> channel_id/title
         try:
-            mem_dao, db = _membership_dao()
-            try:
-                cid_cached, title_cached = mem_dao.map_invite_get(invite_hash)
-            finally:
-                db.close()
+            with _db() as db:
+                cache = mem_db.invite_cache_get(db, invite_hash)
+                cid_cached = cache.channel_id if cache else None
+                title_cached = cache.title if cache else None
             if cid_cached:
                 return int(cid_cached), (title_cached or None), "invite", invite_hash
         except Exception:
@@ -249,8 +238,8 @@ async def ensure_join(client, url: str):
         if not cid:
             return None
         try:
-            with _membership() as mem_dao:
-                final = _final_from_cache(mem_dao.any_final_for_channel(int(cid)))
+            with _db() as db:
+                final = _final_from_cache(mem_db.any_final_for_channel(db, int(cid)))
         except Exception:
             _log_exc("ensure_join: any_final_for_channel known")
             final = None
@@ -267,6 +256,32 @@ async def ensure_join(client, url: str):
     is_invite = bool(invite_hash)
     requested_limit = 2
 
+    def _cache_status(
+        status: str | None,
+        *,
+        cid: int | None = None,
+        title: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        if not invite_hash:
+            return
+        try:
+            sess = None
+            try:
+                sess = session_name(client)
+            except Exception:
+                pass
+            invite_cache_upsert(
+                invite_hash,
+                channel_id=cid,
+                title=title,
+                status=status,
+                session=sess,
+                last_error=last_error,
+            )
+        except Exception:
+            _log_exc("ensure_join: invite_cache_upsert status")
+
     def _requested_status() -> str:
         """
         Інкрементує лічильник requested для інвайта і повертає
@@ -274,20 +289,18 @@ async def ensure_join(client, url: str):
         """
         if not invite_hash:
             return "requested"
+        # рахуємо локально, але зберігаємо лише в invite_cache.status
         try:
             cnt = bump_requested_attempt(invite_hash)
             if cnt > requested_limit:
-                try:
-                    invite_status_put(invite_hash, "requested_fast")
-                except Exception:
-                    _log_exc("ensure_join: invite_status_put(requested_fast)")
+                invite_cache_upsert(invite_hash, status="requested_fast")
                 return "requested_fast"
         except Exception:
             _log_exc("ensure_join: bump_requested_attempt")
         try:
-            invite_status_put(invite_hash, "requested")
+            invite_cache_upsert(invite_hash, status="requested")
         except Exception:
-            _log_exc("ensure_join: invite_status_put(requested)")
+            _log_exc("ensure_join: invite_cache_upsert(requested)")
         return "requested"
 
     # --- Спроба знайти канал за raw_url у кеші links через DAO (якщо вже лінкували) ---
@@ -301,7 +314,7 @@ async def ensure_join(client, url: str):
                 if final_norm in FINAL_GLOBAL:
                     if invite_hash:
                         log.debug(
-                            "ensure_join(link_cache): final=%s cid=%s invite=%s -> invite_map not updated",
+                            "ensure_join(link_cache): final=%s cid=%s invite=%s -> invite_cache not updated",
                             final_norm,
                             cid_link,
                             invite_hash,
@@ -322,10 +335,11 @@ async def ensure_join(client, url: str):
             cid_cached, title_cached = (None, None)
             try:
                 if invite_hash:
-                    with _membership() as mem_dao:
-                        cid_cached, title_cached = mem_dao.map_invite_get(invite_hash)
+                    cache = invite_cache_get(invite_hash)
+                    cid_cached = cache.channel_id if cache else None
+                    title_cached = cache.title if cache else None
             except Exception:
-                _log_exc("ensure_join: map_invite_get")
+                _log_exc("ensure_join: invite_cache_get")
 
             if cid_cached:
                 try:
@@ -341,7 +355,7 @@ async def ensure_join(client, url: str):
                         cid_cached,
                     )
                     log.debug(
-                        "ensure_join(invite_cache): invite_map not updated because already subscribed via %s",
+                        "ensure_join(invite_cache): invite_cache not updated because already subscribed via %s",
                         who,
                     )
                     return "already", (title_cached or None), "invite", int(cid_cached), invite_hash
@@ -349,13 +363,13 @@ async def ensure_join(client, url: str):
                 # 🟢 Глобальна перевірка: якщо в кеші membership вже є фінальний статус по цьому каналу,
                 # не робимо мережеву спробу, одразу повертаємо його.
                 try:
-                    with _membership() as mem_dao:
-                        final = _final_from_cache(mem_dao.any_final_for_channel(int(cid_cached)))
+                    with _db() as db:
+                        final = _final_from_cache(mem_db.any_final_for_channel(db, int(cid_cached)))
                         if final:
                             if final not in ("joined", "already"):
-                                mem_dao.invite_status_put(invite_hash, final)
+                                invite_cache_upsert(invite_hash, status=final)
                             log.debug(
-                                "ensure_join(invite_cache): final=%s invite=%s cid=%s -> invite_map not updated",
+                                "ensure_join(invite_cache): final=%s invite=%s cid=%s -> invite_cache not updated",
                                 final,
                                 invite_hash,
                                 cid_cached,
@@ -372,16 +386,19 @@ async def ensure_join(client, url: str):
 
             # --- КРОК 0b: перевірка кешу статусу по invite_hash (без API)
             try:
-                with _membership() as mem_dao:
-                    st = mem_dao.invite_status_get(invite_hash)
+                cache = invite_cache_get(invite_hash)
+                st = cache.status if cache else None
+                cid_known = cache.channel_id if cache else None
+                title_known = cache.title if cache else None
             except Exception:
                 st = None
-            log.debug("ensure_join(invite): invite_status_get=%s invite=%s", st, invite_hash)
+                cid_known = None
+                title_known = None
+            log.debug("ensure_join(invite): invite_cache_get status=%s invite=%s", st, invite_hash)
             # Кешований too_many прив'язаний до інвайта, але це ліміт акаунта, тож його ігноруємо.
             if st == "too_many":
                 pass
             elif st in ("invalid", "private", "requested", "requested_fast", "blocked"):
-                cid_known, title_known = map_invite_get(invite_hash)
                 st_norm = _final_from_cache(st)
                 if st == "requested":
                     st_norm = _requested_status()
@@ -402,15 +419,21 @@ async def ensure_join(client, url: str):
                         title_new = getattr(chat, "title", None)
                         if cid_new:
                             try:
-                                map_invite_set(invite_hash, cid_new, title_new or None)
+                                invite_cache_upsert(
+                                    invite_hash,
+                                    channel_id=cid_new,
+                                    title=title_new or None,
+                                    status="already",
+                                    session=session_name(client),
+                                )
                                 log.debug(
-                                    "ensure_join(invite_cache): map_invite_set invite=%s cid=%s title=%r (requested->already)",
+                                    "ensure_join(invite_cache): invite_cache_upsert invite=%s cid=%s title=%r (requested->already)",
                                     invite_hash,
                                     cid_new,
                                     title_new,
                                 )
                             except Exception:
-                                _log_exc("ensure_join: map_invite_set requested->already")
+                                _log_exc("ensure_join: invite_cache_upsert requested->already")
                             log.info("ensure_join(invite): requested->already via recheck invite=%s cid=%s", invite_hash, cid_new)
                             return "already", (title_new or title_known or None), "invite", cid_new, invite_hash
                     except InviteRequestSentError:
@@ -422,16 +445,16 @@ async def ensure_join(client, url: str):
                         msg = str(e)
                         if "expired and is not valid anymore" in msg:
                             try:
-                                invite_status_put(invite_hash, "invalid")
+                                invite_cache_upsert(invite_hash, status="invalid", last_error=msg)
                             except Exception:
-                                _log_exc("ensure_join: invite_status_put(invalid) recheck")
+                                _log_exc("ensure_join: invite_cache_upsert(invalid) recheck")
                             log.info("ensure_join(invite): requested->invalid via recheck invite=%s", invite_hash)
                             return "invalid", (title_known or None), "invite", None, invite_hash
                         log.debug("ensure_join(invite): recheck failed invite=%s: %s", invite_hash, e)
 
                 if invite_hash:
                     log.debug(
-                        "ensure_join(invite_cache): cached status=%s invite=%s cid=%s -> invite_map not updated",
+                        "ensure_join(invite_cache): cached status=%s invite=%s cid=%s -> invite_cache not updated",
                         st_norm,
                         invite_hash,
                         cid_known,
@@ -455,16 +478,21 @@ async def ensure_join(client, url: str):
                     title_peek = getattr(chat, "title", None)
                     if cid_peek:
                         try:
-                            map_invite_set(invite_hash, cid_peek, title_peek or None)
+                            invite_cache_upsert(
+                                invite_hash,
+                                channel_id=cid_peek,
+                                title=title_peek or None,
+                                session=sess_name,
+                            )
                             log.debug(
-                                "ensure_join(invite): peek map_invite_set invite=%s cid=%s title=%r sess=%s",
+                                "ensure_join(invite): peek invite_cache_upsert invite=%s cid=%s title=%r sess=%s",
                                 invite_hash,
                                 cid_peek,
                                 title_peek,
                                 sess_name,
                             )
                         except Exception:
-                            _log_exc("ensure_join: map_invite_set peek")
+                            _log_exc("ensure_join: invite_cache_upsert peek")
                         try:
                             final_peek = _final_from_cache(any_final_for_channel(cid_peek))
                         except Exception:
@@ -474,9 +502,13 @@ async def ensure_join(client, url: str):
                         if final_peek:
                             try:
                                 # кешуємо фінальний статус для інвайта (включно з joined/already)
-                                invite_status_put(invite_hash, final_peek)
+                                invite_cache_upsert(
+                                    invite_hash,
+                                    status=final_peek,
+                                    session=sess_name,
+                                )
                             except Exception:
-                                _log_exc("ensure_join: invite_status_put peek")
+                                _log_exc("ensure_join: invite_cache_upsert peek status")
                             log.info(
                                 "ensure_join(invite): peek final=%s cid=%s title=%r sess=%s -> skip join",
                                 final_peek,
@@ -490,7 +522,7 @@ async def ensure_join(client, url: str):
                     return f"flood_wait_{int(e.seconds)}", None, "invite", None, invite_hash
                 except (InviteHashInvalidError, InviteHashExpiredError):
                     log.debug("ensure_join(invite): peek invalid invite=%s", invite_hash)
-                    invite_status_put(invite_hash, "invalid")
+                    invite_cache_upsert(invite_hash, status="invalid", last_error="invalid_invite")
                     return "invalid", None, "invite", None, invite_hash
                 except Exception:
                     _log_exc("ensure_join: CheckChatInviteRequest peek")
@@ -512,10 +544,7 @@ async def ensure_join(client, url: str):
             chats = getattr(updates, "chats", None)
             if not chats:
                 # join request flow → нас ще не прийняли
-                try:
-                    invite_status_put(invite_hash, "requested")
-                except Exception:
-                    _log_exc("ensure_join: invite_status_put(requested) join_request")
+                _cache_status("requested")
                 log.info("ensure_join(invite): sent join request invite=%s -> requested", invite_hash)
                 return "requested", None, "invite", None, invite_hash
 
@@ -524,22 +553,10 @@ async def ensure_join(client, url: str):
             title = getattr(ch, "title", "?") if ch else "?"
 
             if invite_hash and cid:
-                try:
-                    map_invite_set(invite_hash, cid, title or None)
-                    log.debug(
-                        "ensure_join(invite): map_invite_set invite=%s cid=%s title=%r (joined)",
-                        invite_hash,
-                        cid,
-                        title,
-                    )
-                except Exception:
-                    _log_exc("ensure_join: map_invite_set joined")
+                _cache_status(None, cid=cid, title=title or None)
                 known = _known_status_by_cid(cid)
                 if known:
-                    try:
-                        invite_status_put(invite_hash, known)
-                    except Exception:
-                        _log_exc("ensure_join: invite_status_put known joined")
+                    _cache_status(known, cid=cid, title=title or None)
                     log.info(
                         "ensure_join(invite): known channel cid=%s status=%s title=%r (no rejoin)",
                         cid,
@@ -580,11 +597,7 @@ async def ensure_join(client, url: str):
             cid = int(getattr(ent, "id", 0) or 0) or None
             # якщо це був інвайт-URL, збережемо мапу/статус навіть у public-гілці
             if invite_hash and cid:
-                try:
-                    map_invite_set(invite_hash, cid, title or None)
-                    invite_status_put(invite_hash, "joined")
-                except Exception:
-                    _log_exc("ensure_join: map_invite_set/invite_status_put joined public")
+                _cache_status("joined", cid=cid, title=title or None)
             log.info("ensure_join(public): joined url=%s cid=%s title=%r", url, cid, title)
             try:
                 if cleaned_url:
@@ -601,11 +614,7 @@ async def ensure_join(client, url: str):
             title = getattr(ent, "title", None)
             cid = int(getattr(ent, "id", 0) or 0) or None
             if invite_hash and cid:
-                try:
-                    map_invite_set(invite_hash, cid, title or None)
-                    invite_status_put(invite_hash, "already")
-                except Exception:
-                    _log_exc("ensure_join: map_invite_set/invite_status_put already public")
+                _cache_status("already", cid=cid, title=title or None)
             log.debug("ensure_join(public): already url=%s cid=%s title=%r", url, cid, title)
             try:
                 if cleaned_url:
@@ -622,7 +631,7 @@ async def ensure_join(client, url: str):
     # ---- обробка винятків ----
     except InviteRequestSentError:
         if is_invite and invite_hash:
-            invite_status_put(invite_hash, "requested")
+            _cache_status("requested")
         log.info("ensure_join(invite): InviteRequestSentError invite=%s -> requested", invite_hash)
         return "requested", None, "invite", None, invite_hash
 
@@ -639,10 +648,7 @@ async def ensure_join(client, url: str):
 
             # 1) Позначаємо статус
 
-            try:
-                invite_status_put(invite_hash, "already")
-            except Exception:
-                _log_exc("ensure_join: invite_status_put(already) user_already")
+            _cache_status("already")
 
             # 2) Прагнемо отримати channel_id без join – одним легким викликом
 
@@ -658,21 +664,7 @@ async def ensure_join(client, url: str):
 
                 if cid:
 
-                    try:
-
-                        # збережемо мапу invite -> (channel_id, title)
-
-                        map_invite_set(invite_hash, cid, title or None)
-                        log.debug(
-                            "ensure_join(invite): map_invite_set invite=%s cid=%s title=%r (already)",
-                            invite_hash,
-                            cid,
-                            title,
-                        )
-
-
-                    except Exception:
-                        _log_exc("ensure_join: map_invite_set already")
+                    _cache_status("already", cid=cid, title=title or None)
 
                 return "already", title, "invite", cid, invite_hash
 
@@ -688,7 +680,7 @@ async def ensure_join(client, url: str):
 
     except (InviteHashInvalidError, InviteHashExpiredError, UsernameNotOccupiedError):
         if is_invite and invite_hash:
-            invite_status_put(invite_hash, "invalid")
+            _cache_status("invalid")
         kind = "invite" if is_invite else "public"
         log.debug("ensure_join(%s): invalid/expired/not_occupied", kind)
         return "invalid", None, kind, None, invite_hash
@@ -697,17 +689,14 @@ async def ensure_join(client, url: str):
         # Якщо маємо кешований requested і Telegram каже, що інвайт протух (CheckChatInviteRequest),
         # відмічаємо як invalid, щоб не ходити по ньому знову.
         if is_invite and invite_hash and "expired and is not valid anymore" in str(e):
-            try:
-                invite_status_put(invite_hash, "invalid")
-            except Exception:
-                _log_exc("ensure_join: invite_status_put(invalid) unexpected")
+            _cache_status("invalid")
             log.info("ensure_join(invite): expired -> invalid invite=%s", invite_hash)
             return "invalid", None, "invite", None, invite_hash
         raise
 
     except ChannelPrivateError:
         if is_invite and invite_hash:
-            invite_status_put(invite_hash, "private")
+            _cache_status("private")
         kind = "invite" if is_invite else "public"
         log.debug("ensure_join(%s): ChannelPrivateError -> private", kind)
         return "private", None, kind, None, invite_hash
@@ -730,12 +719,12 @@ async def ensure_join(client, url: str):
             return "too_many", None, kind, None, invite_hash
         if "USER_BANNED_IN_CHANNEL" in msg or "USER_KICKED" in msg:
             if is_invite and invite_hash:
-                invite_status_put(invite_hash, "blocked")
+                _cache_status("blocked")
             log.warning("ensure_join(%s): blocked/banned", kind)
             return "blocked", None, kind, None, invite_hash
         if "INVITE_REQUEST_SENT" in msg:
             if is_invite and invite_hash:
-                invite_status_put(invite_hash, "requested")
+                _cache_status("requested")
             log.info("ensure_join(%s): INVITE_REQUEST_SENT -> requested", kind)
             return "requested", None, kind, None, invite_hash
         log.exception("ensure_join(%s): unexpected error: %s", kind, msg)
