@@ -25,13 +25,14 @@ from app.services import link_queue
 from app.services import account_pool
 from app.DAL import channels_operations as cho
 from app.DAL import membership_operations as mem_db
+from app.DAL import invite_cache_operations as ic_db
 from app.DAL import network_channels_operations as net_db
+from app.DAL import link_operations as link_db
 from app.DAL.refresh_links_operation import (
     BatchResultDTO,
     RefreshPlanDTO,
     build_batch_results,
     build_refresh_plan,
-    invite_cache_status_get_bulk,
     bulk_memberships_accounts,
     bulk_any_session,
     bulk_owner_conflict,
@@ -39,7 +40,7 @@ from app.DAL.refresh_links_operation import (
     bulk_admin_for_channels,
     bulk_channel_link_meta,
 )
-from app.DAL.admins_operations import AdminSnapshot
+from app.DAL.schemas import AdminRecord
 from app.utils.link_parser import sanitize_link
 from app.admin_bot.services.subscription.subscription_utils import norm_keys as collect_norm_keys
 
@@ -53,11 +54,8 @@ class RefreshContext:
     batch_id: str
     chat_id: int
     reply_msg: Any
-    admin: AdminSnapshot
+    admin: AdminRecord
     urls: List[str]
-    raw_text: str
-    raw_html: str
-    entities: List
 
 
 @dataclass(frozen=True)
@@ -82,7 +80,7 @@ def _prepare_refresh_phase_data(
     batch_id: str,
     urls: List[str],
     current_channel_ids: Set[int],
-    admin: AdminSnapshot,
+    admin: AdminRecord,
 ) -> RefreshPhaseData:
     with session_scope() as db:
         cache_entry = batch_cache.pop(batch_id) or {}
@@ -96,7 +94,8 @@ def _prepare_refresh_phase_data(
                     url_keys.add(norm_key)
 
         channel_ids = [batch_result.channel_id for batch_result in batch_results if batch_result.channel_id is not None]
-        status_by_url = invite_cache_status_get_bulk(db, list(url_keys))
+        invite_cache_records = ic_db.invite_cache_status_get_bulk(db, list(url_keys))
+        status_by_url = {rec.invite_hash: rec.status for rec in invite_cache_records if rec.invite_hash}
         titles_map = bulk_channel_title_owner(db, channel_ids)
         admin_map = bulk_admin_for_channels(db, channel_ids)
         conflict_map = bulk_owner_conflict(db, channel_ids)
@@ -240,36 +239,7 @@ def _empty_cleanup_stats() -> Dict[str, int]:
     }
 
 
-def _resolve_channel_id(url: str) -> Optional[int]:
-    """
-    Визначає channel_id за URL/інвайтом, використовуючи кеш links/invite_cache.
-    """
-    if not url:
-        return None
-    try:
-        clean = sanitize_link(url) or url
-    except Exception:
-        clean = url
-
-    for candidate in (url, clean):
-        if not candidate:
-            continue
-        with session_scope() as db:
-            row = cho.find_channel_by_link(db, candidate)
-            if row and row.channel_id:
-                return row.channel_id
-            cid = cho.get_channel_id_by_url(db, candidate)
-            if cid:
-                return cid
-            cid_map_title = mem_db.map_invite_get(db, candidate)
-            if cid_map_title:
-                cid_map, _title = cid_map_title
-                if cid_map:
-                    return cid_map
-    return None
-
-
-async def _cleanup_removed_channels(admin: AdminSnapshot, chan_ids: Set[int]) -> Dict[str, int]:
+async def _cleanup_removed_channels(admin: AdminRecord, chan_ids: Set[int]) -> Dict[str, int]:
     """
     Відписує сесії від каналів та чистить пов’язані таблиці для каналів, які більше не потрібні цьому адміна.
     """
@@ -296,7 +266,7 @@ async def _cleanup_removed_channels(admin: AdminSnapshot, chan_ids: Set[int]) ->
             )
         db.commit()
 
-        keep_ids = set(cho.list_all_admin_channel_ids(db)) | set(net_db.list_channel_ids_for_admin_networks(db, admin.id))
+        keep_ids = set(net_db.list_channel_ids_for_admin_networks(db, admin.id))
         delete_ids = [cid for cid in chan_ids if cid not in keep_ids]
 
         if delete_ids:
@@ -314,12 +284,12 @@ async def _cleanup_removed_channels(admin: AdminSnapshot, chan_ids: Set[int]) ->
     # Phase 3: apply deletes/cleanup (DB-only)
     with session_scope() as db:
         if delete_ids:
-            stats["membership_deleted"] = m.delete_memberships_by_channels(db, delete_ids)
-            stats["membership_status_deleted"] = m.delete_membership_status_by_channels(db, delete_ids)
-            stats["owner_conflicts_deleted"] = m.delete_owner_conflict_by_channels(db, delete_ids)
-            stats["links_deleted"] = m.delete_links_by_channels(db, delete_ids)
+            stats["membership_deleted"] = mem_db.delete_memberships_by_channels(db, delete_ids)
+            stats["membership_status_deleted"] = mem_db.delete_membership_status_by_channels(db, delete_ids)
+            stats["owner_conflicts_deleted"] = mem_db.owner_conflict_delete_by_channels(db, delete_ids)
+            stats["links_deleted"] = link_db.delete_links_by_channels(db, delete_ids)
             try:
-                stats["invite_cache_deleted"] = mem_db.invite_cache_delete_by_channels(db, delete_ids)
+                stats["invite_cache_deleted"] = ic_db.invite_cache_delete_by_channels(db, delete_ids)
             except Exception:
                 stats["invite_cache_deleted"] = 0
 
@@ -332,14 +302,13 @@ async def _cleanup_removed_channels(admin: AdminSnapshot, chan_ids: Set[int]) ->
                     stats["url_cache_deleted"] = svc_admins._delete_url_cache_db(db, urls_for_cleanup, None)  # type: ignore[attr-defined]
                 except Exception:
                     pass
-            stats["channels_deleted"] = m.delete_channels_by_ids(db, delete_ids)
+            stats["channels_deleted"] = cho.delete_channels_by_ids(db, delete_ids)
         db.commit()
 
     # Phase 4: cleanup link_queue (separate sqlite access)
     try:
         stats["link_queue_deleted"] = link_queue.delete_by_owner(
             owner_admin_id=admin.id,
-            owner_username=admin.username,
             urls=list(set(urls_for_cleanup)) if urls_for_cleanup else None,
         )
     except Exception:
@@ -375,7 +344,7 @@ def _format_removed_lines(
 
 async def _send_refresh_report(
     *,
-    admin: AdminSnapshot,
+    admin: AdminRecord,
     reply_msg,
     status_lines: List[str],
     to_remove: Set[int],
@@ -466,7 +435,7 @@ async def refresh_channels_for_admin(refresh_context: RefreshContext) -> None:
     """
     admin_obj = refresh_context.admin
     if isinstance(admin_obj, m.Admin):
-        admin = AdminSnapshot(
+        admin = AdminRecord(
             id=admin_obj.id,
             username=admin_obj.username,
             display=admin_obj.display,
@@ -480,10 +449,8 @@ async def refresh_channels_for_admin(refresh_context: RefreshContext) -> None:
     link_queue.enqueue(
         refresh_context.urls,
         batch_id=refresh_context.batch_id,
-        origin_chat=refresh_context.chat_id,
         origin_msg=getattr(refresh_context.reply_msg, "message_id", None),
         owner_admin_id=admin.id,
-        owner_username=admin.username,
         adopt_existing=True,
         reset_next_try=True,
     )
@@ -575,9 +542,6 @@ async def refresh_channels_for_admin(refresh_context: RefreshContext) -> None:
         admin_display=admin.display,
         admin_username=admin.username,
         admin_tg_id=admin.tg_id,
-        raw_text=refresh_context.raw_text,
-        raw_html=refresh_context.raw_html,
-        entities=refresh_context.entities,
         original_urls=refresh_context.urls,
     )
 
@@ -693,7 +657,7 @@ async def finalize_refresh_confirmation(batch_id: str, approve_unsubscribe: bool
     admin = None
     if admin_id:
         with session_scope() as db:
-            admin = svc_admins.get_admin_snapshot_by_id(db, admin_id)
+            admin = svc_admins.get_admin_by_id(db, admin_id)
 
     if not admin:
         await answer_with_retry(reply_msg, "Адміна не знайдено. Спробуй запустити оновлення ще раз.")

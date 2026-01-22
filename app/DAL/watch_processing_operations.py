@@ -11,6 +11,7 @@ from app.db import models as m
 from app.DAL import channels_operations as cho
 from app.DAL.membership_operations import get_any_session_for_channel
 from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now, moscow_now_str
+from app.db.session import session_scope
 
 
 def _now_str() -> str:
@@ -41,20 +42,21 @@ def list_active_channels_db(db: Session) -> List[int]:
     return [int(r[0]) for r in rows if r[0] is not None]
 
 
-def get_pending_by_channel_db(db: Session, channel_id: int) -> List[Dict[str, Any]]:
-    rows = db.execute(
-        select(
-            m.WatchPost.id,
-            m.WatchPost.template_id,
-            m.WatchPost.expected_text_hash,
-            m.WatchPost.expected_text_norm_len,
-            m.WatchPost.expected_links_json,
-            m.WatchPost.expected_media_fingerprint,
-            m.WatchPost.time_window_start,
-            m.WatchPost.time_window_end,
-            m.WatchPost.group_id,
-        ).where(m.WatchPost.channel_id == channel_id, m.WatchPost.status == "pending")
-    ).all()
+def get_pending_by_channel_db(channel_id: int) -> List[Dict[str, Any]]:
+    with session_scope() as db:
+        rows = db.execute(
+            select(
+                m.WatchPost.id,
+                m.WatchPost.template_id,
+                m.WatchPost.expected_text_hash,
+                m.WatchPost.expected_text_norm_len,
+                m.WatchPost.expected_links_json,
+                m.WatchPost.expected_media_fingerprint,
+                m.WatchPost.time_window_start,
+                m.WatchPost.time_window_end,
+                m.WatchPost.group_id,
+            ).where(m.WatchPost.channel_id == channel_id, m.WatchPost.status == "pending")
+        ).all()
     return [
         {
             "id": int(r.id),
@@ -71,19 +73,20 @@ def get_pending_by_channel_db(db: Session, channel_id: int) -> List[Dict[str, An
     ]
 
 
-def list_due_coverage_db(db: Session, now_ts: Optional[str] = None) -> List[Tuple[int, int, int, Optional[str]]]:
-    now_val = now_ts or _now_str()
-    rows = db.execute(
-        select(
-            m.WatchPost.id,
-            m.WatchPost.channel_id,
-            m.WatchPost.matched_message_id,
-            m.WatchPost.matched_session,
-        ).where(
-            m.WatchPost.status == "matched",
-            m.WatchPost.coverage_check_at <= now_val,
-        )
-    ).all()
+def list_due_coverage_db(now_ts: Optional[str] = None) -> List[Tuple[int, int, int, Optional[str]]]:
+    current_ts = now_ts or _now_str()
+    with session_scope() as db:
+        rows = db.execute(
+            select(
+                m.WatchPost.id,
+                m.WatchPost.channel_id,
+                m.WatchPost.matched_message_id,
+                m.WatchPost.matched_session,
+            ).where(
+                m.WatchPost.status == "matched",
+                m.WatchPost.coverage_check_at <= current_ts,
+            )
+        ).all()
     out: List[Tuple[int, int, int, Optional[str]]] = []
     for r in rows:
         if r.matched_message_id is None:
@@ -102,38 +105,37 @@ def list_due_coverage_db(db: Session, now_ts: Optional[str] = None) -> List[Tupl
 
 
 def mark_matched_db(
-    db: Session,
     watch_id: int,
     message_id: int,
     coverage_check_at: Optional[str],
     matched_session: Optional[str] = None,
 ) -> None:
     now_val = _now_str()
-    db.execute(
-        update(m.WatchPost)
-        .where(m.WatchPost.id == watch_id, m.WatchPost.status == "pending")
-        .values(
-            matched_message_id=message_id,
-            matched_at=now_val,
-            coverage_check_at=coverage_check_at,
-            matched_session=matched_session,
-            status="matched",
-            updated_at=now_val,
+    with session_scope() as db:
+        db.execute(
+            update(m.WatchPost)
+            .where(m.WatchPost.id == watch_id, m.WatchPost.status == "pending")
+            .values(
+                matched_message_id=message_id,
+                matched_at=now_val,
+                coverage_check_at=coverage_check_at,
+                matched_session=matched_session,
+                status="matched",
+                updated_at=now_val,
+            )
         )
-    )
-    db.commit()
 
 
-def mark_done_views_db(db: Session, watch_id: int, final_views: Optional[int]) -> None:
-    now_val = _now_str()
-    try:
+def mark_done_views_db(watch_id: int, final_views: Optional[int]) -> None:
+    now_str = _now_str()
+    with session_scope() as db:
         wp = db.execute(
             select(m.WatchPost.network_id, m.WatchPost.admin_id, m.WatchPost.group_id).where(m.WatchPost.id == watch_id).limit(1)
         ).first()
         db.execute(
             update(m.WatchPost)
             .where(m.WatchPost.id == watch_id, m.WatchPost.status == "matched")
-            .values(final_views=final_views, status="done", updated_at=now_val)
+            .values(final_views=final_views, status="done", updated_at=now_str)
         )
         if wp and wp[0]:
             net_id = int(wp[0])
@@ -208,15 +210,11 @@ def mark_done_views_db(db: Session, watch_id: int, final_views: Optional[int]) -
                     actual_cpm=g_cpm,
                 )
             )
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
 
 
-def mark_done_deleted_db(db: Session, watch_id: int) -> Optional[str]:
+def mark_done_deleted_db(watch_id: int) -> Optional[str]:
     now_val = _now_str()
-    try:
+    with session_scope() as db:
         row = db.execute(select(m.WatchPost.status).where(m.WatchPost.id == watch_id).limit(1)).first()
         if not row:
             return None
@@ -227,28 +225,24 @@ def mark_done_deleted_db(db: Session, watch_id: int) -> Optional[str]:
                 .where(m.WatchPost.id == watch_id, m.WatchPost.status == "done")
                 .values(deleted_at=func.coalesce(m.WatchPost.deleted_at, now_val), updated_at=now_val)
             )
-            db.commit()
             return status
         db.execute(
             update(m.WatchPost)
             .where(m.WatchPost.id == watch_id, m.WatchPost.status.in_(["matched", "deleted", "edited"]))
             .values(deleted_at=func.coalesce(m.WatchPost.deleted_at, now_val), status="deleted", updated_at=now_val)
         )
-        db.commit()
         return status
-    except Exception:
-        db.rollback()
-        raise
 
 
-def find_matched_by_message_db(db: Session, channel_id: int, message_id: int) -> List[int]:
-    rows = db.execute(
-        select(m.WatchPost.id).where(
-            m.WatchPost.status.in_(["matched", "done", "deleted", "edited"]),
-            m.WatchPost.channel_id == channel_id,
-            m.WatchPost.matched_message_id == message_id,
-        )
-    ).all()
+def find_matched_by_message_db(channel_id: int, message_id: int) -> List[int]:
+    with session_scope() as db:
+        rows = db.execute(
+            select(m.WatchPost.id).where(
+                m.WatchPost.status.in_(["matched", "done", "deleted", "edited"]),
+                m.WatchPost.channel_id == channel_id,
+                m.WatchPost.matched_message_id == message_id,
+            )
+        ).all()
     return [int(r.id) for r in rows]
 
 

@@ -87,21 +87,21 @@ def _mk_key(sheet: str, ssid: Optional[str]) -> Tuple[str, str]:
 
 
 def _db_get_watch_core(wid: int):
-    from app.DAL import session_scope
-
-    with session_scope() as db:
-        info = watch_posts_db.get_watch_info_db(db, int(wid))
-    if not info:
+    details = watch_posts_db.get_watch_post_details_by_id(int(wid))
+    if not details:
+        return None
+    if details.channel_id is None:
+        log.warning("gsheets_buffer: watch %s missing channel_id", wid)
         return None
     return {
-        "channel_id": int(info.get("channel_id") or 0),
-        "template_id": int(info.get("template_id")) if info.get("template_id") is not None else None,
-        "expected_links_json": info.get("expected_links_json"),
-        "time_window_start": info.get("time_window_start"),
-        "matched_at": info.get("matched_at"),
-        "deleted_at": info.get("deleted_at"),
-        "source_url": info.get("source_url") or None,
-        "project": info.get("project"),
+        "channel_id": int(details.channel_id),
+        "template_id": int(details.template_id) if details.template_id is not None else None,
+        "expected_links_json": details.expected_links_json,
+        "time_window_start": details.time_window_start,
+        "matched_at": details.matched_at,
+        "deleted_at": details.deleted_at,
+        "source_url": details.source_url or None,
+        "project": details.project,
     }
 
 

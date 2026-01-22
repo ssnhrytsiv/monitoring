@@ -5,7 +5,6 @@ DAO for link_queue table (функціональний стиль).
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from typing import List, Optional
 
 from sqlalchemy import or_, delete
@@ -13,17 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db import models as m
-
-
-@dataclass
-class LinkQueueItem:
-    id: int
-    url: str
-    tries: int
-    origin_chat: Optional[int]
-    origin_msg: Optional[int]
-    owner_admin_id: Optional[int]
-    owner_username: Optional[str]
+from app.DAL.schemas import LinkQueueRecord, LinkQueueRecordListAdapter
 
 
 def _now() -> int:
@@ -34,11 +23,9 @@ def enqueue(
     db: Session,
     urls: List[str],
     batch_id: Optional[str],
-    origin_chat: Optional[int],
     origin_msg: Optional[int],
     delay_sec: int = 0,
     owner_admin_id: Optional[int] = None,
-    owner_username: Optional[str] = None,
     *,
     adopt_existing: bool = False,
     reset_next_try: bool = True,
@@ -47,7 +34,6 @@ def enqueue(
         return 0
     now = _now()
     added = 0
-    owner_username_norm = owner_username.lstrip("@").lower() if owner_username else None
 
     for u in urls:
         try:
@@ -60,10 +46,8 @@ def enqueue(
                     next_try_ts=now + max(0, int(delay_sec)),
                     last_error=None,
                     batch_id=batch_id,
-                    origin_chat=origin_chat,
                     origin_msg=origin_msg,
                     owner_admin_id=owner_admin_id,
-                    owner_username=owner_username_norm,
                 )
             )
             db.commit()
@@ -95,10 +79,8 @@ def enqueue(
             )
             update_data = {
                 "batch_id": batch_id,
-                "origin_chat": origin_chat,
                 "origin_msg": origin_msg,
                 "owner_admin_id": owner_admin_id,
-                "owner_username": owner_username_norm,
                 "state": "queued",
                 "tries": 0,
                 "last_error": None,
@@ -116,18 +98,21 @@ def fetch_due(
     db: Session,
     limit: int = 20,
     exclude_batch_prefixes: Optional[List[str]] = None,
-) -> List[LinkQueueItem]:
+) -> List[LinkQueueRecord]:
     now = _now()
     prefixes = exclude_batch_prefixes or []
     q = (
         db.query(
             m.LinkQueue.id,
             m.LinkQueue.url,
+            m.LinkQueue.state,
             m.LinkQueue.tries,
-            m.LinkQueue.origin_chat,
+            m.LinkQueue.added_ts,
+            m.LinkQueue.next_try_ts,
+            m.LinkQueue.last_error,
+            m.LinkQueue.batch_id,
             m.LinkQueue.origin_msg,
             m.LinkQueue.owner_admin_id,
-            m.LinkQueue.owner_username,
         )
         .filter(
             m.LinkQueue.state == "queued",
@@ -141,33 +126,25 @@ def fetch_due(
             conds.append(m.LinkQueue.batch_id.notlike(pref))
         q = q.filter(or_(*conds))
     rows = q.limit(limit).all()
-    return [
-        LinkQueueItem(
-            id=int(r.id),
-            url=r.url,
-            tries=int(r.tries),
-            origin_chat=r.origin_chat,
-            origin_msg=r.origin_msg,
-            owner_admin_id=r.owner_admin_id,
-            owner_username=r.owner_username,
-        )
-        for r in rows
-    ]
+    return LinkQueueRecordListAdapter.validate_python(rows)
 
 
 def fetch_batch_due(
     db: Session, batch_id: str, limit: int = 50
-) -> List[LinkQueueItem]:
+) -> List[LinkQueueRecord]:
     now = _now()
     rows = (
         db.query(
             m.LinkQueue.id,
             m.LinkQueue.url,
+            m.LinkQueue.state,
             m.LinkQueue.tries,
-            m.LinkQueue.origin_chat,
+            m.LinkQueue.added_ts,
+            m.LinkQueue.next_try_ts,
+            m.LinkQueue.last_error,
+            m.LinkQueue.batch_id,
             m.LinkQueue.origin_msg,
             m.LinkQueue.owner_admin_id,
-            m.LinkQueue.owner_username,
         )
         .filter(
             m.LinkQueue.state == "queued",
@@ -178,18 +155,8 @@ def fetch_batch_due(
         .limit(limit)
         .all()
     )
-    return [
-        LinkQueueItem(
-            id=int(r.id),
-            url=r.url,
-            tries=int(r.tries),
-            origin_chat=r.origin_chat,
-            origin_msg=r.origin_msg,
-            owner_admin_id=r.owner_admin_id,
-            owner_username=r.owner_username,
-        )
-        for r in rows
-    ]
+    mapped = [dict(row._mapping) for row in rows]
+    return LinkQueueRecordListAdapter.validate_python(mapped)
 
 
 def count_processing(db: Session) -> int:
@@ -228,14 +195,11 @@ def mark_failed(db: Session, item_id: int, error: str, backoff_sec: int, max_ret
 def delete_by_owner(
     db: Session,
     owner_admin_id: Optional[int] = None,
-    owner_username: Optional[str] = None,
     urls: Optional[list[str]] = None,
 ) -> int:
     conditions = []
     if owner_admin_id is not None:
         conditions.append(m.LinkQueue.owner_admin_id == owner_admin_id)
-    elif owner_username:
-        conditions.append(m.LinkQueue.owner_username == owner_username.lstrip("@").lower())
     if urls:
         conditions.append(m.LinkQueue.url.in_(urls))
     if not conditions:

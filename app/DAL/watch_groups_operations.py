@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.db import models as m
 from app.utils.time_utils import ensure_moscow_timezone, moscow_now
+from app.db.session import session_scope
 
 
 @dataclass
@@ -57,39 +58,41 @@ def _post_row_to_record(row: m.WatchPost) -> WatchGroupPostRecord:
     )
 
 
-def list_groups_for_admin(db: Session, admin_id: int, network_ids: Optional[List[int]] = None) -> List[WatchGroupRecord]:
+def list_groups_for_admin(admin_id: int, network_ids: Optional[List[int]] = None) -> List[WatchGroupRecord]:
     network_ids = network_ids or []
-    q = (
-        db.query(m.WatchGroup)
-        .filter(
-            exists().where(
-                (m.WatchPost.group_id == m.WatchGroup.id)
-                & (m.WatchPost.status != "cancelled")
+    with session_scope() as db:
+        q = (
+            db.query(m.WatchGroup)
+            .filter(
+                exists().where(
+                    (m.WatchPost.group_id == m.WatchGroup.id)
+                    & (m.WatchPost.status != "cancelled")
+                )
             )
         )
-    )
-    if network_ids:
-        q = q.filter(
-            (m.WatchGroup.admin_id == int(admin_id))
-            | (m.WatchGroup.network_id.in_(network_ids))
-        )
-    else:
-        q = q.filter(m.WatchGroup.admin_id == int(admin_id))
-    rows = q.order_by(m.WatchGroup.id.desc()).all()
+        if network_ids:
+            q = q.filter(
+                (m.WatchGroup.admin_id == int(admin_id))
+                | (m.WatchGroup.network_id.in_(network_ids))
+            )
+        else:
+            q = q.filter(m.WatchGroup.admin_id == int(admin_id))
+        rows = q.order_by(m.WatchGroup.id.desc()).all()
     return [_group_row_to_record(g) for g in rows]
 
 
-def sum_actual_price_for_network(db: Session, net_id: int, days: int = 30) -> float:
+def sum_actual_price_for_network(net_id: int, days: int = 30) -> float:
     try:
         cutoff = moscow_now() - timedelta(days=days)
     except Exception:
         return 0.0
     total = 0.0
-    rows = db.execute(
-        select(m.WatchGroup.actual_price, m.WatchGroup.created_at).where(
-            m.WatchGroup.network_id == int(net_id)
-        )
-    ).all()
+    with session_scope() as db:
+        rows = db.execute(
+            select(m.WatchGroup.actual_price, m.WatchGroup.created_at).where(
+                m.WatchGroup.network_id == int(net_id)
+            )
+        ).all()
     for price, created_at in rows:
         try:
             if created_at and ensure_moscow_timezone(datetime.fromisoformat(str(created_at))) < cutoff:
@@ -104,17 +107,18 @@ def sum_actual_price_for_network(db: Session, net_id: int, days: int = 30) -> fl
     return total
 
 
-def sum_subscribers_for_network(db: Session, net_id: int, days: int = 30) -> int:
+def sum_subscribers_for_network(net_id: int, days: int = 30) -> int:
     try:
         cutoff = moscow_now() - timedelta(days=days)
     except Exception:
         return 0
     total = 0
-    rows = db.execute(
-        select(m.WatchGroup.subscribers, m.WatchGroup.created_at).where(
-            m.WatchGroup.network_id == int(net_id)
-        )
-    ).all()
+    with session_scope() as db:
+        rows = db.execute(
+            select(m.WatchGroup.subscribers, m.WatchGroup.created_at).where(
+                m.WatchGroup.network_id == int(net_id)
+            )
+        ).all()
     for subs, created_at in rows:
         try:
             if created_at and ensure_moscow_timezone(datetime.fromisoformat(str(created_at))) < cutoff:
@@ -129,23 +133,24 @@ def sum_subscribers_for_network(db: Session, net_id: int, days: int = 30) -> int
     return total
 
 
-def get_group_detail(db: Session, group_id: int) -> Tuple[Optional[WatchGroupRecord], List[WatchGroupPostRecord]]:
-    g = db.query(m.WatchGroup).filter(m.WatchGroup.id == int(group_id)).one_or_none()
-    posts = (
-        db.query(m.WatchPost)
-        .filter(m.WatchPost.group_id == int(group_id), m.WatchPost.status != "cancelled")
-        .order_by(m.WatchPost.id.desc())
-        .all()
-    )
+def get_group_detail(group_id: int) -> Tuple[Optional[WatchGroupRecord], List[WatchGroupPostRecord]]:
+    with session_scope() as db:
+        g = db.query(m.WatchGroup).filter(m.WatchGroup.id == int(group_id)).one_or_none()
+        posts = (
+            db.query(m.WatchPost)
+            .filter(m.WatchPost.group_id == int(group_id), m.WatchPost.status != "cancelled")
+            .order_by(m.WatchPost.id.desc())
+            .all()
+        )
     group_rec = _group_row_to_record(g) if g else None
     posts_list = [_post_row_to_record(p) for p in posts]
     return group_rec, posts_list
 
 
-def set_watch_group_subscribers(db: Session, group_id: int, subscribers: int) -> None:
-    db.execute(
-        update(m.WatchGroup)
-        .where(m.WatchGroup.id == int(group_id))
-        .values(subscribers=int(subscribers))
-    )
-    db.commit()
+def set_watch_group_subscribers(group_id: int, subscribers: int) -> None:
+    with session_scope() as db:
+        db.execute(
+            update(m.WatchGroup)
+            .where(m.WatchGroup.id == int(group_id))
+            .values(subscribers=int(subscribers))
+        )

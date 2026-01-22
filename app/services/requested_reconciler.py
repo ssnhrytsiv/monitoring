@@ -18,9 +18,8 @@ from telethon.tl.functions.channels import GetParticipantRequest
 from app.DAL import requested_operations as rdb
 from app.services import link_queue
 from app.services.account_pool import iter_pool_clients, session_name
-from app.DAL import channels_operations as cho
-from app.DAL import invite_owners_operations as ioo
 from app.DAL import membership_operations as mem_db
+from app.DAL import invite_cache_operations as ic_db
 from app.db.session import session_scope
 
 log = logging.getLogger("services.requested_reconciler")
@@ -66,28 +65,6 @@ RL_DEBUG = os.getenv("REQUESTED_RECONCILER_RL_DEBUG", "0").lower() not in ("0", 
 def _membership_db():
     with session_scope() as db:
         yield db
-
-
-def _get_invite_owner(invite_hash: str):
-    with session_scope() as db:
-        return ioo.get_invite_owner(db, invite_hash)
-
-
-def _find_channel(cid: int):
-    with session_scope() as db:
-        return cho.find_channel(db, cid)
-
-
-def _upsert_channel(cid: int, username, title, owner_admin_id, last_status):
-    with session_scope() as db:
-        cho.upsert_channel(
-            db,
-            cid,
-            username,
-            title,
-            owner_admin_id,
-            last_status,
-        )
 
 
 class InviteCheckStatus(Enum):
@@ -415,37 +392,11 @@ async def run_requested_reconciler() -> None:
                         title = getattr(ch_obj, "title", None)
                         try:
                             with _membership_db() as db:
-                                mem_db.map_invite_set(db, invite_hash, cid, title)
+                                ic_db.map_invite_set(db, invite_hash, cid, title)
                                 mem_db.upsert_membership(db, sess, cid, "already")
-                                mem_db.invite_cache_status_put(db, invite_hash, "already")
+                                ic_db.invite_cache_status_put(db, invite_hash, "already")
                         except Exception:
                             pass
-
-                        # NEW: sticky owner from invite -> channel if channel has no owner yet
-                        try:
-                            inv_row = _get_invite_owner(str(invite_hash))
-                        except Exception:
-                            inv_row = None
-                        if inv_row:
-                            try:
-                                ch_row = _find_channel(cid)
-                            except Exception:
-                                ch_row = None
-                            ex_owner_admin = ch_row.owner_admin_id if ch_row else None
-                            if not ex_owner_admin:
-                                oa = inv_row.owner_admin_id
-                                if oa:
-                                    try:
-                                        _upsert_channel(cid, None, title, oa, "already")
-                                        log.debug(
-                                            "[reconciler.invites] set owner from invite (cid=%s invite=%s admin=%s)",
-                                            cid, invite_hash, oa,
-                                        )
-                                    except Exception as e:
-                                        log.debug(
-                                            "[reconciler.invites] failed to set owner from invite (cid=%s invite=%s): %s",
-                                            cid, invite_hash, e,
-                                        )
 
                         with session_scope() as db:
                             rdb.clear_invite(db, sess, invite_hash)
@@ -506,7 +457,7 @@ async def run_requested_reconciler() -> None:
                             except Exception:
                                 pass
                             try:
-                                mem_db.invite_cache_status_put_for_channel(db_mem, cid, "already")
+                                ic_db.invite_cache_status_put_for_channel(db_mem, cid, "already")
                             except Exception:
                                 pass
                             with session_scope() as db:

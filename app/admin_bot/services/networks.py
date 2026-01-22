@@ -40,7 +40,7 @@ def add_channels_to_network(
 ) -> dict:
     """
     Додає канали до мережі.
-    - якщо admin_id заданий, канал має бути прив'язаний до цього адміна (admin_channels), інакше не додаємо;
+    - якщо admin_id заданий, канал має бути прив'язаний до цього адміна (channels.owner_admin_id), інакше не додаємо;
     - якщо move_existing=True: якщо канал уже є в іншій сітці того ж адміна – переносимо в цільову.
     """
     return net_db.add_channels_to_network(
@@ -56,8 +56,8 @@ def networks_with_channels(db: Session, admin_id: int) -> list[net_db.NetworkWit
     return net_db.networks_with_channels(db, admin_id)
 
 
-def admin_channels_without_network(db: Session, admin_id: int) -> List[m.Channel]:
-    return net_db.admin_channels_without_network(db, admin_id)
+def list_channels_without_network_for_admin(db: Session, admin_id: int) -> List[m.Channel]:
+    return net_db.list_channels_without_network_for_admin(db, admin_id)
 
 
 def delete_network(db: Session, network_id: int) -> dict:
@@ -98,7 +98,7 @@ def channel_hyperlink(db: Session, ch: m.Channel) -> str:
     """
     Повертає HTML-посилання на канал: username -> https://t.me/<username>,
     якщо немає username – шукаємо invite_hash у invite_cache і будуємо https://t.me/+<hash> (з назвою з invite_cache.title, якщо є),
-    якщо немає і цього – повертаємо екрановану назву або останній raw_url.
+    якщо немає і цього – повертаємо екрановану назву або останній url_norm.
     """
     meta = net_db.channel_link_meta(db, ch.channel_id)
     if not meta:
@@ -110,11 +110,11 @@ def channel_hyperlink(db: Session, ch: m.Channel) -> str:
     if meta.invite_hash:
         label = title or meta.invite_title or meta.invite_hash
         return f'<a href="https://t.me/+{html.escape(meta.invite_hash)}">{html.escape(label)}</a>'
-    if meta.last_raw_url:
+    if meta.last_url:
         try:
-            href = sanitize_link(meta.last_raw_url) or meta.last_raw_url
+            href = sanitize_link(meta.last_url) or meta.last_url
         except Exception:
-            href = meta.last_raw_url
+            href = meta.last_url
         label = title or href or str(meta.channel_id)
         return f'<a href="{html.escape(href)}">{html.escape(label)}</a>'
     return html.escape(title or str(meta.channel_id))

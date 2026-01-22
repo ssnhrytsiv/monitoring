@@ -23,7 +23,6 @@ def _env(name: str, default: str = "") -> str:
 
 API_ID   = int(_env("API_ID", "0") or "0")
 API_HASH = _env("API_HASH", "")
-PRIMARY  = _env("SESSION") or _env("SESSION_NAME") or "tg_session"
 
 # Людські імена акаунтів (для логів/діагностики). Оновлюється на старті пулу через get_me.
 SESSION_DISPLAY: dict[str, str] = {
@@ -37,7 +36,7 @@ SESSION_DISPLAY: dict[str, str] = {
 def _parse_accounts_env() -> List[str]:
     """
     ACCOUNTS=tg_session_2,tg_session_3
-    Прибираємо пробіли, дублікати та primary (SESSION/SESSION_NAME).
+    Прибираємо пробіли й дублікати.
     """
     raw = _env("ACCOUNTS")
     names = [x.strip() for x in raw.split(",") if x.strip()]
@@ -46,7 +45,6 @@ def _parse_accounts_env() -> List[str]:
         if n not in seen:
             out.append(n)
             seen.add(n)
-    out = [n for n in out if n != PRIMARY]
     return out
 
 POOL_SESSIONS = _parse_accounts_env()
@@ -117,7 +115,6 @@ def find_slot_by_session_name(name: str) -> Optional[ClientSlot]:
 def get_client_by_session_name(name: str) -> Optional[TelegramClient]:
     """
     Повертає TelegramClient із пулу за ім’ям сесії, або None якщо не знайдено/не в пулі.
-    (PRIMARY тут недоступний, він не є частиною пулу.)
     """
     slot = find_slot_by_session_name(name)
     return slot.client if slot else None
@@ -301,7 +298,6 @@ async def _ensure_connected(slot: ClientSlot) -> None:
 async def start_pool() -> None:
     """
     Створює та піднімає клієнти для ACCOUNTS.
-    PRIMARY (SESSION) не додаємо у пул.
     """
     global _POOL, _limits_checker_task
     if not POOL_SESSIONS:
@@ -310,8 +306,6 @@ async def start_pool() -> None:
         return
     if not API_ID or not API_HASH:
         raise RuntimeError("API_ID/API_HASH must be set in .env for pool")
-    if PRIMARY in POOL_SESSIONS:
-        log.warning("PRIMARY session %s присутня в ACCOUNTS — це може викликати блокування .session. Рекомендується використовувати окремі файли сесій для пулу.", PRIMARY)
 
     pool: List[ClientSlot] = []
     for sess in POOL_SESSIONS:

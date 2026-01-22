@@ -126,10 +126,8 @@ def get_invite_sessions(db: Session, invite_hash: str) -> List[str]:
 
 
 def due_invites(db: Session, sessions: Sequence[str], limit: int) -> List[InviteCheckRecord]:
-    if not sessions:
-        return []
     now = _now()
-    rows = (
+    return InviteCheckRecordListAdapter.validate_python(
         db.query(sm.InviteCheck)
         .filter(sm.InviteCheck.session.in_(sessions))
         .filter(sm.InviteCheck.next_check_at <= now)
@@ -137,7 +135,6 @@ def due_invites(db: Session, sessions: Sequence[str], limit: int) -> List[Invite
         .limit(int(limit))
         .all()
     )
-    return InviteCheckRecordListAdapter.validate_python(rows)
 
 
 def backoff_invite_miss(db: Session, session: str, invite_hash: str) -> None:

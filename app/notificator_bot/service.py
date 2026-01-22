@@ -81,8 +81,7 @@ def _admin_label(admin_id: int | None) -> str | None:
 
 
 def _get_watch_info(watch_id: int) -> dict:
-    with session_scope() as db:
-        return watch_posts_db.get_watch_info_db(db, watch_id)
+    return watch_posts_db.get_watch_info_db(watch_id)
 
 
 def _channel_meta(channel_id: int, fallback_url: str | None) -> Tuple[str, str]:
@@ -291,7 +290,7 @@ def collect_grouped_events(
     Всередині групи по кожному watch_id залишаємо найпріоритетніший запис.
     """
     with session_scope() as db:
-        events = fetch_unsent_events(db, limit=1000)
+        events = fetch_unsent_events(limit=1000)
     log.debug("notificator: fetched unsent events count=%s", len(events))
     if not events:
         log.debug("notificator: no unsent events")
@@ -583,7 +582,6 @@ async def send_notifications(bot: Bot, debounce_sec: int = 60) -> None:
     sent_to = NOTIFIER_TARGET_IDS[0] if NOTIFIER_TARGET_IDS else 0
     for ev_id in dict.fromkeys(event_ids):
         try:
-            with session_scope() as db:
-                mark_event_sent(db, ev_id, sent_to)
+            mark_event_sent(ev_id, sent_to)
         except Exception as e:
             log.error("mark_event_sent failed for event_id=%s: %s", ev_id, e)

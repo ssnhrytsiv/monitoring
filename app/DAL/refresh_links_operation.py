@@ -114,19 +114,6 @@ def build_refresh_plan(current_cids: Set[int], batch_results: List[BatchResultDT
     )
 
 
-def invite_cache_status_get_bulk(db: Session, invites: list[str]) -> Dict[str, Optional[str]]:
-    hashes = [sanitize_link(x) or x for x in invites or [] if x]
-    hashes = [h for h in hashes if h]
-    if not hashes:
-        return {}
-    rows = (
-        db.query(m.InviteCache.invite_hash, m.InviteCache.status)
-        .filter(m.InviteCache.invite_hash.in_(hashes))
-        .all()
-    )
-    return {row[0]: row[1] for row in rows if row and row[0]}
-
-
 def bulk_channel_title_owner(db: Session, channel_ids: List[int]) -> Dict[int, Optional[str]]:
     ids = [int(cid) for cid in channel_ids or [] if cid is not None]
     if not ids:
@@ -199,21 +186,21 @@ def bulk_channel_link_meta(db: Session, channel_ids: List[int]) -> Dict[int, tup
         select(m.Channel.channel_id, m.Channel.username, m.Channel.title).where(m.Channel.channel_id.in_(ids))
     ).all()
     meta: Dict[int, Dict[str, Optional[str]]] = {
-        int(cid): {"username": username, "title": title, "raw_url": None} for cid, username, title in channels if cid
+        int(cid): {"username": username, "title": title, "url_norm": None} for cid, username, title in channels if cid
     }
     link_rows = db.execute(
-        select(m.Link.channel_id, m.Link.raw_url)
+        select(m.Link.channel_id, m.Link.url_norm)
         .where(m.Link.channel_id.in_(ids))
         .order_by(m.Link.id.desc())
     ).all()
-    for cid, raw_url in link_rows:
+    for cid, url_norm in link_rows:
         if cid is None:
             continue
         cid_i = int(cid)
         if cid_i not in meta:
-            meta[cid_i] = {"username": None, "title": None, "raw_url": None}
-        if meta[cid_i]["raw_url"] is None and raw_url:
-            meta[cid_i]["raw_url"] = raw_url
+            meta[cid_i] = {"username": None, "title": None, "url_norm": None}
+        if meta[cid_i]["url_norm"] is None and url_norm:
+            meta[cid_i]["url_norm"] = url_norm
 
     result: Dict[int, tuple[Optional[str], Optional[str]]] = {}
     for cid, data in meta.items():
@@ -221,7 +208,7 @@ def bulk_channel_link_meta(db: Session, channel_ids: List[int]) -> Dict[int, tup
         username = data.get("username")
         if username:
             href = f"https://t.me/{str(username).lstrip('@')}"
-        elif data.get("raw_url"):
-            href = data.get("raw_url")
+        elif data.get("url_norm"):
+            href = data.get("url_norm")
         result[cid] = (data.get("title"), href)
     return result

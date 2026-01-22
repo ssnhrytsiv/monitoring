@@ -1,6 +1,6 @@
 """DAL для сіток (networks) та зв'язків каналів із сітками."""
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 import time
 import re
 
@@ -38,7 +38,7 @@ class ChannelLinkMeta:
     title: Optional[str]
     invite_hash: Optional[str]
     invite_title: Optional[str]
-    last_raw_url: Optional[str]
+    last_url: Optional[str]
 
 
 def get_network_for_channel(db: Session, channel_id: int) -> Optional[NetworkChannelBind]:
@@ -176,18 +176,9 @@ def add_channels_to_network(
         if not ch:
             not_found += 1
             continue
-        if admin_id is not None:
-            ac = (
-                db.query(m.AdminChannel)
-                .filter(
-                    m.AdminChannel.admin_id == admin_id,
-                    m.AdminChannel.channel_id == ch.channel_id,
-                )
-                .one_or_none()
-            )
-            if not ac:
-                not_found += 1
-                continue
+        if admin_id is not None and ch.owner_admin_id != admin_id:
+            not_found += 1
+            continue
 
         existing_same = (
             db.query(m.NetworkChannel)
@@ -247,7 +238,7 @@ def ensure_primary_network(db: Session, admin_id: int, name: str = "Основн
     return net
 
 
-def admin_channels_without_network(db: Session, admin_id: int) -> List[m.Channel]:
+def list_channels_without_network_for_admin(db: Session, admin_id: int) -> List[m.Channel]:
     admin = db.query(m.Admin).filter(m.Admin.id == admin_id).one_or_none()
     if not admin or not admin.channels:
         return []
@@ -328,9 +319,9 @@ def channel_link_meta(db: Session, channel_id: int) -> Optional[ChannelLinkMeta]
     )
     invite_hash = invite_row.invite_hash if invite_row else None
     invite_title = invite_row.title if invite_row else None
-    raw_url = (
-        db.query(m.Link.raw_url)
-        .filter(m.Link.channel_id == channel_id, m.Link.raw_url.isnot(None))
+    last_url = (
+        db.query(m.Link.url_norm)
+        .filter(m.Link.channel_id == channel_id, m.Link.url_norm.isnot(None))
         .order_by(m.Link.id.desc())
         .scalar()
     )
@@ -340,13 +331,13 @@ def channel_link_meta(db: Session, channel_id: int) -> Optional[ChannelLinkMeta]
         title=ch.title,
         invite_hash=invite_hash,
         invite_title=invite_title,
-        last_raw_url=raw_url,
+        last_url=last_url,
     )
 
 
 def move_orphans_to_primary(db: Session, admin_id: int) -> int:
     primary = ensure_primary_network(db, admin_id)
-    orphan = admin_channels_without_network(db, admin_id)
+    orphan = list_channels_without_network_for_admin(db, admin_id)
     if not orphan:
         return 0
     moved = 0
@@ -427,6 +418,19 @@ def delete_network_channels_by_networks(db: Session, network_ids: List[int], cha
     if channel_ids:
         q = q.filter(m.NetworkChannel.channel_id.in_(channel_ids))
     return q.delete(synchronize_session=False)
+
+
+def delete_networks_by_admin(db: Session, admin_id: int) -> tuple[int, list[int]]:
+    net_ids = [
+        nid
+        for (nid,) in db.query(m.Network.id)
+        .filter(m.Network.admin_id == int(admin_id))
+        .all()
+        if nid is not None
+    ]
+    if net_ids:
+        db.query(m.Network).filter(m.Network.id.in_(net_ids)).delete(synchronize_session=False)
+    return len(net_ids), net_ids
 
 
 def update_network_params(

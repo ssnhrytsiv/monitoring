@@ -5,8 +5,8 @@ from sqlalchemy.orm import sessionmaker
 from app.db import models as m
 from app.DAL import channels_operations as ch_db
 from app.DAL import link_queue_operations as lq_db
-from app.DAL import invite_owners_operations as io_db
 from app.DAL import membership_operations as mem_db
+from app.DAL import invite_cache_operations as ic_db
 
 
 @pytest.fixture()
@@ -30,8 +30,6 @@ def test_find_channel_by_link(db_session):
         raw_url="https://t.me/+abcd",
         kind="invite",
         batch_msg_id=None,
-        owner_admin_id=None,
-        owner_username="ownername",
     )
     found = ch_db.find_channel_by_link(db_session, "https://t.me/+abcd")
     assert found and found.channel_id == 501 and found.title == "Test"
@@ -42,11 +40,9 @@ def test_link_queue_flow(db_session):
         db_session,
         ["https://t.me/+x1", "https://t.me/+x2"],
         batch_id="batchA",
-        origin_chat=111,
         origin_msg=222,
         delay_sec=0,
         owner_admin_id=7,
-        owner_username="demo",
         adopt_existing=False,
         reset_next_try=True,
     )
@@ -71,17 +67,15 @@ def test_link_queue_flow(db_session):
 
 
 def test_link_queue_adopt_existing(db_session):
-    lq_db.enqueue(db_session, ["https://t.me/+dup"], batch_id="b1", origin_chat=None, origin_msg=None, delay_sec=0, owner_admin_id=None, owner_username=None)
+    lq_db.enqueue(db_session, ["https://t.me/+dup"], batch_id="b1", origin_msg=None, delay_sec=0, owner_admin_id=None)
     # second enqueue same url with adopt_existing should update existing row, not create new
     added = lq_db.enqueue(
         db_session,
         ["https://t.me/+dup"],
         batch_id="b2",
-        origin_chat=1,
         origin_msg=2,
         delay_sec=0,
         owner_admin_id=5,
-        owner_username="demo",
         adopt_existing=True,
         reset_next_try=False,
     )
@@ -91,40 +85,30 @@ def test_link_queue_adopt_existing(db_session):
     latest = rows[-1]
     assert latest.batch_id == "b2"
     assert latest.owner_admin_id == 5
-    assert latest.owner_username == "demo"
 
 
 def test_delete_by_owner_username(db_session):
-    lq_db.enqueue(db_session, ["https://t.me/+del"], batch_id=None, origin_chat=None, origin_msg=None, delay_sec=0, owner_admin_id=None, owner_username="@User")
-    lq_db.enqueue(db_session, ["https://t.me/+keep"], batch_id=None, origin_chat=None, origin_msg=None, delay_sec=0, owner_admin_id=1, owner_username=None)
-    deleted = lq_db.delete_by_owner(db_session, owner_username="user")
+    lq_db.enqueue(db_session, ["https://t.me/+del"], batch_id=None, origin_msg=None, delay_sec=0, owner_admin_id=5)
+    lq_db.enqueue(db_session, ["https://t.me/+keep"], batch_id=None, origin_msg=None, delay_sec=0, owner_admin_id=1)
+    deleted = lq_db.delete_by_owner(db_session, owner_admin_id=5)
     assert deleted == 1
     remaining = lq_db.fetch_due(db_session, limit=10)
     assert len(remaining) == 1
     assert remaining[0].url == "https://t.me/+keep"
 
 
-def test_invite_owner_dao(db_session):
-    dao = io_db.InviteOwnersDAO(db_session)
-    dao.set_invite_owner("h123", owner_username="demo", owner_admin_id=None)
-    dao.set_invite_owner("h123", owner_username=None, owner_admin_id=42)
-    data = dao.get_invite_owner("h123")
-    assert data.owner_admin_id == 42
-    assert data.owner_username is None
-
-
 def test_membership_upsert(db_session):
-    m.upsert_membership(db_session, channel_id=77, account="acc1", status="joined")
+    mem_db.upsert_membership(db_session, account="acc1", channel_id=77, status="joined")
     row = db_session.query(m.Membership).filter(m.Membership.channel_id == 77, m.Membership.account == "acc1").one()
     assert row.status == "joined"
-    m.upsert_membership(db_session, channel_id=77, account="acc1", status="left")
+    mem_db.upsert_membership(db_session, account="acc1", channel_id=77, status="left")
     row = db_session.query(m.Membership).filter(m.Membership.channel_id == 77, m.Membership.account == "acc1").one()
     assert row.status == "left"
 
 
 def test_invite_cache_upsert_and_get(db_session):
-    mem_db.invite_cache_upsert(db_session, "https://t.me/+AAA111", channel_id=10, title="Chan", status="queued", session="sess1")
-    res = mem_db.invite_cache_get(db_session, "AAA111")
+    ic_db.invite_cache_upsert(db_session, "https://t.me/+AAA111", channel_id=10, title="Chan", status="queued", session="sess1")
+    res = ic_db.invite_cache_get(db_session, "AAA111")
     assert res is not None
     assert res.channel_id == 10
     assert res.title == "Chan"
@@ -132,8 +116,8 @@ def test_invite_cache_upsert_and_get(db_session):
     assert res.session == "sess1"
 
     # update existing entry
-    mem_db.invite_cache_upsert(db_session, "AAA111", status="joined", session="sess2", last_error="ok")
-    res2 = mem_db.invite_cache_get(db_session, "https://t.me/+AAA111")
+    ic_db.invite_cache_upsert(db_session, "AAA111", status="joined", session="sess2", last_error="ok")
+    res2 = ic_db.invite_cache_get(db_session, "https://t.me/+AAA111")
     assert res2 is not None
     assert res2.status == "joined"
     assert res2.session == "sess2"
@@ -141,25 +125,26 @@ def test_invite_cache_upsert_and_get(db_session):
 
 
 def test_invite_cache_map_and_status_helpers(db_session):
-    mem_db.map_invite_set(db_session, "https://t.me/+BBB222", channel_id=20, title="Bbb")
-    map_rec = mem_db.map_invite_get(db_session, "BBB222")
+    ic_db.map_invite_set(db_session, "https://t.me/+BBB222", channel_id=20, title="Bbb")
+    map_rec = ic_db.map_invite_get(db_session, "BBB222")
     assert map_rec
-    assert map_rec.channel_id == 20
-    assert map_rec.title == "Bbb"
+    cid, title = map_rec
+    assert cid == 20
+    assert title == "Bbb"
 
-    mem_db.invite_cache_status_put(db_session, "BBB222", "queued")
-    assert mem_db.invite_cache_status_get(db_session, "https://t.me/+BBB222") == "queued"
+    ic_db.invite_cache_status_put(db_session, "BBB222", "queued")
+    assert ic_db.invite_cache_status_get(db_session, "https://t.me/+BBB222") == "queued"
 
 
 def test_invite_status_delete_filtered(db_session):
-    mem_db.invite_cache_upsert(db_session, "h1", status="queued")
-    mem_db.invite_cache_upsert(db_session, "h2", status="failed")
-    mem_db.invite_cache_upsert(db_session, "h3", status="failed")
+    ic_db.invite_cache_upsert(db_session, "h1", status="queued")
+    ic_db.invite_cache_upsert(db_session, "h2", status="failed")
+    ic_db.invite_cache_upsert(db_session, "h3", status="failed")
 
-    deleted = mem_db.invite_cache_status_delete(db_session, ["h1", "h2", "h3"], statuses=["failed"])
+    deleted = ic_db.invite_cache_status_delete(db_session, ["h1", "h2", "h3"], statuses=["failed"])
     assert deleted == 2
     # h1 should remain
-    rec_h1 = mem_db.invite_cache_get(db_session, "h1")
+    rec_h1 = ic_db.invite_cache_get(db_session, "h1")
     assert rec_h1 and rec_h1.status == "queued"
-    assert mem_db.invite_cache_get(db_session, "h2") is None
-    assert mem_db.invite_cache_get(db_session, "h3") is None
+    assert ic_db.invite_cache_get(db_session, "h2") is None
+    assert ic_db.invite_cache_get(db_session, "h3") is None

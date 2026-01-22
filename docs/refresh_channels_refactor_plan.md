@@ -115,7 +115,7 @@ This file is the single source of truth for progress. After each step is complet
   - bulk URL normalization / mapping helpers
   - batch `channel_id -> title/owner/admin` lookups
   - batch membership account/session hints for a set of channels
-  - batch removed-item link metadata (invite_hash/last_raw_url/title)
+  - batch removed-item link metadata (invite_hash/last_url/title)
 - [ ] Ensure every DAL helper returns dataclasses with named fields, not tuples.
 
 ### 7) Cleanup Imports + Type Safety
@@ -162,7 +162,7 @@ This file is the single source of truth for progress. After each step is complet
 - 2026-01-20: Step 3A — `finalize_refresh_confirmation` більше не має `await` у `session_scope`, застосування/звіт робляться поза DB-блоком.
 - 2026-01-20: Step 4A — `_cleanup_removed_channels` розбито на фази: DB gather → async leave → DB apply → link_queue cleanup (немає await у `session_scope`).
 - 2026-01-21: Phase C оптимізовано пакетними DAL-хелперами (немає SQL у циклі), додано batch DTO (BatchResultDTO, RefreshPlanDTO) і bulk lookup для meta/conflicts/memberships.
-- 2026-01-21: Bulk-хелпери для refresh зібрані в `app/DAL/refresh_links_operation.py` (titles/admins/conflicts/memberships/link_meta, invite_cache_status_get_bulk).
+- 2026-01-21: Bulk-хелпери для refresh зібрані в `app/DAL/refresh_links_operation.py` (titles/admins/conflicts/memberships/link_meta; invite_cache_status_get_bulk перенесено в `app/DAL/invite_cache_operations.py` і повертає список DTO).
 - 2026-01-21: Step 2 done — `refresh_channels_for_admin` приймає `RefreshContext`, розбито на фази A–D (DB read → async batch → DB plan build → async preview/report), DB не переходить через await.
 
 ## Codex Prompt (Copy/Paste)

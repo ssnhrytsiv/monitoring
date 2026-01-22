@@ -7,7 +7,6 @@ load_dotenv()
 load_dotenv(".env.local", override=True)
 
 log = logging.getLogger("config")
-log.info("CONFIG env SESSION_NAME=%r", os.getenv("SESSION_NAME"))
 
 ENV_MODE = os.getenv("ENV", "").lower()
 

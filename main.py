@@ -16,15 +16,10 @@ from app.services.requested_reconciler import run_requested_reconciler  # noqa: 
 from app.db.session import init_db as orm_init_db  # noqa: E402
 from app.services.owner_conflict_guard import init as owner_guard_init  # noqa: E402
 
-from app.services.googlesheets.channels_export_service import (  # noqa: E402
-    start_channels_exporter,
-    stop_channels_exporter,
-)
 
 from app.watch_bot.run import run_bot  # noqa: E402
 from app.admin_bot.run import run_admin_bot  # noqa: E402
 from app.admin_bot.config import ADMIN_BOT_TOKEN  # noqa: E402
-from scripts.forward_bot import start_forward_bot  # noqa: E402
 from app.notificator_bot.run import start_notificator_bot  # noqa: E402
 
 
@@ -37,10 +32,8 @@ async def _main():
     log = get_logger("main")
 
     reconciler_task = None
-    exporter_task = None
     bot_task = None
     admin_bot_task = None
-    forward_bot_task = None
     notifier_task = None
 
     def _log_task_result(name: str):
@@ -111,15 +104,6 @@ async def _main():
             log.exception("client.disconnect() failed after reconciler create failure")
         raise SystemExit(1)
 
-    try:
-        exporter_task = start_channels_exporter()
-        if exporter_task:
-            log.debug("Channels exporter task created: %s", exporter_task.get_name())
-        else:
-            log.info("Channels exporter is disabled or not configured; skipping")
-    except Exception:
-        log.exception("Failed to start channels exporter")
-
     log.info("Завантажую плагіни…")
     t0 = time.perf_counter()
     try:
@@ -159,13 +143,6 @@ async def _main():
         log.exception("Failed to start Bot UI task")
 
     try:
-        forward_bot_task = asyncio.create_task(start_forward_bot(), name="forward_bot")
-        forward_bot_task.add_done_callback(_log_task_result("Forward bot"))
-        log.info("Forward bot task created: %s", forward_bot_task.get_name())
-    except Exception:
-        log.exception("Failed to start Forward bot task")
-
-    try:
         notifier_task = asyncio.create_task(start_notificator_bot(), name="notificator_bot")
         notifier_task.add_done_callback(_log_task_result("Notifier bot"))
         log.info("Notifier bot task created: %s", notifier_task.get_name())
@@ -203,16 +180,6 @@ async def _main():
             except Exception:
                 log.exception("Bot UI task finished with error")
 
-        if forward_bot_task:
-            log.info("Зупиняю Forward bot…")
-            forward_bot_task.cancel()
-            try:
-                await forward_bot_task
-            except asyncio.CancelledError:
-                log.debug("Forward bot task cancelled")
-            except Exception:
-                log.exception("Forward bot task finished with error")
-
         if admin_bot_task:
             log.info("Зупиняю admin bot…")
             admin_bot_task.cancel()
@@ -222,13 +189,6 @@ async def _main():
                 log.debug("Admin bot task cancelled")
             except Exception:
                 log.exception("Admin bot task finished with error")
-
-        if exporter_task:
-            log.info("Зупиняю експортер каналів…")
-            try:
-                await stop_channels_exporter()
-            except Exception:
-                log.exception("Channels exporter stop failed")
 
         if reconciler_task:
             log.info("Зупиняю reconciler…")

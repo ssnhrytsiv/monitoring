@@ -73,7 +73,7 @@ def get_links_by_channel_ids(cids: List[int]) -> Dict[int, str]:
         log.exception("get_links_by_channel_ids failed: %s", e)
         return {}
 
-def get_owners_by_channel_ids(cids: List[int]) -> List[channels_db.ChannelOwnerLabel]:
+def get_owners_by_channel_ids(cids: List[int]) -> List[channels_db.ChannelOwner]:
     try:
         with session_scope() as db:
             return channels_db.get_owners_by_channel_ids(db, cids)

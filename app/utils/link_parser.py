@@ -1,6 +1,6 @@
 from __future__ import annotations
 import re
-from typing import Iterable, List, Union, Any
+from typing import Iterable, List, Union, Any, Optional
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 import html as _html_mod
 
@@ -83,6 +83,30 @@ def normalize(url: str) -> str:
     return url
 
 
+def normalize_invite_hash(invite_or_url: str) -> Optional[str]:
+    """
+    Повертає чистий invite-hash із:
+      - https://t.me/+XXXXXXXX
+      - https://t.me/joinchat/XXXXXXXX
+    або None, якщо це не інвайт.
+    Приймає також уже чистий хеш (без пробілів та '/').
+    """
+    if not invite_or_url:
+        return None
+    raw_value = str(invite_or_url)
+    raw_value = raw_value.replace("\u200b", "").replace("\u200e", "").replace("\u200f", "").strip()
+    try:
+        if "/+" in raw_value:
+            return raw_value.rsplit("/", 1)[-1].replace("+", "").strip()
+        if "joinchat/" in raw_value:
+            return raw_value.rsplit("joinchat/", 1)[-1].strip()
+        if "/" not in raw_value and " " not in raw_value:
+            return raw_value
+    except Exception:
+        return None
+    return None
+
+
 def sanitize_link(u: str) -> str:
     """
     Нормалізує/«лікує» URL:
@@ -94,7 +118,7 @@ def sanitize_link(u: str) -> str:
       - для t.me завжди ставить HTTPS
     Повертає стабільний рядок. Якщо не вдалось розпарсити — повертає виправлене «як є».
     """
-    s = (u or "").strip()
+    s = _clean(u or "")
     if not s:
         return s
 
@@ -159,6 +183,20 @@ def sanitize_link(u: str) -> str:
         p = SplitResult("https", p.netloc, p.path, p.query, p.fragment)
 
     return urlunsplit(p)
+
+
+def build_invite_url(invite_hash: Optional[str]) -> Optional[str]:
+    """
+    Конструює стандартний інвайт-URL https://t.me/+<hash> і нормалізує його.
+    Повертає None, якщо хеш порожній або невалідний.
+    """
+    h = normalize_invite_hash(invite_hash or "")
+    if not h:
+        return None
+    try:
+        return sanitize_link(f"https://t.me/+{h}")
+    except Exception:
+        return f"https://t.me/+{h}"
 
 
 def extract_bot_username(u: str) -> str | None:

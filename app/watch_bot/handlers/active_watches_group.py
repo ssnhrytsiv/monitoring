@@ -384,8 +384,8 @@ async def watch_group_similar(cb: CallbackQuery):
         await cb.answer("Вотчів у групі немає", show_alert=True)
         return
 
-    with session_scope() as db:
-        cands = list_group_watch_candidates(db, wids, status=CANDIDATE_PENDING_STATUS)
+
+    cands = list_group_watch_candidates(wids, status=CANDIDATE_PENDING_STATUS)
     if not cands:
         kb = InlineKeyboardBuilder()
         bb = back_button(callback_data=f"watch:group:{leader_wid}")
@@ -582,8 +582,7 @@ async def watch_similar_accept(cb: CallbackQuery):
     if gsb:
         try:
             text_hash = cand.text_hash or ""
-            with session_scope() as db:
-                accepted = list_candidates_by_hash(db, text_hash, status="accepted") if text_hash else []
+            accepted = list_candidates_by_hash(text_hash, status="accepted") if text_hash else []
             target_wids = {c.watch_id for c in accepted if c.watch_id}
             if not target_wids and cand.watch_id:
                 target_wids = {cand.watch_id}
@@ -622,8 +621,7 @@ async def watch_similar_reject(cb: CallbackQuery):
     text_hash = cand.text_hash or ""
     rejected_any = False
     if text_hash:
-        with session_scope() as db:
-            for c in list_candidates_by_hash(db, text_hash, status="pending"):
+            for c in list_candidates_by_hash(text_hash, status="pending"):
                 set_watch_candidate_status(db, int(c.id), "rejected")
                 rejected_any = True
     else:
@@ -661,8 +659,7 @@ async def watch_similar_view(cb: CallbackQuery):
     wid = cand.watch_id
 
     # Всі кандидати з тим самим text_hash (щоб показати всі канали разом; тільки pending)
-    with session_scope() as db:
-        same_hash = list_candidates_by_hash(db, cand.text_hash or "", status=CANDIDATE_PENDING_STATUS) or [cand]
+    same_hash = list_candidates_by_hash(cand.text_hash or "", status=CANDIDATE_PENDING_STATUS) or [cand]
 
     # Обмежуємо кандидати лише рамками цієї групи watch'ів
     group_wids: List[int] = []
@@ -830,8 +827,7 @@ async def watch_change_status(cb: CallbackQuery, state: FSMContext):
         await cb.answer("bad id", show_alert=True)
         return
 
-    with session_scope() as db:
-        ok = set_watch_status_pending_db(db, wid)
+    ok = set_watch_status_pending_db(wid)
     if not ok:
         await cb.answer("Не зміг змінити статус", show_alert=True)
         return

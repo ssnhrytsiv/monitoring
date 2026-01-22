@@ -2,176 +2,187 @@
 DAO operations for admins.
 Усі функції приймають зовнішній Session (без внутрішнього SessionLocal).
 """
-from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 
-from sqlalchemy import select, text, or_
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.db import models as m
+from app.db.session import session_scope
+from app.DAL.schemas import AdminRecord, AdminRecordListAdapter
 
 
-@dataclass
-class AdminLabel:
-    display: Optional[str]
-    username: Optional[str]
-
-
-@dataclass(frozen=True)
-class AdminSnapshot:
-    id: int
-    username: Optional[str]
-    display: Optional[str]
-    tg_id: Optional[int]
-
-
-def get_admin_by_id(db: Session, admin_id: int) -> Optional[AdminSnapshot]:
+def get_admin_by_id(db: Session, admin_id: int) -> Optional[AdminRecord]:
     row = db.execute(
         select(m.Admin.id, m.Admin.username, m.Admin.display, m.Admin.tg_id).where(m.Admin.id == int(admin_id))
     ).first()
     if not row:
         return None
-    adm_id, username, display, tg_id = row
-    if adm_id is None:
+    return AdminRecord.model_validate(row)
+
+
+def get_admin_by_record(db: Session, admin: AdminRecord) -> Optional[AdminRecord]:
+    if admin is None or admin.id is None:
         return None
-    return AdminSnapshot(id=int(adm_id), username=username, display=display, tg_id=tg_id)
-
-
-def get_admin_entity_by_id(db: Session, admin_id: int) -> Optional[m.Admin]:
-    return db.execute(select(m.Admin).where(m.Admin.id == int(admin_id))).scalars().first()
-
-
-def get_admin_by_tg_id(db: Session, tg_id: int) -> Optional[AdminSnapshot]:
     row = db.execute(
-        select(m.Admin.id, m.Admin.username, m.Admin.display, m.Admin.tg_id).where(m.Admin.tg_id == tg_id)
+        select(m.Admin.id, m.Admin.username, m.Admin.display, m.Admin.tg_id).where(m.Admin.id == int(admin.id))
     ).first()
     if not row:
         return None
-    adm_id, username, display, tg_id_val = row
-    if adm_id is None:
+    return AdminRecord.model_validate(row)
+
+
+def get_admin_by_username(db: Session, username: str) -> Optional[AdminRecord]:
+    row = db.execute(select(m.Admin).where(m.Admin.username == username)).scalar_one_or_none()
+    if not row:
         return None
-    return AdminSnapshot(id=int(adm_id), username=username, display=display, tg_id=tg_id_val)
+    return AdminRecord.model_validate(row)
 
 
-def get_admin_by_username(db: Session, username: str) -> Optional[m.Admin]:
-    return db.execute(select(m.Admin).where(m.Admin.username == username)).scalar_one_or_none()
+def get_admin_by_display(db: Session, display: str) -> Optional[AdminRecord]:
+    row = db.execute(select(m.Admin).where(m.Admin.display == display)).scalar_one_or_none()
+    if not row:
+        return None
+    return AdminRecord.model_validate(row)
 
 
-def get_admin_by_display(db: Session, display: str) -> Optional[m.Admin]:
-    return db.execute(select(m.Admin).where(m.Admin.display == display)).scalar_one_or_none()
+def get_admin_by_display_autosession(display: str, username: Optional[str] = None) -> Optional[AdminRecord]:
+    """
+    Шукає адміна по display, опційно оновлює username.
+    Працює всередині session_scope, не створює нового адміна.
+    """
+    if not display:
+        return None
+    with session_scope() as db:
+        admin_obj = db.execute(select(m.Admin).where(m.Admin.display == display)).scalar_one_or_none()
+        if not admin_obj:
+            return None
+        changed = False
+        if username and admin_obj.username != username:
+            admin_obj.username = username
+            changed = True
+        if display and admin_obj.display != display:
+            admin_obj.display = display
+            changed = True
+        if changed:
+            db.commit()
+            db.refresh(admin_obj)
+        return AdminRecord.model_validate(admin_obj)
 
 
-def delete_admin_channels_by_admin(db: Session, admin_id: int) -> int:
-    return m.delete_admin_channels_by_admin(db, admin_id)
-
-
-def delete_networks_by_admin(db: Session, admin_id: int) -> tuple[int, list[int]]:
-    return m.delete_networks_by_admin(db, admin_id)
-
-
-def delete_network_channels_by_networks(db: Session, network_ids: list[int]) -> int:
-    return m.delete_network_channels_by_networks(db, network_ids)
-
-
-def delete_memberships_by_channels(db: Session, channel_ids: list[int]) -> int:
-    return m.delete_memberships_by_channels(db, channel_ids)
-
-
-def delete_membership_status_by_channels(db: Session, channel_ids: list[int]) -> int:
-    return m.delete_membership_status_by_channels(db, channel_ids)
-
-
-def delete_owner_conflict_by_channels(db: Session, channel_ids: list[int]) -> int:
-    return m.delete_owner_conflict_by_channels(db, channel_ids)
-
-
-def delete_links_by_channels(db: Session, channel_ids: list[int]) -> int:
-    return m.delete_links_by_channels(db, channel_ids)
-
-
-def delete_channels_by_ids(db: Session, channel_ids: list[int]) -> int:
-    return m.delete_channels_by_ids(db, channel_ids)
-
-
-def delete_invite_owners_by_owner(db: Session, owner_admin_id: int, owner_username: Optional[str]) -> int:
-    inv_where = ["owner_admin_id = :aid"]
-    inv_params = {"aid": owner_admin_id}
-    if owner_username:
-        inv_where.append("owner_username = :ou")
-        inv_params["ou"] = owner_username
-    inv_sql = f"DELETE FROM invite_owners WHERE {' OR '.join(inv_where)}"
-    return db.execute(text(inv_sql), inv_params).rowcount or 0
-
-
-def delete_links_no_channel_by_owner(db: Session, owner_admin_id: int, owner_username: Optional[str]) -> int:
-    conds = [m.Link.owner_admin_id == owner_admin_id]
-    if owner_username:
-        conds.append(m.Link.owner_username == owner_username)
+def delete_admin_by_id(db: Session, admin_id: int) -> int:
     return (
-        db.query(m.Link)
-        .filter(m.Link.channel_id.is_(None))
-        .filter(or_(*conds))
+        db.query(m.Admin)
+        .filter(m.Admin.id == int(admin_id))
         .delete(synchronize_session=False)
-    )
-
-
-def list_owner_links_no_channel(db: Session, owner_admin_id: int, owner_username: Optional[str]) -> list[str]:
-    conds = [m.Link.owner_admin_id == owner_admin_id]
-    if owner_username:
-        conds.append(m.Link.owner_username == owner_username)
-    rows = db.execute(
-        select(m.Link.raw_url).where(
-            m.Link.channel_id.is_(None),
-            or_(*conds),
-        )
-    ).all()
-    return [r[0] for r in rows if r and r[0]]
+    ) or 0
 
 
 def delete_url_cache(db: Session, urls: list[str], statuses: Optional[list[str]]) -> int:
     urls = [u for u in urls if u]
     if not urls:
         return 0
-    url_ph = ",".join([f":u{i}" for i in range(len(urls))])
-    params = {f"u{i}": u for i, u in enumerate(urls)}
-    sql = f"DELETE FROM url_cache WHERE url IN ({url_ph})"
+    q = db.query(m.UrlCache).filter(m.UrlCache.url.in_(urls))
     if statuses:
         st = [s for s in statuses if s]
-        if st:
-            st_ph = ",".join([f":s{i}" for i in range(len(st))])
-            params.update({f"s{i}": s for i, s in enumerate(st)})
-            sql += f" AND status IN ({st_ph})"
-    return db.execute(text(sql), params).rowcount or 0
+        if not st:
+            return 0
+        q = q.filter(m.UrlCache.status.in_(st))
+    deleted = q.delete(synchronize_session=False)
+    db.commit()
+    return deleted or 0
 
 
-def list_admins(db: Session) -> list[m.Admin]:
-    return list(db.execute(select(m.Admin).order_by(m.Admin.id.desc())).scalars().all())
+def list_admins(db: Session) -> List[AdminRecord]:
+    rows = db.execute(select(m.Admin).order_by(m.Admin.id.desc())).scalars().all()
+    return AdminRecordListAdapter.validate_python(rows)
 
 
 def list_admin_channel_ids(db: Session, admin_id: int) -> list[int]:
     rows = (
-        db.execute(select(m.AdminChannel.channel_id).where(m.AdminChannel.admin_id == int(admin_id)))
+        db.execute(select(m.Channel.channel_id).where(m.Channel.owner_admin_id == int(admin_id)))
         .scalars()
         .all()
     )
     return [int(r) for r in rows if r is not None]
 
 
-def get_admin_channel_for_channel(db: Session, channel_id: int) -> Optional[m.AdminChannel]:
-    return (
-        db.execute(select(m.AdminChannel).where(m.AdminChannel.channel_id == int(channel_id)))
-        .scalars()
-        .first()
-    )
-
-
-def get_admin_label(db: Session, admin_id: int) -> Optional[AdminLabel]:
+def get_admin_label(db: Session, admin_id: int) -> Optional[AdminRecord]:
     """
-    Повертає AdminLabel(display, username) для admin_id або None, якщо немає запису.
+    Повертає AdminRecord(display, username) для admin_id або None, якщо немає запису.
     """
     admin_row = db.execute(
         select(m.Admin.display, m.Admin.username).where(m.Admin.id == int(admin_id))
     ).first()
     if not admin_row:
         return None
-    return AdminLabel(display=admin_row[0], username=admin_row[1])
+    return AdminRecord(display=admin_row[0], username=admin_row[1])
+
+
+def get_or_create_admin_entity(
+    db: Session,
+    *,
+    tg_id: Optional[int],
+    username: Optional[str],
+    display: Optional[str],
+) -> m.Admin:
+    adm = None
+    if tg_id is not None:
+        adm = db.query(m.Admin).filter(m.Admin.tg_id == tg_id).one_or_none()
+    if adm is None and username:
+        adm = db.query(m.Admin).filter(m.Admin.username == username).one_or_none()
+    if adm is None and display:
+        adm = db.query(m.Admin).filter(m.Admin.display == display).one_or_none()
+
+    if adm:
+        if tg_id is not None:
+            adm.tg_id = tg_id
+        if username:
+            adm.username = username
+        if display:
+            adm.display = display
+    else:
+        adm = m.Admin(tg_id=tg_id, username=username, display=display)
+        db.add(adm)
+    db.commit()
+    db.refresh(adm)
+    return adm
+
+
+def toggle_admin_new_flag(db: Session, admin_id: int) -> Optional[m.Admin]:
+    adm = db.query(m.Admin).filter(m.Admin.id == int(admin_id)).one_or_none()
+    if not adm:
+        return None
+    current = getattr(adm, "is_new", 0) or 0
+    adm.is_new = 0 if current else 1
+    db.commit()
+    db.refresh(adm)
+    return adm
+
+
+def update_admin_params(
+    db: Session,
+    admin_id: int,
+    *,
+    cpm: Optional[float] = None,
+    price: Optional[float] = None,
+    subscribers: Optional[int] = None,
+) -> Optional[m.Admin]:
+    adm = db.query(m.Admin).filter(m.Admin.id == int(admin_id)).one_or_none()
+    if not adm:
+        return None
+    if cpm is not None:
+        adm.cpm = float(cpm)
+    if price is not None:
+        adm.price = float(price)
+    if subscribers is not None:
+        adm.subscribers = int(subscribers)
+    db.commit()
+    db.refresh(adm)
+    return adm
+
+
+def remove_admin(db: Session, admin_id: int) -> bool:
+    res = db.query(m.Admin).filter(m.Admin.id == int(admin_id)).delete(synchronize_session=False)
+    db.commit()
+    return bool(res)

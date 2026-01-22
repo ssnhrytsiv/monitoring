@@ -12,7 +12,7 @@
 - `post_template`: шаблони постів; DAO `app/DAL/post_templates_operations.py`, плагіни `post_templates`.
 - `watch_posts`, `watch_events`, `watch_candidates`, `watch_groups`: логіка вотчів і нотифікацій; використовуються через DAO в `app/DAL/watch_*_operations.py`, моделі у `app.db.models`, хендлери `active_watches_*`, `gsheets_buffer` (запис статусів).
 - `bot_links`: посилання на боти; DAO `app/DAL/bot_links_operations.py`, меню адмінів (`admin_bot/bot/admins_menu.py`).
-- `invite_cache`, `invite_owners`, `membership`, `url_cache`, `link_queue`: блок сабскрипшенів/інвайтів; DAO в `app/DAL/membership_operations.py`, використовуються у `admins.py`, subscription воркерах, cleanup‑скриптах.
+- `invite_cache`, `membership`, `url_cache`, `link_queue`: блок сабскрипшенів/інвайтів; DAO в `app/DAL/membership_operations.py`, використовуються у `admins.py`, subscription воркерах, cleanup‑скриптах.
 - `owner_conflicts`: резолюція власників; `app/services/owner_conflict_guard.py`, `admin_bot/services/admins.py`.
 - `notifier_state`, `notifier_messages`: стан/історія нотифікатора; `app/notificator_bot/models.py`.
 
@@ -33,7 +33,7 @@
 - admin_bot/main.py: `from app.db.session import Base, engine`
 - admin_bot/services/networks.py: `from app.db import models as m`
 - admin_bot/db/models.py: `from app.db.session import Base`
-- admin_bot/services/subscription/subscription_worker.py: `from app.db.models import upsert_membership`
+- admin_bot/services/subscription/subscription_worker.py: `from app.DAL import membership_operations as mem_db`
 - admin_bot/services/subscription/subscription_worker.py: `from app.db.session import SessionLocal`
 - admin_bot/services/subscription/subscription_worker.py: `from app.db import models as m`
 - alembic/env.py: `from app.db import models as shared_models`

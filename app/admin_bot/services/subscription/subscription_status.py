@@ -8,7 +8,7 @@ from app.utils.link_parser import sanitize_link
 from app.services.account_pool import session_display
 
 
-def normalize_url(url: str) -> str:
+def _clean_url(url: str) -> str:
     try:
         cleaned = sanitize_link(url) or url
     except Exception:
@@ -89,7 +89,7 @@ def render_html_with_statuses(
     norm_counts: Dict[str, int] = {}
     cid_counts: Dict[Optional[int], int] = {}
     for it in result_items:
-        n = normalize_url(it.get("url", ""))
+        n = _clean_url(it.get("url", ""))
         norm_counts[n] = norm_counts.get(n, 0) + 1
         cid_counts[it.get("channel_id")] = cid_counts.get(it.get("channel_id"), 0) + 1
 
@@ -99,7 +99,7 @@ def render_html_with_statuses(
     # Готуємо бакети items по нормалізованому URL, щоб брати по одному в порядку
     buckets: Dict[str, List[Dict]] = {}
     for it in result_items:
-        n = normalize_url(it.get("url", ""))
+        n = _clean_url(it.get("url", ""))
         buckets.setdefault(n, []).append(it)
 
     norm_seen: Dict[str, int] = {}
@@ -114,7 +114,7 @@ def render_html_with_statuses(
         return None
 
     for url in render_order:
-        norm = normalize_url(url)
+        norm = _clean_url(url)
         item = _pop_item(norm)
         if not item:
             continue
@@ -162,4 +162,4 @@ def render_html_with_statuses(
     return final_text
 
 
-__all__ = ["normalize_url", "render_html_with_statuses"]
+__all__ = ["render_html_with_statuses"]

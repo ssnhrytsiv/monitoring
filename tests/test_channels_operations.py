@@ -5,14 +5,12 @@ from sqlalchemy.orm import sessionmaker
 from app.db import models as m
 from app.DAL import channels_operations as ch_db
 from app.DAL.channels_operations import (
-    ChannelOwnerLabel,
-    ChannelOwnerInfo,
-    ChannelTitleOwner,
     ChannelRecord,
-    LinkLookup,
     RecentChannel,
     RecentLink,
 )
+from app.DAL.schemas import LinkRecord
+from app.DAL.schemas.channel import ChannelOwner
 
 
 @pytest.fixture()
@@ -62,16 +60,12 @@ def test_add_link_and_find_channel(db_session):
         raw_url="https://t.me/+abc",
         kind="invite",
         batch_msg_id=1,
-        owner_admin_id=3,
-        owner_username="should_ignore",
     )
-    # owner_admin_id має записатись, owner_username проігнорований
     link = db_session.query(m.Link).one()
-    assert link.owner_admin_id == 3
-    assert link.owner_username is None
+    assert link.url_norm == "https://t.me/+abc"
 
     found = ch_db.find_channel_by_link(db_session, "https://t.me/+abc")
-    assert isinstance(found, LinkLookup)
+    assert isinstance(found, LinkRecord)
     assert found.channel_id == 20
     assert found.title == "Chan"
 
@@ -90,7 +84,7 @@ def test_get_owners_by_channel_ids(db_session):
     ch_db.upsert_channel(db_session, channel_id=41, username=None, title=None, owner_admin_id=None)
 
     owners = ch_db.get_owners_by_channel_ids(db_session, [40, 41])
-    assert all(isinstance(o, ChannelOwnerLabel) for o in owners)
+    assert all(isinstance(o, ChannelOwner) for o in owners)
     owners_map = {o.channel_id: o.owner_label for o in owners}
     assert owners_map[40] == "Alice"
     assert 41 not in owners_map
@@ -102,7 +96,7 @@ def test_get_channel_owner_info(db_session):
     db_session.commit()
     ch_db.upsert_channel(db_session, channel_id=50, username=None, title=None, owner_admin_id=admin.id)
     info = ch_db.get_channel_owner_info(db_session, 50)
-    assert isinstance(info, ChannelOwnerInfo)
+    assert isinstance(info, ChannelOwner)
     assert info.owner_admin_id == admin.id
     assert info.owner_display == "Bob"
 
@@ -111,19 +105,19 @@ def test_get_channel_title_and_owner(db_session):
     admin = m.Admin(display="Carol", username="carol")
     db_session.add(admin)
     db_session.commit()
-    ch_db.upsert_channel(db_session, channel_id=60, username=None, title="Title60", owner_admin_id=admin.id, owner_username=None)
+    ch_db.upsert_channel(db_session, channel_id=60, username=None, title="Title60", owner_admin_id=admin.id)
     res = ch_db.get_channel_title_and_owner(db_session, 60)
-    assert isinstance(res, ChannelTitleOwner)
+    assert isinstance(res, ChannelOwner)
     assert res.title == "Title60"
     assert res.owner_label == "Carol"
 
 
 def test_recent_links_and_channels(db_session):
     # Links
-    ch_db.add_link(db_session, channel_id=None, raw_url="https://t.me/+zzz", kind="invite", batch_msg_id=None, owner_admin_id=None, owner_username=None)
+    ch_db.add_link(db_session, channel_id=None, raw_url="https://t.me/+zzz", kind="invite", batch_msg_id=None)
     links = ch_db.recent_links(db_session, limit=1)
     assert links and isinstance(links[0], RecentLink)
-    assert links[0].raw_url == "https://t.me/+zzz"
+    assert links[0].url_norm == "https://t.me/+zzz"
 
     # Channels
     admin = m.Admin(display="Dora", username="dora")
@@ -153,8 +147,6 @@ def test_get_channel_id_by_url_norm_and_raw(db_session):
         raw_url="https://t.me/u90",
         kind="public",
         batch_msg_id=None,
-        owner_admin_id=None,
-        owner_username=None,
     )
     cid_norm = ch_db.get_channel_id_by_url(db_session, "https://t.me/u90")
     assert cid_norm == 90

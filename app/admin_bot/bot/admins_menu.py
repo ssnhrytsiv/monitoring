@@ -521,7 +521,7 @@ def _result_groups_for_admin(admin_id: int) -> tuple[list[WatchGroupRecord], lis
     with session_scope() as db:
         nets = svc_networks.list_networks_by_admin(db, admin_id)
         net_ids = [n.id for n in nets]
-        groups_data = watch_groups_db.list_groups_for_admin(db, admin_id, net_ids)
+    groups_data = watch_groups_db.list_groups_for_admin(admin_id, net_ids)
     return groups_data, net_ids
 
 
@@ -552,14 +552,12 @@ def _build_results_text(admin, groups: list[WatchGroupRecord]) -> str:
 
 def _sum_actual_price_for_network(net_id: int, days: int = 30) -> float:
     """Сумує actual_price груп для сітки за останні days."""
-    with session_scope() as db:
-        return watch_groups_db.sum_actual_price_for_network(db, net_id, days)
+    return watch_groups_db.sum_actual_price_for_network(net_id, days)
 
 
 def _sum_subscribers_for_network(net_id: int, days: int = 30) -> int:
     """Сумує subscribers груп для сітки за останні days."""
-    with session_scope() as db:
-        return watch_groups_db.sum_subscribers_for_network(db, net_id, days)
+    return watch_groups_db.sum_subscribers_for_network(net_id, days)
 
 
 def _results_kb(admin_id: int, groups: list[WatchGroupRecord]) -> InlineKeyboardMarkup:
@@ -572,8 +570,7 @@ def _results_kb(admin_id: int, groups: list[WatchGroupRecord]) -> InlineKeyboard
 
 
 def _render_group_detail(admin_id: int, group_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    with session_scope() as db:
-        group_data, posts_data = watch_groups_db.get_group_detail(db, group_id)
+    group_data, posts_data = watch_groups_db.get_group_detail(group_id)
     if not group_data:
         return "Групу не знайдено.", InlineKeyboardMarkup(
             inline_keyboard=[
@@ -826,8 +823,7 @@ async def on_group_subs(m, state: FSMContext):
     except Exception:
         await m.answer("Не вдалося розпізнати число, спробуй ще раз.")
         return
-    with session_scope() as db:
-        watch_groups_db.set_watch_group_subscribers(db, int(gid), subs)
+    watch_groups_db.set_watch_group_subscribers(int(gid), subs)
     await state.clear()
     text, kb = _render_group_detail(int(admin_id), int(gid))
     await m.answer(f"Підписників встановлено: {subs}", reply_markup=InlineKeyboardMarkup(
@@ -917,6 +913,7 @@ async def cb_admin_net_edit(cb: CallbackQuery):
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="Додати сітку", callback_data=f"admin_net_add:{admin_id}")],
+                [InlineKeyboardButton(text="Задати порядок", callback_data=f"admin_net_order:{admin_id}")],
                 [
                     InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin_id}"),
                     InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu"),
@@ -928,6 +925,7 @@ async def cb_admin_net_edit(cb: CallbackQuery):
         return
     rows = _build_networks_keyboard(db, nets, admin_id)
     rows.append([InlineKeyboardButton(text="Додати сітку", callback_data=f"admin_net_add:{admin_id}")])
+    rows.append([InlineKeyboardButton(text="Задати порядок", callback_data=f"admin_net_order:{admin_id}")])
     rows.append([
         InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin_id}"),
         InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu"),
@@ -957,6 +955,27 @@ async def cb_admin_net_page(cb: CallbackQuery):
     svc_networks.move_orphans_to_primary(db, admin_id)
     # пагінації для списку сіток більше немає – повертаємо до admin_net_edit
     await cb_admin_net_edit(cb)
+
+
+@router.callback_query(F.data.startswith("admin_net_order:"))
+async def cb_admin_net_order(cb: CallbackQuery):
+    try:
+        admin_id = int(cb.data.split(":", 1)[1])
+    except Exception:
+        await cb.answer()
+        return
+    text = (
+        "Порядок каналів у сітках тепер відтворює послідовність додавання з черги. "
+        "Додаткове ручне налаштування буде доступне пізніше."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ До сіток", callback_data=f"admin_net_edit:{admin_id}")],
+            [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
+        ]
+    )
+    await cb.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+    await cb.answer()
 
 
 @router.callback_query(F.data.startswith("admin_back:"))

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from typing import List, Optional, Tuple
 
 from sqlalchemy import (
@@ -16,43 +15,38 @@ from sqlalchemy import (
     select,
     Index,
     PrimaryKeyConstraint,
+    CheckConstraint,
 )
-from sqlalchemy.orm import Session, relationship
+from sqlalchemy.orm import relationship
 from sqlalchemy.sql import text
 
 from app.db.session import Base
+from app.utils.time_utils import moscow_timestamp
+
+
+def _link_cache_now() -> int:
+    try:
+        return int(moscow_timestamp())
+    except Exception:
+        import time
+        return int(time.time())
 
 
 class Channel(Base):
     __tablename__ = "channels"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    channel_id = Column(BigInteger, unique=True, index=True)
+    channel_id = Column(BigInteger, unique=True, index=True, nullable=False)
     order_index = Column(BigInteger, index=True)
     username = Column(String)
     title = Column(String)
-    owner_admin_id = Column(Integer)
+    owner_admin_id = Column(Integer, ForeignKey("admins.id", ondelete="CASCADE"), index=True, nullable=False)
     last_status = Column(String)
     updated_at = Column(String)
 
-    links = relationship(
-        "Link",
-        primaryjoin="Channel.channel_id==foreign(Link.channel_id)",
-        lazy="selectin",
-        viewonly=True,
-    )
-    owner_admin = relationship(
-        "Admin",
-        primaryjoin="foreign(Channel.owner_admin_id)==Admin.id",
-        lazy="joined",
-        viewonly=True,
-    )
-    invite_caches = relationship(
-        "InviteCache",
-        primaryjoin="Channel.channel_id==foreign(InviteCache.channel_id)",
-        lazy="selectin",
-        viewonly=True,
-    )
+    links = relationship("Link", lazy="selectin")
+    owner_admin = relationship("Admin", lazy="joined", back_populates="channels")
+    invite_caches = relationship("InviteCache", lazy="selectin")
 
 
 class Link(Base):
@@ -62,14 +56,21 @@ class Link(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    channel_id = Column(BigInteger, index=True)
-    owner_admin_id = Column(Integer)
-    raw_url = Column(Text)
-    url_norm = Column(Text, index=True)
+    channel_id = Column(BigInteger, ForeignKey("channels.channel_id", ondelete="CASCADE"), index=True, nullable=True)
+    url_norm = Column(
+        Text,
+        ForeignKey("link_cache.url_norm", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
     kind = Column(String)
     batch_msg_id = Column(BigInteger)
-    owner_username = Column(String)
     added_at = Column(String)
+    cache = relationship(
+        "LinkCache",
+        lazy="selectin",
+        back_populates="link",
+    )
 
 
 class Membership(Base):
@@ -78,29 +79,10 @@ class Membership(Base):
         UniqueConstraint("channel_id", "account", name="pk_membership"),
     )
 
-    channel_id = Column(Integer, primary_key=True)
+    channel_id = Column(BigInteger, ForeignKey("channels.channel_id", ondelete="CASCADE"), primary_key=True, nullable=False)
     account = Column(String, primary_key=True)
     status = Column(String, nullable=False)
     ts = Column(Integer, nullable=False)
-
-
-def upsert_membership(db: Session, channel_id: int, account: str, status: str) -> None:
-    """Зберігає статус підписки для пари (channel_id, account)."""
-    now = int(time.time())
-    row = (
-        db.query(Membership)
-        .filter(
-            Membership.channel_id == channel_id,
-            Membership.account == account,
-        )
-        .one_or_none()
-    )
-    if row:
-        row.status = status
-        row.ts = now
-    else:
-        db.add(Membership(channel_id=channel_id, account=account, status=status, ts=now))
-    db.commit()
 
 
 class LinkQueue(Base):
@@ -115,17 +97,42 @@ class LinkQueue(Base):
     next_try_ts = Column(Integer, nullable=False)
     last_error = Column(Text)
     batch_id = Column(String)
-    origin_chat = Column(BigInteger)
     origin_msg = Column(BigInteger)
-    owner_admin_id = Column(Integer)
-    owner_username = Column(String)
+    owner_admin_id = Column(Integer, ForeignKey("admins.id", ondelete="CASCADE"))
+
+
+class LinkCache(Base):
+    __tablename__ = "link_cache"
+
+    url_norm = Column(Text, primary_key=True)
+    kind = Column(String, nullable=False)  # public | invite | bot
+    status = Column(String, nullable=False)
+    account = Column(String, nullable=True)
+    channel_id = Column(BigInteger, ForeignKey("channels.channel_id", ondelete="CASCADE"), nullable=True)
+    title = Column(Text, nullable=True)
+    last_error = Column(Text, nullable=True)
+    join_time = Column(Integer, nullable=False, default=_link_cache_now)
+
+    __table_args__ = (
+        CheckConstraint("kind in ('public','invite','bot')", name="ck_link_cache_kind"),
+        Index("idx_link_cache_kind", "kind"),
+        Index("idx_link_cache_join_time", "join_time"),
+        Index("idx_link_cache_channel_id", "channel_id"),
+    )
+    link = relationship(
+        "Link",
+        lazy="selectin",
+        back_populates="cache",
+        uselist=False,
+    )
 
 
 class InviteCache(Base):
     __tablename__ = "invite_cache"
+    # updated_at колонку прибрали; останній стан відслідковується через status/last_error та фактичні записи в invite_check.
 
     invite_hash = Column(String, primary_key=True)
-    channel_id = Column(BigInteger, ForeignKey("channels.channel_id", ondelete="SET NULL"), index=True, nullable=True)
+    channel_id = Column(BigInteger, ForeignKey("channels.channel_id", ondelete="CASCADE"), index=True, nullable=True)
     title = Column(String)
     status = Column(String)
     session = Column(String)
@@ -179,7 +186,7 @@ class RequestedCheck(Base):
     __tablename__ = "requested_check"
 
     session = Column(Text, nullable=False)
-    channel_id = Column(Integer, nullable=False)
+    channel_id = Column(BigInteger, ForeignKey("channels.channel_id", ondelete="CASCADE"), nullable=False)
     noted_at = Column(Integer, nullable=False)
     next_check_at = Column(Integer, nullable=False)
     tries = Column(Integer, nullable=False, default=0)
@@ -202,7 +209,7 @@ class OwnerConflict(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     owner = Column(String, nullable=False)
-    channel_id = Column(Integer)
+    channel_id = Column(BigInteger)
     source_ref = Column(String)
     reason = Column(String, nullable=False)
     created_at = Column(Integer, nullable=False)
@@ -220,30 +227,14 @@ class Admin(Base):
     price = Column(Float)
     subscribers = Column(Integer)
 
-    channels = relationship(
-        "AdminChannel",
-        primaryjoin="Admin.id==foreign(AdminChannel.admin_id)",
-        lazy="selectin",
-        viewonly=True,
-    )
-
-
-class AdminChannel(Base):
-    __tablename__ = "admin_channels"
-    __table_args__ = (
-        UniqueConstraint("admin_id", "channel_id", name="uq_admin_channel"),
-    )
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    admin_id = Column(Integer, nullable=False)
-    channel_id = Column(Integer, nullable=False)
+    channels = relationship("Channel", lazy="selectin", back_populates="owner_admin")
 
 
 class Network(Base):
     __tablename__ = "networks"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    admin_id = Column(Integer, nullable=True)
+    admin_id = Column(Integer, ForeignKey("admins.id", ondelete="CASCADE"), nullable=True)
     name = Column(String, nullable=False)
     description = Column(Text)
     created_at = Column(Integer)
@@ -263,8 +254,8 @@ class NetworkChannel(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    network_id = Column(Integer, nullable=False)
-    channel_id = Column(Integer, nullable=False)
+    network_id = Column(Integer, ForeignKey("networks.id", ondelete="CASCADE"), nullable=False)
+    channel_id = Column(BigInteger, ForeignKey("channels.channel_id", ondelete="CASCADE"), nullable=False)
     price = Column(Float)
     currency = Column(String)
     cpm = Column(Float)
@@ -276,15 +267,6 @@ class NetworkChannel(Base):
     note = Column(Text)
     created_at = Column(Integer)
     updated_at = Column(Integer)
-
-
-class InviteOwner(Base):
-    __tablename__ = "invite_owners"
-
-    invite_hash = Column(Text, primary_key=True)
-    owner_admin_id = Column(Integer)
-    owner_username = Column(Text)
-    created_at = Column(Text)
 
 
 class BotLink(Base):
@@ -379,7 +361,7 @@ class WatchPost(Base):
     created_by = Column(BigInteger, nullable=True, index=True)
     created_via = Column(Text, nullable=True)
     project = Column(Text, nullable=True)
-    group_id = Column(BigInteger, nullable=True, index=True)
+    group_id = Column(Integer, nullable=True, index=True)
     admin_id = Column(Integer, nullable=True, index=True)
     network_id = Column(Integer, nullable=True, index=True)
     posted_at = Column(Text, nullable=True, index=True)
@@ -404,7 +386,7 @@ class WatchEvent(Base):
     __tablename__ = "watch_events"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    watch_id = Column(BigInteger, nullable=False)
+    watch_id = Column(Integer, nullable=False)
     event_type = Column(String, nullable=False)
     payload_json = Column(Text, nullable=True)
     created_at = Column(Text, nullable=False)
@@ -420,7 +402,7 @@ class WatchCandidate(Base):
     __tablename__ = "watch_candidates"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    watch_id = Column(BigInteger, nullable=False, index=True)
+    watch_id = Column(Integer, nullable=False, index=True)
     channel_id = Column(BigInteger, nullable=True)
     message_id = Column(BigInteger, nullable=True)
     text_hash = Column(Text, nullable=True, index=True)
@@ -429,83 +411,3 @@ class WatchCandidate(Base):
     status = Column(String, nullable=True, default="pending", index=True)
     created_at = Column(Text, nullable=False)
     expires_at = Column(Text, nullable=True, index=True)
-
-
-def delete_admin_channels_by_admin(db: Session, admin_id: int) -> int:
-    return db.execute(delete(AdminChannel).where(AdminChannel.admin_id == admin_id)).rowcount or 0
-
-
-def delete_network_channels_by_networks(db: Session, net_ids: List[int]) -> int:
-    if not net_ids:
-        return 0
-    return db.execute(delete(NetworkChannel).where(NetworkChannel.network_id.in_(net_ids))).rowcount or 0
-
-
-def delete_networks_by_admin(db: Session, admin_id: int) -> Tuple[int, List[int]]:
-    net_ids = list(db.execute(select(Network.id).where(Network.admin_id == admin_id)).scalars().all())
-    if net_ids:
-        db.execute(delete(Network).where(Network.id.in_(net_ids)))
-    return len(net_ids), net_ids
-
-
-def delete_admin_by_id(db: Session, admin_id: int) -> int:
-    return db.execute(delete(Admin).where(Admin.id == admin_id)).rowcount or 0
-
-
-def delete_memberships_by_channels(db: Session, chan_ids: List[int]) -> int:
-    if not chan_ids:
-        return 0
-    return db.execute(delete(Membership).where(Membership.channel_id.in_(chan_ids))).rowcount or 0
-
-
-def delete_membership_status_by_channels(db: Session, chan_ids: List[int]) -> int:
-    if not chan_ids:
-        return 0
-    try:
-        placeholders = ",".join([str(cid) for cid in chan_ids])
-        return db.execute(text(f"DELETE FROM membership_status WHERE channel_id IN ({placeholders})")).rowcount or 0
-    except Exception:
-        return 0
-
-
-def delete_owner_conflict_by_channels(db: Session, chan_ids: List[int]) -> int:
-    if not chan_ids:
-        return 0
-    return db.execute(delete(OwnerConflict).where(OwnerConflict.channel_id.in_(chan_ids))).rowcount or 0
-
-
-def delete_links_by_channels(db: Session, chan_ids: List[int]) -> int:
-    if not chan_ids:
-        return 0
-    return db.execute(delete(Link).where(Link.channel_id.in_(chan_ids))).rowcount or 0
-
-
-def delete_channels_by_ids(db: Session, chan_ids: List[int]) -> int:
-    if not chan_ids:
-        return 0
-    return db.execute(delete(Channel).where(Channel.channel_id.in_(chan_ids))).rowcount or 0
-
-
-def delete_invite_owners_and_links_no_channel(
-    db: Session, owner_admin_id: Optional[int], owner_user: Optional[str]
-) -> Tuple[int, int]:
-    where_raw = []
-    params_raw = {}
-    if owner_admin_id is not None:
-        where_raw.append("owner_admin_id = :oaid")
-        params_raw["oaid"] = owner_admin_id
-    if owner_user:
-        where_raw.append("owner_username = :ou")
-        params_raw["ou"] = owner_user
-    if not where_raw:
-        return 0, 0
-    where_expr = " OR ".join(where_raw)
-    invite_owners_deleted = db.execute(
-        text(f"DELETE FROM invite_owners WHERE {where_expr}"),
-        params_raw,
-    ).rowcount or 0
-    links_no_channel_deleted = db.execute(
-        text(f"DELETE FROM links WHERE channel_id IS NULL AND ({where_expr})"),
-        params_raw,
-    ).rowcount or 0
-    return invite_owners_deleted, links_no_channel_deleted

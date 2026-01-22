@@ -30,20 +30,6 @@ def test_joiner_extract_invite_hash(url, expected):
 
 
 @pytest.mark.parametrize(
-    "h,expected",
-    [
-        ("abcdEFGH12345678", True),
-        ("short", False),
-        ("a" * 70, False),
-        ("bad space", False),
-        ("bad#", False),
-    ],
-)
-def test_joiner_plausible_invite_hash(h, expected):
-    assert joiner._plausible_invite_hash(h) is expected
-
-
-@pytest.mark.parametrize(
     "url,should_match",
     [
         ("https://t.me/", False),

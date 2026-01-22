@@ -5,7 +5,6 @@ from sqlalchemy.orm import sessionmaker
 from app.db import models as m
 from app.DAL import channels_operations as ch_db
 from app.DAL import link_queue_operations as lq_db
-from app.DAL import invite_owners_operations as io_db
 
 
 @pytest.fixture()
@@ -38,12 +37,9 @@ def test_add_link_prefers_admin_id(db_session):
         raw_url="https://t.me/+abc",
         kind="invite",
         batch_msg_id=1,
-        owner_admin_id=5,
-        owner_username="ShouldBeIgnored",
     )
     link = db_session.query(m.Link).one()
-    assert link.owner_admin_id == 5
-    assert link.owner_username is None
+    assert link.url_norm == "https://t.me/+abc"
 
     ch_db.add_link(
         db_session,
@@ -51,21 +47,9 @@ def test_add_link_prefers_admin_id(db_session):
         raw_url="https://t.me/username",
         kind=None,
         batch_msg_id=None,
-        owner_admin_id=None,
-        owner_username="@UserName",
     )
     links = db_session.query(m.Link).order_by(m.Link.id).all()
-    assert links[1].owner_admin_id is None
-    assert links[1].owner_username == "username"  # normalized
-
-
-def test_invite_owner_set_and_get(db_session):
-    dao = io_db.InviteOwnersDAO(db_session)
-    dao.set_invite_owner("hash1", owner_username="owner1", owner_admin_id=None)
-    dao.set_invite_owner("hash1", owner_username=None, owner_admin_id=22)
-    data = dao.get_invite_owner("hash1")
-    assert data.owner_admin_id == 22
-    assert data.owner_username is None
+    assert links[1].url_norm == "https://t.me/username"
 
 
 def test_link_queue_owner_fields(db_session):
@@ -73,11 +57,9 @@ def test_link_queue_owner_fields(db_session):
         db_session,
         ["https://t.me/+a", "https://t.me/+b"],
         batch_id="b123",
-        origin_chat=123,
         origin_msg=456,
         delay_sec=0,
         owner_admin_id=9,
-        owner_username="demo",
         adopt_existing=False,
         reset_next_try=True,
     )
@@ -86,7 +68,6 @@ def test_link_queue_owner_fields(db_session):
     assert len(items) == 2
     first = items[0]
     assert first.owner_admin_id == 9
-    assert first.owner_username == "demo"
 
     deleted = lq_db.delete_by_owner(db_session, owner_admin_id=9)
     assert deleted == 2

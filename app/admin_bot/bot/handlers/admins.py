@@ -21,6 +21,8 @@ from app.admin_bot.services.subscription import (
     finalize_refresh_confirmation,
     RefreshContext,
 )
+from app.admin_bot.services.subscription.subscription_worker import process_batch
+from app.DAL.schemas import AdminRecord
 from app.admin_bot.utils.messages import extract_links_from_message
 from app.utils.link_parser import extract_bot_username
 from app.services import account_pool
@@ -246,7 +248,7 @@ async def cb_dedup_admin_channels(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         return
     if not conflicts:
-        await cb.message.answer("Дублікатів у admin_channels не знайдено.", reply_markup=main_menu_kb())
+        await cb.message.answer("Дублікатів у привʼязках каналів не знайдено.", reply_markup=main_menu_kb())
         await cb.answer()
         return
     await state.set_state(DedupAdminChannelsFlow.browsing)
@@ -395,21 +397,14 @@ async def cb_refresh_channels(cb: CallbackQuery, state: FSMContext):
     with session_scope() as db:
         if admin_id:
             admin = svc_admins.get_admin_by_id(db, admin_id)
-        if admin is None:
-            admin = svc_admins.find_admin(
-                db,
-                tg_id=cb.from_user.id if cb.from_user else None,
-                username=cb.from_user.username if cb.from_user else None,
-                display=None,
-            )
         if not admin:
             await cb.message.answer("Спочатку додай себе як адміна (/add_admin).")
             await cb.answer()
             return
-        found_admin_id = admin.id
+        found_admin_id = admin
     await state.clear()
     await state.set_state(RefreshChannelsFlow.waiting_links)
-    await state.update_data(admin_id=found_admin_id)
+    await state.update_data(admin=found_admin_id)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -518,21 +513,12 @@ async def cb_refresh_collect_go(cb: CallbackQuery, state: FSMContext):
     if not urls:
         await cb.answer("Немає зібраних посилань. Надішли t.me/+ ...", show_alert=True)
         return
-    admin_snapshot = svc_admins.get_admin_for_refresh(
-        admin_id=data.get("admin_id"),
-        from_user_id=cb.from_user.id if cb.from_user else None,
-        from_username=cb.from_user.username if cb.from_user and cb.from_user.username else None,
-    )
+    admin_snapshot = svc_admins.get_admin_for_refresh(admin=data.get("admin"))
     if not admin_snapshot:
         await cb.answer("Адміна не знайдено. Додай через /add_admin", show_alert=True)
         await state.clear()
         return
 
-    raw_texts: list[str] = data.get("raw_texts") or []
-    raw_htmls: list[str] = data.get("raw_htmls") or raw_texts
-    raw_text = "\n".join(raw_texts) if raw_texts else ""
-    raw_html = "\n".join(raw_htmls) if raw_htmls else raw_text
-    entities = data.get("entities") or []
     batch_id = f"refresh:{cb.message.chat.id}:{int(time.time())}"
 
     await state.clear()
@@ -545,9 +531,6 @@ async def cb_refresh_collect_go(cb: CallbackQuery, state: FSMContext):
                 reply_msg=cb.message,
                 admin=admin_snapshot,
                 urls=urls,
-                raw_text=raw_text,
-                raw_html=raw_html,
-                entities=entities,
             )
         )
     )
@@ -613,11 +596,7 @@ async def on_refresh_links(m: Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    admin = svc_admins.get_admin_for_refresh(
-        admin_id=data.get("admin_id"),
-        from_user_id=m.from_user.id if m.from_user else None,
-        from_username=m.from_user.username if m.from_user and m.from_user.username else None,
-    )
+    admin = svc_admins.get_admin_for_refresh(admin=data.get("admin"))
     if not admin:
         await m.answer("Адміна не знайдено. Додай його через /add_admin і спробуй ще раз.")
         await state.clear()
@@ -689,23 +668,28 @@ async def on_admin_name(m: Message, state: FSMContext):
             return
 
         candidate_username = username or data.get("admin_username")
-        raw_text = data.get("raw_text") or ""
-        raw_html = data.get("raw_html") or raw_text
-        entities = data.get("entities") or []
         admin_id, batch_id, added = svc_admins.add_admin_and_enqueue_links(
             urls=urls,
             display=display,
             username=candidate_username,
-            raw_text=raw_text,
-            raw_html=raw_html,
-            entities=entities,
             chat_id=m.chat.id if m.chat else None,
             msg_id=m.message_id,
-            reply_msg=m,
         )
         log.info("on_admin_name: enqueue batch_id=%s urls=%s admin_display=%s username=%s", batch_id, len(urls), display, candidate_username)
         await _answer_with_retry(m, f"Додано у чергу {added}/{len(urls)} посилань. Починаю обробку…")
-
+        if added:
+            asyncio.create_task(
+                process_batch(
+                    batch_id=batch_id,
+                    chat_id=m.chat.id if m.chat else 0,
+                    reply_msg=m,
+                    admin_id=admin_id or None,
+                    admin_display=display,
+                    admin_username=candidate_username,
+                    admin_tg_id=m.from_user.id if m.from_user else None,
+                    original_urls=urls,
+                )
+            )
         await state.clear()
     except Exception:
         log.exception("on_admin_name failed")

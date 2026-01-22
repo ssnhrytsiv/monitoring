@@ -10,12 +10,13 @@ from app.services import link_queue
 from app.services.account_pool import mark_flood, mark_limit, bump_cooldown, session_name
 from app.services.joiner import ensure_join, _extract_invite_hash
 from app.DAL import membership_operations as mem_db
+from app.DAL import link_cache_operations as lc_db
+from app.DAL.schemas import LinkCachePatch
 from app.DAL.membership_operations import FINAL_GLOBAL
 from app.admin_bot.services.subscription.subscription_for_bot import ensure_bot_started
 from app.utils.throttle import LINK_DELAY_INVITE_MAX, LINK_DELAY_PUBLIC_MAX
-from app.utils.link_parser import sanitize_link, extract_bot_username
+from app.utils.link_parser import sanitize_link, extract_bot_username, build_invite_url
 from app.DAL.channels_operations import upsert_channel_full
-from app.db.models import upsert_membership
 from app.admin_bot.services.owner_conflicts import log_conflict
 from app.admin_bot.services.subscription.subscription_menu import split_text_for_telegram
 from app.admin_bot.services.subscription.keyboards import make_report_keyboard
@@ -25,7 +26,7 @@ from app.admin_bot.services import admins as svc_admins
 from app.admin_bot.services import networks as svc_networks
 from app.db.session import session_scope
 from app.admin_bot.services.subscription.subscription_slots_pool import get_ready_slot
-from app.admin_bot.services.subscription.subscription_status import normalize_url, render_html_with_statuses
+from app.admin_bot.services.subscription.subscription_status import render_html_with_statuses
 from app.admin_bot.services.subscription.subscription_report import answer_with_retry
 from app.admin_bot.services.subscription.subscription_utils import norm_keys as collect_norm_keys
 from app.logging_json import get_logger, configure_logging
@@ -62,8 +63,6 @@ def _add_link(
     raw_url,
     kind,
     batch_msg_id,
-    owner_admin_id: Optional[int],
-    owner_username: Optional[str],
 ):
     with session_scope() as db:
         cho.add_link(
@@ -72,8 +71,6 @@ def _add_link(
             raw_url,
             kind,
             batch_msg_id,
-            owner_admin_id=owner_admin_id,
-            owner_username=owner_username,
         )
 
 
@@ -86,19 +83,20 @@ async def process_batch(
     admin_display: str,
     admin_username: Optional[str],
     admin_tg_id: Optional[int],
-    raw_text: str,
-    raw_html: Optional[str] = None,
-    entities=None,
     original_urls: Optional[List[str]] = None,
 ):
     """
     Обробляє записані в link_queue URL для batch_id. Використовує один lease, якщо доступний.
     """
-    urls_rec = link_queue.fetch_batch_due(batch_id, limit=200)
-    log.info("queue_worker.start batch_id=%s chat_id=%s urls=%s", batch_id, chat_id, len(urls_rec))
-    if not urls_rec:
-        await answer_with_retry(reply_msg, "Черга порожня або ще не готова.")
-        return
+    try:
+        urls_rec = link_queue.fetch_batch_due(batch_id, limit=200)
+        log.info("queue_worker.start batch_id=%s chat_id=%s urls=%s", batch_id, chat_id, len(urls_rec))
+        if not urls_rec:
+            await answer_with_retry(reply_msg, "Черга порожня або ще не готова.")
+            return
+    except Exception:
+        log.exception("queue_worker.start failed batch_id=%s chat_id=%s", batch_id, chat_id)
+        raise
 
     total = len(urls_rec)
     progress = Progress(reply_msg, total=total)
@@ -119,19 +117,21 @@ async def process_batch(
     ) -> None:
         if not invite_hash:
             return
+        invite_url_norm = build_invite_url(invite_hash) or invite_hash
         try:
-            with session_scope() as db_cache:
-                mem_db.invite_cache_upsert(
-                    db_cache,
-                    invite_hash,
+            lc_db.update_link_cache_status(
+                LinkCachePatch(
+                    url_norm=invite_url_norm,
+                    kind="invite",
+                    status=status,
+                    account=sess or "",
                     channel_id=cid,
                     title=title,
-                    status=status,
-                    session=sess,
                     last_error=last_error,
                 )
+            )
         except Exception:
-            pass
+            log.warning("queue_worker.cache_invite_status failed invite=%s status=%s", invite_hash, status, exc_info=True)
 
     # Попередня перевірка: якщо URL уже відомий у links (DAO) і є фінальний статус у membership_db,
     # одразу ставимо "already" без мережевих викликів.
@@ -162,6 +162,19 @@ async def process_batch(
             if session is not None and entry.get("session") is None:
                 entry["session"] = session
             seen_urls[k] = entry
+
+    def _resolve_from_cache(url: str, cleaned: Optional[str]) -> Optional[Tuple[str, Optional[str], Optional[int], Optional[str]]]:
+        """
+        Повертає (status, title, channel_id, account) з link_cache або None.
+        """
+        for candidate in (url, cleaned):
+            if not candidate:
+                continue
+            rec = lc_db.get_link_cache_record(candidate)
+            if rec:
+                status_norm = "already" if rec.status == "joined" else rec.status
+                return status_norm, rec.title, rec.channel_id, rec.account
+        return None
 
     for rec in urls_rec:
         url = rec.url
@@ -200,6 +213,19 @@ async def process_batch(
                     preferred_session = mem_db.invite_check_last_session(db_sess, inv_hash)
             except Exception:
                 preferred_session = None
+        # 0) link_cache: фінальні/duplicate стани без мережі
+        try:
+            cache_hit = _resolve_from_cache(url, cleaned)
+        except Exception:
+            cache_hit = None
+        if cache_hit:
+            status_norm, title_cached, cid_cached, acc_cached = cache_hit
+            if (status_norm in FINAL_GLOBAL and status_norm != "requested") or status_norm == "duplicate":
+                data = (status_norm, title_cached, cid_cached or 0, "link_cache", acc_cached)
+                _register_preknown(url, data)
+                if cleaned != url:
+                    _register_preknown(cleaned, data)
+                continue
         # 1) find_channel_by_link (raw/clean)
         try:
             link_row = _find_channel_by_link(url, cleaned)
@@ -232,53 +258,35 @@ async def process_batch(
                             _register_preknown(cleaned, data)
                         continue
 
-            # 2) Інвайт: якщо знаємо invite_hash -> channel_id і фінальний статус
+            # 2) Інвайт: якщо знаємо invite_hash -> channel_id і фінальний статус (через link_cache)
             if inv_hash:
-                with session_scope() as db_inv_cache:
-                    cache = mem_db.invite_cache_get(db_inv_cache, inv_hash)
-                if cache and cache.channel_id:
-                    cid_cached = int(cache.channel_id)
-                    title_cached = cache.title
-                    final = mem_db.any_final_for_channel(db_inv_cache, cid_cached)
-                    if final:
-                        final_norm = "already" if final == "joined" else final
-                        if final_norm in FINAL_GLOBAL and final_norm != "requested":
-                            sess_known = mem_db.get_any_session_for_channel(db_inv_cache, cid_cached)
-                            data = (final_norm, title_cached, cid_cached, "invite_cache", sess_known)
+                try:
+                    cache_hit = _resolve_from_cache(url, cleaned)
+                    if cache_hit:
+                        status_norm, title_cached, cid_cached, acc_cached = cache_hit
+                        if (status_norm in FINAL_GLOBAL and status_norm != "requested") or status_norm == "duplicate":
+                            data = (status_norm, title_cached, cid_cached or 0, "link_cache", acc_cached)
                             _register_preknown(url, data)
                             if cleaned != url:
                                 _register_preknown(cleaned, data)
                             continue
+                except Exception:
+                    pass
         except Exception:
             pass
 
-        # 3) url_cache — фінальні стани або duplicate
-        try:
-            with session_scope() as db_url:
-                url_rec = mem_db.url_get(db_url, url) or mem_db.url_get(db_url, cleaned)
-        except Exception:
-            url_rec = None
-        if url_rec:
-            status_norm = "already" if url_rec == "joined" else url_rec
-            if (status_norm in FINAL_GLOBAL and status_norm != "requested") or status_norm == "duplicate":
-                data = (status_norm, None, None, "url_cache", None)
-                _register_preknown(url, data)
-                if cleaned != url:
-                    _register_preknown(cleaned, data)
-                continue
-
         # Якщо сюди дійшли — мережа потрібна
         if inv_hash:
-            # Якщо в invite_cache уже є фінальний статус (наприклад, invalid), не рахуємо у ETA
+            # Якщо в link_cache уже є фінальний статус (наприклад, invalid), не рахуємо у ETA
+            st_inv = None
             try:
-                with session_scope() as db_inv:
-                    cache = mem_db.invite_cache_get(db_inv, inv_hash)
-                    st_inv = cache.status if cache else None
+                cache_hit = _resolve_from_cache(url, cleaned)
+                st_inv = cache_hit[0] if cache_hit else None
             except Exception:
                 st_inv = None
             if st_inv and st_inv != "requested":
                 final_norm = "already" if st_inv == "joined" else st_inv
-                data = (final_norm, None, None, "invite_cache_status", None)
+                data = (final_norm, None, None, "link_cache_status", None)
                 _register_preknown(url, data)
                 if cleaned != url:
                     _register_preknown(cleaned, data)
@@ -296,12 +304,7 @@ async def process_batch(
 
     # Якщо є існуючий адмін з такими даними — використовуємо його одразу, щоб уникнути фальшивих owner_conflict
     with session_scope() as db_lookup:
-        existing_admin = svc_admins.find_admin(
-            db_lookup,
-            tg_id=admin_tg_id,
-            username=admin_username,
-            display=admin_display,
-        )
+        existing_admin = svc_admins.get_admin_by_display(db_lookup, admin_display) if admin_display else None
         if existing_admin:
             admin_id = existing_admin.id
             current_owner_username = existing_admin.username
@@ -322,18 +325,15 @@ async def process_batch(
             f"кулдаун: +{cooldown_extra_sec}s)."
         )
     except Exception:
-        pass
+        log.debug("queue_worker.reply_eta failed batch_id=%s", batch_id, exc_info=True)
     for idx, rec in enumerate(urls_rec, start=1):
         item_id = rec.id
         url = rec.url
         tries = rec.tries
         origin_msg = rec.origin_msg
         owner_admin_id_rec = rec.owner_admin_id
-        ou = rec.owner_username
         if owner_admin_id_rec and admin_id is None:
             admin_id = owner_admin_id_rec
-        if ou and not current_owner_username:
-            current_owner_username = ou
         keys_norm = collect_norm_keys(url)
         existing_seen = None
         for k in keys_norm:
@@ -523,7 +523,7 @@ async def process_batch(
                             other_name,
                         )
 
-                upsert_membership(db, channel_id=cid, account=(sess or ""), status=base_status)
+                mem_db.upsert_membership(db, account=(sess or ""), channel_id=cid, status=base_status)
             link_queue.mark_done(item_id)
             try:
                 _add_link(
@@ -531,8 +531,6 @@ async def process_batch(
                     url,
                     kind,
                     origin_msg,
-                    admin_id,
-                    current_owner_username,
                 )
             except Exception:
                 pass
@@ -715,7 +713,7 @@ async def process_batch(
                             other_name,
                         )
 
-                upsert_membership(db, channel_id=cid, account=sess or "", status=base_status)
+                mem_db.upsert_membership(db, account=sess or "", channel_id=cid, status=base_status)
 
             _cache_invite_status(
                 invite_hash,
@@ -733,8 +731,6 @@ async def process_batch(
                     url,
                     kind,
                     origin_msg,
-                    admin_id,
-                    current_owner_username,
                 )
             except Exception:
                 pass
@@ -769,7 +765,7 @@ async def process_batch(
         norm_counts: Dict[str, int] = {}
         cid_counts: Dict[Optional[int], int] = {}
         for it in result_items:
-            n = normalize_url(it.get("url", ""))
+            n = (sanitize_link(it.get("url", "")) or it.get("url", "")).rstrip(").,;")
             norm_counts[n] = norm_counts.get(n, 0) + 1
             cid_counts[it.get("channel_id")] = cid_counts.get(it.get("channel_id"), 0) + 1
 
@@ -780,7 +776,7 @@ async def process_batch(
         render_order = original_urls if original_urls else [it.get("url", "") for it in result_items]
         buckets: Dict[str, List[Dict]] = {}
         for it in result_items:
-            n = normalize_url(it.get("url", ""))
+            n = (sanitize_link(it.get("url", "")) or it.get("url", "")).rstrip(").,;")
             buckets.setdefault(n, []).append(it)
 
         def _pop(norm: str) -> Optional[Dict]:
@@ -790,7 +786,7 @@ async def process_batch(
             return None
 
         for url in render_order:
-            norm = normalize_url(url)
+            norm = (sanitize_link(url) or url).rstrip(").,;")
             it = _pop(norm)
             if not it:
                 continue
@@ -814,45 +810,21 @@ async def process_batch(
 
     # Фолбек: підтягуємо title з БД, якщо його немає у результатах
     try:
-        with session_scope() as db_titles:
-            for it in result_items:
-                cid = it.get("channel_id")
-                url_val = it.get("url")
-                if cid and not it.get("title"):
-                    ch = cho.find_channel(db_titles, cid)
-                    if ch and ch.title:
-                        it["title"] = ch.title
-                if not it.get("title") and url_val:
-                    row = cho.find_channel_by_link(db_titles, url_val)
-                    if row:
-                        if row.channel_id and not cid:
-                            cid = int(row.channel_id)
-                            it["channel_id"] = cid
-                        if row.title and not it.get("title"):
-                            it["title"] = row.title
-                if not it.get("title") and url_val:
-                    inv_hash = _extract_invite_hash(url_val)
-                    if inv_hash:
-                        cache = mem_db.invite_cache_get(db_titles, inv_hash)
-                        inv_cid = cache.channel_id if cache else None
-                        inv_title = cache.title if cache else None
-                        if inv_cid and not cid:
-                            it["channel_id"] = inv_cid
-                            cid = inv_cid
-                        if inv_title:
-                            it["title"] = inv_title
-                status_raw = (it.get("status") or "").strip()
-                if "[" not in status_raw and cid:
-                    sess_known = mem_db.get_session_by_channel(db_titles, cid)
-                    log.debug(
-                        "queue_worker.report: hydrate session cid=%s status=%s session=%s url=%s",
-                        cid,
-                        status_raw,
-                        sess_known,
-                        url_val,
-                    )
-                    if sess_known:
-                        it["status"] = f"{status_raw or 'already'}[{sess_known}]"
+        for it in result_items:
+            cid = it.get("channel_id")
+            url_val = it.get("url")
+            cache = lc_db.get_link_cache_record(url_val or "")
+            if cache:
+                if cache.channel_id and not cid:
+                    it["channel_id"] = cache.channel_id
+                    cid = cache.channel_id
+                if cache.title and not it.get("title"):
+                    it["title"] = cache.title
+            status_raw = (it.get("status") or "").strip()
+            if "[" not in status_raw and cid:
+                sess_known = cache.account if cache and cache.account else None
+                if sess_known:
+                    it["status"] = f"{status_raw or 'already'}[{sess_known}]"
     except Exception:
         log.exception("queue_worker: failed to hydrate titles/sessions from DB")
 
@@ -864,12 +836,6 @@ async def process_batch(
         log.exception("queue_worker: failed render html report, fallback disabled")
         pages = [f"Render error: {e}"]
         report_idx = None
-        # Старий fallback із build_full_footer залишив закоментованим на випадок повернення
-        # footer, sections = build_full_footer(result_items, raw_lines=[raw_text])
-        # pages = []
-        # pages.extend(split_text_for_telegram(footer, max_len=3500))
-        # for label, text in sections:
-        #     pages.extend(split_text_for_telegram(f\"{label}:\\n{text}\", max_len=3500))
     else:
         pages = split_text_for_telegram(html_report, max_len=6000)
         report_idx = None

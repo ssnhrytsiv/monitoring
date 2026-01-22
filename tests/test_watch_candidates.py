@@ -36,8 +36,7 @@ def _get_watch_status(wid: int):
 
 
 def _get_candidate_status(cid: int):
-    with session_scope() as db:
-        cand = watch_cand_db.get_watch_candidate(db, cid)
+    cand = watch_cand_db.get_watch_candidate(cid)
     return cand.status if cand else None
 
 
@@ -89,8 +88,7 @@ def test_candidate_accept_matches_multiple_with_same_text_hash():
         )
 
     # Приймаємо перший — має заметчити обидва завдяки однаковому text_hash
-    with session_scope() as db:
-        ok = watch_cand_db.accept_watch_candidate(db, cid1)
+    ok = watch_cand_db.accept_watch_candidate(cid1)
     assert ok is True
 
     # Обидва кандидати мають бути accepted
@@ -122,8 +120,7 @@ def test_list_and_get_candidate_fields():
             message_text="Hello world",
             ttl_days=1.0,
         )
-    with session_scope() as db:
-        items = watch_cand_db.list_watch_candidates(db, wid)
+    items = watch_cand_db.list_watch_candidates(wid)
     assert len(items) == 1
     item = items[0]
     assert item.id == cid
@@ -133,8 +130,7 @@ def test_list_and_get_candidate_fields():
     assert item.similarity == 0.75
     assert item.text_hash  # має бути заповнений
 
-    with session_scope() as db:
-        cand = watch_cand_db.get_watch_candidate(db, cid)
+    cand = watch_cand_db.get_watch_candidate(cid)
     assert cand is not None
     assert cand.id == cid
     assert cand.watch_id == wid
@@ -156,12 +152,10 @@ def test_reject_and_not_pending_accept():
             ttl_days=1.0,
         )
     # Відхиляємо
-    with session_scope() as db:
-        watch_cand_db.set_watch_candidate_status(db, cid, "rejected")
+    watch_cand_db.set_watch_candidate_status(cid, "rejected")
     assert _get_candidate_status(cid) == "rejected"
     # Прийняття повинно повернути False, статус не змінюється
-    with session_scope() as db:
-        ok = watch_cand_db.accept_watch_candidate(db, cid)
+    ok = watch_cand_db.accept_watch_candidate(cid)
     assert ok is False
     assert _get_candidate_status(cid) == "rejected"
 
@@ -192,8 +186,7 @@ def test_list_candidates_filters_expired():
         )
     _expire_candidate(cid_expired)
 
-    with session_scope() as db:
-        cands = watch_cand_db.list_watch_candidates(db, wid)
+    cands = watch_cand_db.list_watch_candidates(wid)
     ids = {c.id for c in cands}
     assert cid_active in ids
     assert cid_expired not in ids

@@ -5,7 +5,6 @@ from sqlalchemy.orm import sessionmaker
 from app.db import models as m
 from app.DAL import channels_operations as ch_db
 from app.DAL import link_queue_operations as lq_db
-from app.DAL import invite_owners_operations as io_db
 from app.utils.link_parser import extract_links_from_html
 
 
@@ -40,23 +39,11 @@ def test_add_link_respects_owner_admin(db_session):
         db_session,
         ["https://t.me/+abc"],
         batch_id="b1",
-        origin_chat=1,
         origin_msg=1,
         owner_admin_id=2,
-        owner_username=None,
     )
     row = db_session.query(m.LinkQueue).one()
     assert row.owner_admin_id == 2
-    assert row.owner_username is None
-
-
-def test_invite_owner_storage(db_session):
-    h = "hash123"
-    io_db.set_invite_owner(db_session, h, owner_admin_id=5, owner_username="user5")
-    rec = io_db.get_invite_owner(db_session, h)
-    assert rec
-    assert rec.owner_admin_id == 5
-    assert rec.owner_username == "user5"
 
 
 def test_extract_links_various():
@@ -76,10 +63,8 @@ def test_enqueue_wrapper(db_session):
         db_session,
         ["https://t.me/+abc", "@demo_bot"],
         batch_id="b2",
-        origin_chat=1,
         origin_msg=2,
         owner_admin_id=3,
-        owner_username="demo",
         adopt_existing=True,
         reset_next_try=True,
     )
@@ -87,4 +72,3 @@ def test_enqueue_wrapper(db_session):
     rows = db_session.query(m.LinkQueue).order_by(m.LinkQueue.id.asc()).all()
     assert [r.url for r in rows] == ["https://t.me/+abc", "@demo_bot"]
     assert all(r.owner_admin_id == 3 for r in rows)
-    assert all(r.owner_username == "demo" for r in rows)

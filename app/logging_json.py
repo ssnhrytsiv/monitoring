@@ -2,6 +2,8 @@ import os
 import json
 import time
 import logging
+from pathlib import Path
+from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, Optional
 
 _RESERVED = {"exc_info", "stack_info", "stacklevel", "extra"}
@@ -99,6 +101,26 @@ def _env_bool(name: str, default: bool) -> bool:
         return default
     return raw.lower() in ("1", "true", "yes", "on")
 
+
+def _build_file_handlers(formatter: logging.Formatter) -> list[logging.Handler]:
+    log_dir = Path(os.getenv("LOG_DIR", "logs"))
+    max_bytes = int(os.getenv("LOG_MAX_BYTES", 10 * 1024 * 1024))
+    backup_count = int(os.getenv("LOG_BACKUP_COUNT", 10))
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return []
+
+    info_handler = RotatingFileHandler(log_dir / "info.log", maxBytes=max_bytes, backupCount=backup_count)
+    info_handler.setLevel(logging.INFO)
+    info_handler.setFormatter(formatter)
+
+    err_handler = RotatingFileHandler(log_dir / "error.log", maxBytes=max_bytes, backupCount=backup_count)
+    err_handler.setLevel(logging.ERROR)
+    err_handler.setFormatter(formatter)
+
+    return [info_handler, err_handler]
+
 def configure_logging(force_json: Optional[bool] = None,
                       force_plain_verbose: Optional[bool] = None):
     if force_json is True:
@@ -120,9 +142,12 @@ def configure_logging(force_json: Optional[bool] = None,
     level = getattr(logging, level_name, logging.INFO)
 
     # Якщо хендлери вже є (наприклад, хтось налаштував logging.basicConfig),
-    # усе одно виставляємо рівні та фільтри для SQLAlchemy і повертаємо.
+    # усе одно виставляємо рівні, додаємо файлові хендлери та фільтри для SQLAlchemy.
     if root.handlers:
         root.setLevel(level)
+        for fh in _build_file_handlers(JSONFormatter() if decided_json else PlainFormatterVerbose("[%(asctime)s] %(levelname)-8s %(name)s: %(message)s", "%H:%M:%S")):
+            if all(not isinstance(h, RotatingFileHandler) or h.baseFilename != getattr(fh, "baseFilename", "") for h in root.handlers):
+                root.addHandler(fh)
         _configure_sqlalchemy_logging()
         return decided_json
 
@@ -139,6 +164,12 @@ def configure_logging(force_json: Optional[bool] = None,
     handler.setFormatter(formatter)
     root.setLevel(level)
     root.addHandler(handler)
+
+    # File handlers (info + error with rotation)
+    for fh in _build_file_handlers(formatter):
+        # avoid duplicates if configure_logging called twice
+        if fh not in root.handlers:
+            root.addHandler(fh)
 
     if level == logging.DEBUG:
         logging.getLogger("telethon").setLevel(logging.INFO)

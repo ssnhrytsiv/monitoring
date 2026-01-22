@@ -129,19 +129,20 @@ _HTML_RENDER_SRC = "app.services.html_render.render_html"
 
 def _db_get_watch_core(wid: int) -> Optional[Dict[str, Any]]:
     try:
-        with session_scope() as db:
-            info = watch_posts_db.get_watch_info_db(db, wid)
+        info = watch_posts_db.get_watch_post_details_by_id(wid)
         if not info:
             return None
-        expected_raw = info.get("expected_text_hash") or ""
+        expected_raw = info.expected_text_hash or ""
         expected_norm = normalize_html_full(expected_raw) if expected_raw else ""
+        if info.channel_id is None:
+            return None
         return {
-            "channel_id": int(info["channel_id"]),
-            "template_id": int(info["template_id"]) if info.get("template_id") is not None else None,
+            "channel_id": int(info.channel_id),
+            "template_id": int(info.template_id) if info.template_id is not None else None,
             "expected_text_hash": expected_norm,
-            "expected_links_json": info.get("expected_links_json"),
-            "time_window_start": info.get("time_window_start"),
-            "time_window_end": info.get("time_window_end"),
+            "expected_links_json": info.expected_links_json,
+            "time_window_start": info.time_window_start,
+            "time_window_end": info.time_window_end,
         }
     except Exception:
         _pylog.exception("_db_get_watch_core failed (wid=%s)", wid)
@@ -188,8 +189,7 @@ async def _views_worker():
             pool_map = {session_name(s.client): s.client for s in slots}
             any_cli = next(iter(pool_map.values()))
 
-            with session_scope() as db:
-                due = watch_proc_db.list_due_coverage_db(db)
+            due = watch_proc_db.list_due_coverage_db()
             for watch_id, channel_id, msg_id, matched_session in due:
                 cli = pool_map.get(matched_session) if matched_session else None
                 if cli is None:
@@ -203,7 +203,8 @@ async def _views_worker():
                     # Спроба підвантажити entity через source_url (username/інвайт)
                     fallback_url: str | None = None
                     try:
-                        fallback_url = watch_posts_db.get_watch_source_url(watch_id)
+                        details = watch_posts_db.get_watch_post_details_by_id(watch_id)
+                        fallback_url = details.source_url if details else None
                     except Exception:
                         _pylog.exception("views: get_watch_source_url failed (wid=%s)", watch_id)
 
@@ -229,22 +230,20 @@ async def _views_worker():
                     # якщо не змогли отримати entity — вважаємо покритим, щоб не зациклитись
                     if msg is None:
                         try:
-                            with session_scope() as db:
-                                watch_proc_db.mark_done_views_db(db, watch_id, 0)
-                                watch_events_db.insert_watch_event(
-                                    db,
-                                    watch_id,
-                                    "views",
-                                    json.dumps(
-                                        {
-                                            "watch_id": watch_id,
-                                            "channel_id": channel_id,
-                                            "message_id": msg_id,
-                                            "views": 0,
-                                            "status": "entity_miss",
-                                        }
-                                    ),
-                                )
+                            watch_proc_db.mark_done_views_db(watch_id, 0)
+                            watch_events_db.insert_watch_event(
+                                watch_id,
+                                "views",
+                                json.dumps(
+                                    {
+                                        "watch_id": watch_id,
+                                        "channel_id": channel_id,
+                                        "message_id": msg_id,
+                                        "views": 0,
+                                        "status": "entity_miss",
+                                    }
+                                ),
+                            )
                         except Exception:
                             _pylog.exception("views: mark_done_views failed (wid=%s) after entity miss", watch_id)
                         msg = None
@@ -254,21 +253,19 @@ async def _views_worker():
 
                 views = int(getattr(msg, "views", 0) or 0)
                 try:
-                    with session_scope() as db:
-                        watch_proc_db.mark_done_views_db(db, watch_id, views)
-                        watch_events_db.insert_watch_event(
-                            db,
-                            watch_id,
-                            "views",
-                            json.dumps(
-                                {
-                                    "watch_id": watch_id,
-                                    "channel_id": channel_id,
-                                    "message_id": msg_id,
-                                    "views": views,
-                                }
-                            ),
-                        )
+                    watch_proc_db.mark_done_views_db(watch_id, views)
+                    watch_events_db.insert_watch_event(
+                        watch_id,
+                        "views",
+                        json.dumps(
+                            {
+                                "watch_id": watch_id,
+                                "channel_id": channel_id,
+                                "message_id": msg_id,
+                                "views": views,
+                            }
+                        ),
+                    )
                     log.info("views: wid=%s views=%s -> done", watch_id, views)
                 except Exception:
                     _pylog.exception("views: mark_done_views failed (wid=%s)", watch_id)
@@ -349,9 +346,6 @@ def _attach_listener_for_client(tag: str, cli) -> None:
         m: Message = ev.message
         #_pylog.info(m)
         cid = None
-        # ігноруємо MAIN
-        if tag == "MAIN":
-            return
         try:
             if hasattr(m, "peer_id") and getattr(m.peer_id, "channel_id", None) is not None:
                 cid = int(m.peer_id.channel_id)
@@ -369,8 +363,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
         #_pylog.info("listen: NEW_MESSAGE cid=%s mid=%s session=%s", cid, mid, tag)
 
         try:
-            with session_scope() as db:
-                pending = watch_proc_db.get_pending_by_channel_db(db, cid)
+            pending = watch_proc_db.get_pending_by_channel_db(cid)
         except Exception:
             _pylog.exception("listen: get_pending_by_channel failed (cid=%s)", cid)
             return
@@ -592,10 +585,9 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                         matched_session = tag
                         matched_ok = True
                         try:
-                            with session_scope() as db:
-                                watch_proc_db.mark_matched_db(
-                                    db, wid, mid, coverage_at, matched_session=matched_session
-                                )
+                            watch_proc_db.mark_matched_db(
+                                wid, mid, coverage_at, matched_session=matched_session
+                            )
                             watch_events_db.insert_watch_event(
                                 wid,
                                 "matched",
@@ -648,7 +640,6 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                                     status=watch_candidates_db.CANDIDATE_PENDING_STATUS,
                                 )
                                 watch_events_db.insert_watch_event(
-                                    db,
                                     wid,
                                     "candidate",
                                     json.dumps(
@@ -681,8 +672,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             matched_session = tag
             matched_ok = True
             try:
-                with session_scope() as db:
-                    watch_proc_db.mark_matched_db(db, wid, mid, coverage_at, matched_session=matched_session)
+                watch_proc_db.mark_matched_db(wid, mid, coverage_at, matched_session=matched_session)
                 watch_events_db.insert_watch_event(
                     wid,
                     "matched",
@@ -725,8 +715,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             return
 
         try:
-            with session_scope() as db:
-                wids = watch_proc_db.find_matched_by_message_db(db, cid, mid)
+            wids = watch_proc_db.find_matched_by_message_db(cid, mid)
         except Exception:
             _pylog.exception("edited: find_matched_by_message failed (cid=%s mid=%s)", cid, mid)
             return
@@ -734,10 +723,9 @@ def _attach_listener_for_client(tag: str, cli) -> None:
         candidate_entries: list[Any] = []
         if not wids:
             try:
-                with session_scope() as db:
-                    candidate_entries = watch_candidates_db.find_candidates_by_channel_message(
-                        db, cid, mid, status=watch_candidates_db.CANDIDATE_PENDING_STATUS
-                    )
+                candidate_entries = watch_candidates_db.find_candidates_by_channel_message(
+                    cid, mid, status=watch_candidates_db.CANDIDATE_PENDING_STATUS
+                )
             except Exception:
                 _pylog.exception("edited: find_candidates_by_channel_message failed (cid=%s mid=%s)", cid, mid)
                 candidate_entries = []
@@ -838,15 +826,13 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                     except Exception:
                         sim_val = 0.0
                     try:
-                        with session_scope() as db:
-                            watch_candidates_db.merge_watch_candidate(
-                                db,
-                                int(c.id),
-                                mid,
-                                watch_proc_db.calc_text_hash(msg_html_norm),
-                                sim_val,
-                                msg_html_norm,
-                            )
+                        watch_candidates_db.merge_watch_candidate(
+                            int(c.id),
+                            mid,
+                            watch_proc_db.calc_text_hash(msg_html_norm),
+                            sim_val,
+                            msg_html_norm,
+                        )
                     except Exception:
                         _pylog.exception("edited: merge_watch_candidate failed (cid=%s mid=%s cand_id=%s)", cid, mid, c.id)
 
@@ -884,8 +870,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
 
         for mid in (ev.deleted_ids or []):
             try:
-                with session_scope() as db:
-                    wids = watch_proc_db.find_matched_by_message_db(db, cid, int(mid))
+                wids = watch_proc_db.find_matched_by_message_db(cid, int(mid))
             except Exception:
                 _pylog.exception("deleted: DB lookup failed (cid=%s mid=%s)", cid, mid)
                 continue
@@ -902,26 +887,24 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 _GLOBAL_DELETED_SEEN[wid] = now_m
 
                 try:
-                    with session_scope() as db:
-                        prev_status = watch_proc_db.mark_done_deleted_db(db, wid)
-                        # Якщо пост уже відстояв перегляди (status=done), не шлемо повторну подію
-                        if prev_status == "done":
-                            log.info("deleted: wid=%s cid=%s mid=%s -> status done, event skipped", wid, cid, mid)
-                            continue
+                    prev_status = watch_proc_db.mark_done_deleted_db(wid)
+                    # Якщо пост уже відстояв перегляди (status=done), не шлемо повторну подію
+                    if prev_status == "done":
+                        log.info("deleted: wid=%s cid=%s mid=%s -> status done, event skipped", wid, cid, mid)
+                        continue
 
-                        watch_events_db.insert_watch_event(
-                            db,
-                            wid,
-                            "deleted",
-                            json.dumps(
-                                {
-                                    "watch_id": wid,
-                                    "channel_id": cid,
-                                    "message_id": int(mid),
-                                }
-                            ),
-                        )
-                        log.info("deleted: wid=%s cid=%s mid=%s -> deleted", wid, cid, mid)
+                    watch_events_db.insert_watch_event(
+                        wid,
+                        "deleted",
+                        json.dumps(
+                            {
+                                "watch_id": wid,
+                                "channel_id": cid,
+                                "message_id": int(mid),
+                            }
+                        ),
+                    )
+                    log.info("deleted: wid=%s cid=%s mid=%s -> deleted", wid, cid, mid)
                 except Exception:
                     _pylog.exception("deleted: mark_done_deleted/insert_event failed (wid=%s)", wid)
 
@@ -957,8 +940,6 @@ def setup(client=None, control_peer=None, monitor_buffer=None, **_):
         except Exception:
             _pylog.exception("attach failed for pool client: %s", getattr(s, "name", "?"))
 
-    # _attach_listener_for_client("MAIN", MAIN_CLIENT)
-    # log.info("posts_watch_listener: attached listener to MAIN client")
 
     loop = asyncio.get_event_loop()
 

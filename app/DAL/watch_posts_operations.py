@@ -10,7 +10,9 @@ from app.db.models import WatchPost, WatchGroup
 from app.DAL.watch_processing_operations import get_session_for_source_url_db as process_get_session_for_source_url
 from app.DAL.watch_events_operations import insert_watch_event
 from app.db import models as m
+from app.DAL.schemas.watch_post import WatchPostDetailsRecord
 from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now
+from app.db.session import session_scope
 
 # Дозволені статуси вотчів
 ALLOWED_STATUSES: Dict[str, str] = {
@@ -90,7 +92,6 @@ def _time_window_key(value: Any) -> Optional[str]:
 
 
 def list_active_watches(
-    db: Session,
     user_id: int,
     statuses: Optional[List[str]] = None,
 ) -> List[WatchSummary]:
@@ -105,41 +106,43 @@ def list_active_watches(
     if not filtered_statuses:
         filtered_statuses = ["pending", "matched"]
 
-    rows = db.execute(
-        select(
-            WatchPost.id,
-            WatchPost.template_id,
-            WatchPost.status,
-            WatchPost.time_window_end,
-            WatchPost.created_by,
-            WatchPost.channel_id,
-        )
-        .where(
-            or_(WatchPost.created_by == user_id, WatchPost.created_by.is_(None)),
-            WatchPost.status.in_(filtered_statuses),
-        )
-        .order_by(WatchPost.id.desc())
-        .limit(200)
-    ).all()
+    with session_scope() as db:
+        rows = db.execute(
+            select(
+                WatchPost.id,
+                WatchPost.template_id,
+                WatchPost.status,
+                WatchPost.time_window_end,
+                WatchPost.created_by,
+                WatchPost.channel_id,
+            )
+            .where(
+                or_(WatchPost.created_by == user_id, WatchPost.created_by.is_(None)),
+                WatchPost.status.in_(filtered_statuses),
+            )
+            .order_by(WatchPost.id.desc())
+            .limit(200)
+        ).all()
 
     return [_row_to_summary(r) for r in rows]
 
 
-def get_watch_by_id(db: Session, watch_id: int) -> Optional[Tuple[int, Optional[int], str, Optional[str], Any, Optional[int], Optional[str]]]:
+def get_watch_by_id(watch_id: int) -> Optional[Tuple[int, Optional[int], str, Optional[str], Any, Optional[int], Optional[str]]]:
     """
     Повертає один watch за id або None, якщо не знайдено.
     """
-    row = db.execute(
-        select(
-            WatchPost.id,
-            WatchPost.template_id,
-            WatchPost.status,
-            WatchPost.time_window_end,
-            WatchPost.created_by,
-            WatchPost.channel_id,
-            WatchPost.source_url,
-        ).where(WatchPost.id == int(watch_id)).limit(1)
-    ).first()
+    with session_scope() as db:
+        row = db.execute(
+            select(
+                WatchPost.id,
+                WatchPost.template_id,
+                WatchPost.status,
+                WatchPost.time_window_end,
+                WatchPost.created_by,
+                WatchPost.channel_id,
+                WatchPost.source_url,
+            ).where(WatchPost.id == int(watch_id)).limit(1)
+        ).first()
     if not row:
         return None
     return (
@@ -153,18 +156,19 @@ def get_watch_by_id(db: Session, watch_id: int) -> Optional[Tuple[int, Optional[
     )
 
 
-def get_group_leader_key(db: Session, watch_id: int) -> Optional[Tuple[Optional[int], Optional[str], Any, Optional[int]]]:
+def get_group_leader_key(watch_id: int) -> Optional[Tuple[Optional[int], Optional[str], Any, Optional[int]]]:
     """
     Повертає (template_id, tw_key, created_by, channel_id) для watch_id.
     """
-    row = db.execute(
-        select(
-            WatchPost.template_id,
-            WatchPost.time_window_end,
-            WatchPost.created_by,
-            WatchPost.channel_id,
-        ).where(WatchPost.id == int(watch_id)).limit(1)
-    ).first()
+    with session_scope() as db:
+        row = db.execute(
+            select(
+                WatchPost.template_id,
+                WatchPost.time_window_end,
+                WatchPost.created_by,
+                WatchPost.channel_id,
+            ).where(WatchPost.id == int(watch_id)).limit(1)
+        ).first()
     if not row:
         return None
     template_id = int(row.template_id) if row.template_id is not None else None
@@ -173,31 +177,31 @@ def get_group_leader_key(db: Session, watch_id: int) -> Optional[Tuple[Optional[
     return template_id, tw_key, row.created_by, channel_id
 
 
-def get_group_leader_for_watch(db: Session, watch_id: int) -> Optional[int]:
+def get_group_leader_for_watch(watch_id: int) -> Optional[int]:
     """
     Повертає мінімальний watch_id за ключем групи (template_id + tw_key + created_by).
     """
-    leader_key = get_group_leader_key(db, watch_id)
+    leader_key = get_group_leader_key(watch_id)
     if not leader_key:
         return None
     template_id, tw_key, created_by, _ = leader_key
-    row = db.execute(
-        select(WatchPost.id)
-        .where(
-            WatchPost.template_id == template_id,
-            WatchPost.time_window_end == tw_key,
-            WatchPost.created_by == created_by,
-        )
-        .order_by(WatchPost.id.asc())
-        .limit(1)
-    ).first()
+    with session_scope() as db:
+        row = db.execute(
+            select(WatchPost.id)
+            .where(
+                WatchPost.template_id == template_id,
+                WatchPost.time_window_end == tw_key,
+                WatchPost.created_by == created_by,
+            )
+            .order_by(WatchPost.id.asc())
+            .limit(1)
+        ).first()
     if not row:
         return None
     return int(row.id)
 
 
 def load_group_items(
-    db: Session,
     template_id: Optional[int],
     tw_key: Optional[str],
     created_by: Any,
@@ -211,23 +215,24 @@ def load_group_items(
     if not status_list:
         status_list = ["pending", "matched"]
 
-    rows = db.execute(
-        select(
-            WatchPost.id,
-            WatchPost.template_id,
-            WatchPost.status,
-            WatchPost.time_window_end,
-            WatchPost.created_by,
-            WatchPost.channel_id,
-            WatchPost.source_url,
-        )
-        .where(
-            WatchPost.status.in_(status_list),
-            WatchPost.template_id == template_id,
-            or_(WatchPost.created_by == created_by, WatchPost.created_by.is_(None)),
-        )
-        .order_by(WatchPost.id.desc())
-    ).all()
+    with session_scope() as db:
+        rows = db.execute(
+            select(
+                WatchPost.id,
+                WatchPost.template_id,
+                WatchPost.status,
+                WatchPost.time_window_end,
+                WatchPost.created_by,
+                WatchPost.channel_id,
+                WatchPost.source_url,
+            )
+            .where(
+                WatchPost.status.in_(status_list),
+                WatchPost.template_id == template_id,
+                or_(WatchPost.created_by == created_by, WatchPost.created_by.is_(None)),
+            )
+            .order_by(WatchPost.id.desc())
+        ).all()
 
     items: List[GroupItem] = []
     for wid, tid_row, status_value, tw_row, created_row, cid, source_url in rows:
@@ -254,7 +259,6 @@ def load_group_items(
 
 
 def load_group_channels(
-    db: Session,
     leader_watch_id: int,
     statuses: Optional[List[str]] = None,
 ) -> List[int]:
@@ -266,24 +270,26 @@ def load_group_channels(
     if not status_list:
         status_list = ["pending", "matched", "expired"]
 
-    leader = db.execute(
-        select(
-            WatchPost.template_id,
-            WatchPost.time_window_end,
-            WatchPost.created_by,
-        ).where(WatchPost.id == int(leader_watch_id)).limit(1)
-    ).first()
+    with session_scope() as db:
+        leader = db.execute(
+            select(
+                WatchPost.template_id,
+                WatchPost.time_window_end,
+                WatchPost.created_by,
+            ).where(WatchPost.id == int(leader_watch_id)).limit(1)
+        ).first()
     if not leader:
         return []
 
-    rows = db.execute(
-        select(WatchPost.channel_id).where(
-            WatchPost.template_id == leader.template_id,
-            WatchPost.time_window_end == leader.time_window_end,
-            WatchPost.created_by == leader.created_by,
-            WatchPost.status.in_(status_list),
-        )
-    ).all()
+    with session_scope() as db:
+        rows = db.execute(
+            select(WatchPost.channel_id).where(
+                WatchPost.template_id == leader.template_id,
+                WatchPost.time_window_end == leader.time_window_end,
+                WatchPost.created_by == leader.created_by,
+                WatchPost.status.in_(status_list),
+            )
+        ).all()
 
     channels: List[int] = []
     for cid in rows:
@@ -296,50 +302,50 @@ def load_group_channels(
     return channels
 
 
-def cancel_group_watches(db: Session, leader_watch_id: int) -> bool:
+def cancel_group_watches(leader_watch_id: int) -> bool:
     """
     Ставит pending/matched/expired -> cancelled для групи leader_watch_id.
     """
-    leader = db.execute(
-        select(
-            WatchPost.template_id,
-            WatchPost.time_window_end,
-            WatchPost.created_by,
-        ).where(WatchPost.id == int(leader_watch_id)).limit(1)
-    ).first()
+    with session_scope() as db:
+        leader = db.execute(
+            select(
+                WatchPost.template_id,
+                WatchPost.time_window_end,
+                WatchPost.created_by,
+            ).where(WatchPost.id == int(leader_watch_id)).limit(1)
+        ).first()
     if not leader:
         return False
     now_str = _now_msk_str()
-    res = db.execute(
-        update(WatchPost)
-        .where(
-            WatchPost.template_id == leader.template_id,
-            WatchPost.time_window_end == leader.time_window_end,
-            WatchPost.created_by == leader.created_by,
-            WatchPost.status.in_(["pending", "matched", "expired"]),
+    with session_scope() as db:
+        res = db.execute(
+            update(WatchPost)
+            .where(
+                WatchPost.template_id == leader.template_id,
+                WatchPost.time_window_end == leader.time_window_end,
+                WatchPost.created_by == leader.created_by,
+                WatchPost.status.in_(["pending", "matched", "expired"]),
+            )
+            .values(status="cancelled", updated_at=now_str)
         )
-        .values(status="cancelled", updated_at=now_str)
-    )
-    db.commit()
     return res.rowcount > 0
 
 
-def set_watch_status_pending_db(db: Session, watch_id: int) -> bool:
+def set_watch_status_pending_db(watch_id: int) -> bool:
     """
     Оновлює статус вотчу на pending і проставляє updated_at.
     """
     now_str = _now_msk_str()
-    res = db.execute(
-        update(WatchPost)
-        .where(WatchPost.id == int(watch_id))
-        .values(status="pending", updated_at=now_str)
-    )
-    db.commit()
+    with session_scope() as db:
+        res = db.execute(
+            update(WatchPost)
+            .where(WatchPost.id == int(watch_id))
+            .values(status="pending", updated_at=now_str)
+        )
     return res.rowcount > 0
 
 
 def update_watch_time_window(
-    db: Session,
     watch_id: int,
     time_window_start: str,
     time_window_end: str,
@@ -348,30 +354,30 @@ def update_watch_time_window(
     Оновлює time_window_start/time_window_end та updated_at для watch_posts.id = watch_id.
     """
     now_str = _now_msk_str()
-    res = db.execute(
-        update(WatchPost)
-        .where(WatchPost.id == int(watch_id))
-        .values(
-            time_window_start=time_window_start,
-            time_window_end=time_window_end,
-            updated_at=now_str,
+    with session_scope() as db:
+        res = db.execute(
+            update(WatchPost)
+            .where(WatchPost.id == int(watch_id))
+            .values(
+                time_window_start=time_window_start,
+                time_window_end=time_window_end,
+                updated_at=now_str,
+            )
         )
-    )
-    db.commit()
     return res.rowcount > 0
 
 
-def update_watch_source_url_db(db: Session, watch_id: int, source_url: str) -> bool:
+def update_watch_source_url_db(watch_id: int, source_url: str) -> bool:
     """
     Оновлює source_url та updated_at для watch_posts.id = watch_id.
     """
     now_str = _now_msk_str()
-    res = db.execute(
-        update(WatchPost)
-        .where(WatchPost.id == int(watch_id))
-        .values(source_url=source_url, updated_at=now_str)
-    )
-    db.commit()
+    with session_scope() as db:
+        res = db.execute(
+            update(WatchPost)
+            .where(WatchPost.id == int(watch_id))
+            .values(source_url=source_url, updated_at=now_str)
+        )
     return res.rowcount > 0
 
 
@@ -407,13 +413,14 @@ def group_active(
     return groups
 
 
-def get_watch_channel_id(db: Session, watch_id: int) -> Optional[int]:
+def get_watch_channel_id(watch_id: int) -> Optional[int]:
     """
     Повертає channel_id для вказаного watch_id.
     """
-    row = db.execute(
-        select(WatchPost.channel_id).where(WatchPost.id == int(watch_id)).limit(1)
-    ).first()
+    with session_scope() as db:
+        row = db.execute(
+            select(WatchPost.channel_id).where(WatchPost.id == int(watch_id)).limit(1)
+        ).first()
     if not row or row[0] is None:
         return None
     try:
@@ -422,19 +429,69 @@ def get_watch_channel_id(db: Session, watch_id: int) -> Optional[int]:
         return None
 
 
-def get_watch_source_url(db: Session, watch_id: int) -> Optional[str]:
+def get_watch_source_url(watch_id: int) -> Optional[str]:
     """
     Повертає source_url для вказаного watch_id.
     """
-    row = db.execute(
-        select(WatchPost.source_url).where(WatchPost.id == int(watch_id)).limit(1)
-    ).first()
+    with session_scope() as db:
+        row = db.execute(
+            select(WatchPost.source_url).where(WatchPost.id == int(watch_id)).limit(1)
+        ).first()
     if not row or row[0] is None:
         return None
     val = row[0]
     return str(val) if val else None
+
+
+def get_watch_post_details_by_id(watch_id: int) -> Optional[WatchPostDetailsRecord]:
+    with session_scope() as db:
+        row = db.execute(
+            select(
+                WatchPost.id,
+                WatchPost.template_id,
+                WatchPost.status,
+                WatchPost.time_window_end,
+                WatchPost.created_by,
+                WatchPost.channel_id,
+                WatchPost.source_url,
+                WatchPost.project,
+                WatchPost.matched_session,
+                WatchPost.created_via,
+                WatchPost.matched_at,
+                WatchPost.deleted_at,
+                WatchPost.updated_at,
+                WatchPost.group_id,
+                WatchPost.final_views,
+                WatchPost.expected_links_json,
+                WatchPost.expected_text_hash,
+                WatchPost.time_window_start,
+                WatchPost.admin_id,
+            ).where(WatchPost.id == int(watch_id)).limit(1)
+        ).first()
+    if not row:
+        return None
+    return WatchPostDetailsRecord(
+        id=int(row.id),
+        template_id=int(row.template_id) if row.template_id is not None else None,
+        status=str(row.status) if row.status is not None else None,
+        time_window_end=row.time_window_end if row.time_window_end is None else str(row.time_window_end),
+        created_by=int(row.created_by) if row.created_by is not None else None,
+        channel_id=int(row.channel_id) if row.channel_id is not None else None,
+        source_url=str(row.source_url) if row.source_url is not None else None,
+        project=str(row.project) if row.project is not None else None,
+        matched_session=str(row.matched_session) if row.matched_session is not None else None,
+        created_via=str(row.created_via) if row.created_via is not None else None,
+        matched_at=row.matched_at if row.matched_at is None else str(row.matched_at),
+        deleted_at=row.deleted_at if row.deleted_at is None else str(row.deleted_at),
+        updated_at=row.updated_at if row.updated_at is None else str(row.updated_at),
+        group_id=int(row.group_id) if row.group_id is not None else None,
+        final_views=int(row.final_views) if row.final_views is not None else None,
+        expected_links_json=str(row.expected_links_json) if row.expected_links_json is not None else None,
+        expected_text_hash=str(row.expected_text_hash) if row.expected_text_hash is not None else None,
+        time_window_start=row.time_window_start if row.time_window_start is None else str(row.time_window_start),
+        admin_id=int(row.admin_id) if row.admin_id is not None else None,
+    )
 def manual_mark_matched(
-    db: Session,
     watch_id: int,
     channel_id: int,
     message_id: int,
@@ -448,32 +505,30 @@ def manual_mark_matched(
     Використовується для ручного матчу (бот).
     """
     session_label = matched_session
-    if not session_label and source_url:
-        try:
-            session_label = process_get_session_for_source_url(db, source_url)
-        except Exception:
-            session_label = None
-    if not session_label:
-        session_label = "MAIN"
+    with session_scope() as db:
+        if not session_label and source_url:
+            try:
+                session_label = process_get_session_for_source_url(db, source_url)
+            except Exception:
+                session_label = None
+        if not session_label:
+            session_label = "MAIN"
 
-    if db is None:
-        raise ValueError("db Session is required")
-    now_str = _now_msk_str()
-    res = db.execute(
-        update(WatchPost)
-        .where(WatchPost.id == watch_id, WatchPost.status.in_(["pending", "expired"]))
-        .values(
-            matched_message_id=message_id,
-            matched_at=now_str,
-            coverage_check_at=coverage_check_at,
-            matched_session=session_label,
-            status="matched",
-            updated_at=now_str,
+        now_str = _now_msk_str()
+        res = db.execute(
+            update(WatchPost)
+            .where(WatchPost.id == watch_id, WatchPost.status.in_(["pending", "expired"]))
+            .values(
+                matched_message_id=message_id,
+                matched_at=now_str,
+                coverage_check_at=coverage_check_at,
+                matched_session=session_label,
+                status="matched",
+                updated_at=now_str,
+            )
         )
-    )
-    db.commit()
-    if res.rowcount == 0:
-        return False
+        if res.rowcount == 0:
+            return False
 
     try:
         payload = json.dumps(
@@ -498,7 +553,6 @@ def manual_mark_matched(
 
 
 def create_watch_group(
-    db: Session,
     project: Optional[str] = None,
     title: Optional[str] = None,
     created_by: Optional[int] = None,
@@ -507,23 +561,22 @@ def create_watch_group(
     network_id: Optional[int] = None,
 ) -> int:
     now_str = _now_msk_str()
-    obj = WatchGroup(
-        project=project,
-        title=title,
-        created_by=created_by,
-        created_via=created_via,
-        created_at=now_str,
-        admin_id=admin_id,
-        network_id=network_id,
-    )
-    db.add(obj)
-    db.commit()
-    db.refresh(obj)
-    return int(obj.id)
+    with session_scope() as db:
+        obj = WatchGroup(
+            project=project,
+            title=title,
+            created_by=created_by,
+            created_via=created_via,
+            created_at=now_str,
+            admin_id=admin_id,
+            network_id=network_id,
+        )
+        db.add(obj)
+        db.refresh(obj)
+        return int(obj.id)
 
 
 def create_watch(
-    db: Session,
     channel_id: int,
     group_id: Optional[int] = None,
     template_id: Optional[int] = None,
@@ -546,51 +599,52 @@ def create_watch(
     price_at_post: Optional[float] = None,
 ) -> int:
     now_str = _now_msk_str()
-    wp = WatchPost(
-        channel_id=channel_id,
-        group_id=group_id,
-        template_id=template_id,
-        expected_text_hash=expected_text_hash,
-        expected_text_norm_len=expected_text_norm_len,
-        expected_links_json=expected_links_json,
-        expected_media_fingerprint=expected_media_fingerprint,
-        time_window_start=time_window_start,
-        time_window_end=time_window_end,
-        status="pending",
-        created_at=now_str,
-        updated_at=now_str,
-        source_url=source_url,
-        created_by=created_by,
-        created_via=created_via,
-        project=project,
-        admin_id=admin_id,
-        network_id=network_id,
-        posted_at=posted_at,
-        views_at_post=views_at_post,
-        subs_at_post=subs_at_post,
-        cpm_at_post=cpm_at_post,
-        price_at_post=price_at_post,
-    )
-    db.add(wp)
-    db.commit()
-    db.refresh(wp)
-    return int(wp.id)
+    with session_scope() as db:
+        wp = WatchPost(
+            channel_id=channel_id,
+            group_id=group_id,
+            template_id=template_id,
+            expected_text_hash=expected_text_hash,
+            expected_text_norm_len=expected_text_norm_len,
+            expected_links_json=expected_links_json,
+            expected_media_fingerprint=expected_media_fingerprint,
+            time_window_start=time_window_start,
+            time_window_end=time_window_end,
+            status="pending",
+            created_at=now_str,
+            updated_at=now_str,
+            source_url=source_url,
+            created_by=created_by,
+            created_via=created_via,
+            project=project,
+            admin_id=admin_id,
+            network_id=network_id,
+            posted_at=posted_at,
+            views_at_post=views_at_post,
+            subs_at_post=subs_at_post,
+            cpm_at_post=cpm_at_post,
+            price_at_post=price_at_post,
+        )
+        db.add(wp)
+        db.refresh(wp)
+        return int(wp.id)
 
 
 def cancel_watch(watch_id: int) -> None:
     raise ValueError("cancel_watch requires explicit db; use cancel_group_watches/cancel_group_watches_db instead")
 
 
-def get_watch_links_or_template_links(db: Session, watch_id: int) -> List[str]:
+def get_watch_links_or_template_links(watch_id: int) -> List[str]:
     """
     Повертає links_json із watch_posts або, якщо порожньо, links із post_template.
     """
-    row = db.execute(
-        select(
-            WatchPost.expected_links_json,
-            WatchPost.template_id,
-        ).where(WatchPost.id == int(watch_id)).limit(1)
-    ).first()
+    with session_scope() as db:
+        row = db.execute(
+            select(
+                WatchPost.expected_links_json,
+                WatchPost.template_id,
+            ).where(WatchPost.id == int(watch_id)).limit(1)
+        ).first()
     links_json = None
     template_id = None
     if row:
@@ -620,7 +674,6 @@ def get_watch_links_or_template_links(db: Session, watch_id: int) -> List[str]:
 
 
 def find_active_duplicate(
-    db: Session,
     channel_id: int,
     template_id: Optional[int],
     expected_text_hash: Optional[str],
@@ -629,26 +682,27 @@ def find_active_duplicate(
     Перевіряє, чи існує активний (pending|matched) watch із тим самим ключем.
     Повертає словник з короткою інформацією або None.
     """
-    row = db.execute(
-        select(
-            WatchPost.id,
-            WatchPost.status,
-            WatchPost.created_at,
-            WatchPost.time_window_end,
-            WatchPost.matched_message_id,
-        ).where(
-            WatchPost.channel_id == int(channel_id),
-            (
-                (WatchPost.template_id.is_(None) if template_id is None else WatchPost.template_id == int(template_id))
-            ),
-            (
-                (WatchPost.expected_text_hash.is_(None) if expected_text_hash is None else WatchPost.expected_text_hash == expected_text_hash)
-            ),
-            WatchPost.status.in_(["pending", "matched"]),
-        )
-        .order_by(WatchPost.id.desc())
-        .limit(1)
-    ).first()
+    with session_scope() as db:
+        row = db.execute(
+            select(
+                WatchPost.id,
+                WatchPost.status,
+                WatchPost.created_at,
+                WatchPost.time_window_end,
+                WatchPost.matched_message_id,
+            ).where(
+                WatchPost.channel_id == int(channel_id),
+                (
+                    (WatchPost.template_id.is_(None) if template_id is None else WatchPost.template_id == int(template_id))
+                ),
+                (
+                    (WatchPost.expected_text_hash.is_(None) if expected_text_hash is None else WatchPost.expected_text_hash == expected_text_hash)
+                ),
+                WatchPost.status.in_(["pending", "matched"]),
+            )
+            .order_by(WatchPost.id.desc())
+            .limit(1)
+        ).first()
     if not row:
         return None
     return {
@@ -660,31 +714,32 @@ def find_active_duplicate(
     }
 
 
-def get_watch_info_db(db: Session, watch_id: int) -> Dict[str, Any]:
+def get_watch_info_db(watch_id: int) -> Dict[str, Any]:
     """
     Повертає інформацію про watch_posts.id, мінімально необхідну для нотифікацій.
     """
-    row = db.execute(
-        select(
-            WatchPost.channel_id,
-            WatchPost.project,
-            WatchPost.matched_session,
-            WatchPost.created_by,
-            WatchPost.created_via,
-            WatchPost.source_url,
-            WatchPost.status,
-            WatchPost.matched_at,
-            WatchPost.deleted_at,
-            WatchPost.updated_at,
-            WatchPost.group_id,
-            WatchPost.final_views,
-            WatchPost.template_id,
-            WatchPost.expected_links_json,
-            WatchPost.expected_text_hash,
-            WatchPost.time_window_start,
-            WatchPost.admin_id,
-        ).where(WatchPost.id == int(watch_id)).limit(1)
-    ).first()
+    with session_scope() as db:
+        row = db.execute(
+            select(
+                WatchPost.channel_id,
+                WatchPost.project,
+                WatchPost.matched_session,
+                WatchPost.created_by,
+                WatchPost.created_via,
+                WatchPost.source_url,
+                WatchPost.status,
+                WatchPost.matched_at,
+                WatchPost.deleted_at,
+                WatchPost.updated_at,
+                WatchPost.group_id,
+                WatchPost.final_views,
+                WatchPost.template_id,
+                WatchPost.expected_links_json,
+                WatchPost.expected_text_hash,
+                WatchPost.time_window_start,
+                WatchPost.admin_id,
+            ).where(WatchPost.id == int(watch_id)).limit(1)
+        ).first()
     if not row:
         return {}
     return {
@@ -708,25 +763,26 @@ def get_watch_info_db(db: Session, watch_id: int) -> Dict[str, Any]:
     }
 
 
-def fetch_watches_by_group_db(db: Session, group_id: int) -> List[Dict[str, Any]]:
+def fetch_watches_by_group_db(group_id: int) -> List[Dict[str, Any]]:
     """
     Повертає всі вотчі групи у вигляді словників.
     """
-    rows = db.execute(
-        select(
-            WatchPost.id,
-            WatchPost.channel_id,
-            WatchPost.source_url,
-            WatchPost.project,
-            WatchPost.status,
-            WatchPost.created_at,
-            WatchPost.updated_at,
-            WatchPost.deleted_at,
-            WatchPost.final_views,
-        )
-        .where(WatchPost.group_id == int(group_id))
-        .order_by(WatchPost.id.asc())
-    ).all()
+    with session_scope() as db:
+        rows = db.execute(
+            select(
+                WatchPost.id,
+                WatchPost.channel_id,
+                WatchPost.source_url,
+                WatchPost.project,
+                WatchPost.status,
+                WatchPost.created_at,
+                WatchPost.updated_at,
+                WatchPost.deleted_at,
+                WatchPost.final_views,
+            )
+            .where(WatchPost.group_id == int(group_id))
+            .order_by(WatchPost.id.asc())
+        ).all()
     result: List[Dict[str, Any]] = []
     for r in rows:
         result.append(

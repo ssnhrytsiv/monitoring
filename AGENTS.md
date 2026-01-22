@@ -1,51 +1,48 @@
-# MANDATORY RULES FOR THIS REPO
+You are Codex with full access to this repository.
 
-## Architecture
-- All DB access must be inside app/DAL/** only.
-- Business logic must not import SessionLocal, engine, Base, or ORM models for querying.
-- Business logic may call DAL functions only.
-- Functions must exchange structured objects with named fields (pydantic/dataclasses/ORM rows); do not pass tuples/lists/None blobs that require positional unpacking in business logic.
+MIGRATION MODE: A2 (DAL manages sessions internally, no db passed from services/listeners)
 
-## Single source of DB configuration
-- The ONLY place that defines/creates engine, SessionLocal and Base is app.db.session (session.py re-exports).
-- DAL must import SessionLocal ONLY from app.db.session.
-- Never create new engines, sessions, or Base anywhere else.
-- Alembic is the single source of truth for schema and migrations.
+TASK:
+Refactor EXACTLY 3 DAL functions to remove the `db: Session` argument and manage `session_scope()` internally.
+Then update ALL call sites across the repository for these 3 functions.
+Do NOT refactor any other functions.
 
-## SQL / ORM rules
-- No query construction in business logic (no session.query, select, execute, or SQL strings).
-- No raw SQL strings outside app/DAL/**.
-- No f-strings in SQL anywhere; parameterized queries only.
-- DAL may use SQLAlchemy ORM or Core, but only inside app/DAL/**.
-- DAL functions must manage sessions internally (open, commit/rollback, close).
-- DAL must never return a session, query, or ORM query object to business logic.
+STRICT RULES:
+- Do NOT change business behavior.
+- Do NOT add wrapper functions.
+- Do NOT add new modules.
+- Keep function names unchanged.
+- Keep return types unchanged.
+- Output UNIFIED DIFF ONLY.
 
-## Naming — Code
-- Variable, function, class, and field names must be explicit and descriptive.
-- No abbreviations or short forms: no ctx, cfg, tmp, obj, data, res, req, dto, etc.
-- Names must describe the real business meaning of the object.
-- Prefer longer, clear names over short or ambiguous ones.
+TARGET FUNCTIONS (EXACTLY THESE 3):
+1) app/DAL/watch_processing_operations.py::list_due_coverage_db
+2) app/DAL/watch_processing_operations.py::mark_done_views_db
+3) app/DAL/watch_events_operations.py::insert_watch_event
 
-## Naming — Database
-- Column and table names must reflect the real domain concept.
-- Use full words: channel_id, watch_post_status, matched_at, deleted_at, source_url.
-- Do not use generic or abbreviated names like id2, val, info, data, tmp, cfg.
-- Timestamps must be suffixed with _at (created_at, updated_at, matched_at, deleted_at, expired_at).
-- Boolean fields must be prefixed with is_ or has_ (is_active, has_error).
+REFRACTOR RULES:
+- Convert each target function from:
+    def func(db: Session, ...):
+  to:
+    def func(...):
+        with session_scope() as db:
+            ...
+- Import session_scope ONLY from app.db.session (single source of DB config).
+- Remove `Session` imports if unused after refactor.
+- If any of these functions contain db.commit(), remove it (session_scope commits automatically).
+- Do not call db.commit()/db.rollback() inside session_scope blocks; session_scope handles commit/rollback on exit.
 
-## Naming — DAL
-- DAL functions must use explicit verbs and domain nouns:
-  - get_watch_by_id
-  - list_channel_watches
-  - create_watch_post
-  - update_watch_status
-  - mark_post_as_deleted
-- Do not use generic names like process, handle, do, run, update1, getData.
+CALL SITE UPDATE:
+- Replace any call:
+    func(db, a, b, ...)
+  with:
+    func(a, b, ...)
+- Remove surrounding `with session_scope() as db:` blocks ONLY if they were used exclusively for calling these functions.
+- If the session_scope block also contains other DB work, keep it and only update the call.
 
-## Behavior
-- Refactors must not change business behavior.
-- Keep public interfaces in business layer stable unless explicitly requested.
+VALIDATION:
+- Exactly 3 function signatures changed.
+- No remaining call passes `db` into these 3 functions.
 
-## Output
-- Produce unified diff patches only.
-- No inline comments inside code blocks.
+OUTPUT:
+Unified diff patch only.
