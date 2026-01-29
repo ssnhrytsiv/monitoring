@@ -26,6 +26,7 @@ from app.admin_bot.run import run_admin_bot
 from app.admin_bot.config import ADMIN_BOT_TOKEN
 from scripts.forward_bot import start_forward_bot
 from app.notificator_bot.run import start_notificator_bot
+from app.planning_bot.run import start_planning_bot
 
 
 def setup_logging():
@@ -43,6 +44,7 @@ async def _main():
     admin_bot_task = None
     forward_bot_task = None
     notifier_task = None
+    planning_bot_task = None
 
     def _log_task_result(name: str):
         def _inner(t: asyncio.Task):
@@ -163,6 +165,13 @@ async def _main():
         log.exception("Failed to start Notifier bot task")
 
     try:
+        planning_bot_task = asyncio.create_task(start_planning_bot(), name="planning_bot")
+        planning_bot_task.add_done_callback(_log_task_result("Planning bot"))
+        log.info("Planning bot task created: %s", planning_bot_task.get_name())
+    except Exception:
+        log.exception("Failed to start Planning bot task")
+
+    try:
         if ADMIN_BOT_TOKEN:
             admin_bot_task = asyncio.create_task(run_admin_bot(), name="admin_bot")
             admin_bot_task.add_done_callback(_log_task_result("Admin bot"))
@@ -176,7 +185,19 @@ async def _main():
 
     try:
         await asyncio.gather(
-            *[t for t in (bot_task, forward_bot_task, notifier_task, admin_bot_task, exporter_task, reconciler_task) if t],
+            *[
+                t
+                for t in (
+                    bot_task,
+                    forward_bot_task,
+                    notifier_task,
+                    planning_bot_task,
+                    admin_bot_task,
+                    exporter_task,
+                    reconciler_task,
+                )
+                if t
+            ],
             return_exceptions=False,
         )
     except asyncio.CancelledError:
@@ -188,6 +209,7 @@ async def _main():
             (bot_task, "Bot UI"),
             (forward_bot_task, "Forward bot"),
             (notifier_task, "Notifier bot"),
+            (planning_bot_task, "Planning bot"),
             (admin_bot_task, "Admin bot"),
         ):
             if not t:

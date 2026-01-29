@@ -16,11 +16,20 @@ def format_message(project: str, grouped: Dict[str, List[str]]) -> str:
     return "\n".join(lines)
 
 
-def format_admin_message(project: str, admin: str, items: List[str], total_views: int | None = None, post_title: str | None = None) -> str:
+def format_admin_message(
+    project: str,
+    admin: str,
+    items: List[str],
+    total_views: int | None = None,
+    post_title: str | None = None,
+    group_id: int | None = None,
+) -> str:
     """
     Формує текст повідомлення для одного адміна всередині проекту.
     """
     lines: List[str] = [f"<b>Проект:</b> {project}", f"<b>Админ:</b> {admin}"]
+    if group_id is not None:
+        lines.append(f"<b>ID:</b> {group_id}")
     if post_title:
         lines.append(f"<b>Пост:</b> {post_title}")
     for idx, line in enumerate(items, 1):

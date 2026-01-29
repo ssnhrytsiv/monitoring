@@ -346,7 +346,8 @@ def accept_watch_candidate(
         effective_session = matched_session
         if effective_session is None and channel_id:
             try:
-                effective_session = mem_db.get_any_session_for_channel(int(channel_id))
+                with SessionLocal() as db_sess:
+                    effective_session = mem_db.get_any_session_for_channel(db_sess, int(channel_id))
             except Exception:
                 effective_session = None
         try:

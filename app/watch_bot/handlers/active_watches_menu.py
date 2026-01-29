@@ -148,12 +148,13 @@ async def menu_list_active(cb: CallbackQuery, status_key: Optional[str] = None, 
     # 🔍 ДІАГНОСТИЧНИЙ ЛОГ ГРУПУВАННЯ (можеш вимкнути, коли перестане бути потрібен)
     log.info("list_active: total rows=%s, groups=%s", len(rows), len(groups))
     for key, items in groups.items():
-        tid_i, tw_end_s, cby = key
+        group_id, tid_i, tw_end_s, cby = key
         wids = [wid for wid, cid in items]
         cids = [cid for wid, cid in items]
         log.info(
-            "list_active: group key=%r (tpl=%r, tw_end=%r, created_by=%r), wids=%s, cids=%s",
+            "list_active: group key=%r (group_id=%r, tpl=%r, tw_end=%r, created_by=%r), wids=%s, cids=%s",
             key,
+            group_id,
             tid_i,
             tw_end_s,
             cby,
@@ -184,7 +185,7 @@ async def menu_list_active(cb: CallbackQuery, status_key: Optional[str] = None, 
     kb = InlineKeyboardBuilder()
 
     for key in page_keys:
-        tid_i, tw_end_s, cby = key
+        group_id, tid_i, tw_end_s, cby = key
         items = groups[key]
 
         # leader_wid — максимальний id у групі
@@ -214,11 +215,11 @@ async def menu_list_active(cb: CallbackQuery, status_key: Optional[str] = None, 
             owner_txt = owners[0] + f" +{len(owners) - 1}"
 
         lines.append(
-            f"{leader_wid} | {title_short} | {chans_n} | {owner_txt} | до {tw_txt}"
+            f"{group_id or leader_wid} | {title_short} | {chans_n} | {owner_txt} | до {tw_txt}"
         )
 
         # Кнопки для цієї групи:
-        kb.button(text=str(leader_wid), callback_data="watch:noop")
+        kb.button(text=str(group_id or leader_wid), callback_data="watch:noop")
         kb.button(
             text=owner_txt,
             callback_data=f"watch:group:{leader_wid}:{status_key}",

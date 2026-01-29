@@ -44,6 +44,24 @@ except Exception:
 
 log = get_logger("plugin.posts_watch_listener")
 _pylog = logging.getLogger("plugin.posts_watch_listener")
+trace_logger = logging.getLogger("plugin.posts_watch_trace")
+if not trace_logger.handlers:
+    try:
+        os.makedirs("logs", exist_ok=True)
+    except Exception:
+        pass
+    handler = logging.FileHandler("logs/posts_watch_trace.log", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    trace_logger.addHandler(handler)
+    trace_logger.setLevel(logging.INFO)
+    trace_logger.propagate = False
+
+
+def _trace(event: str, **payload):
+    try:
+        trace_logger.info(json.dumps({"event": event, **payload}, ensure_ascii=False))
+    except Exception:
+        pass
 
 COVERAGE_POLL_TICK_SEC = 30
 
@@ -355,12 +373,27 @@ async def _views_worker():
                 cli = pool_map.get(matched_session) if matched_session else None
                 if cli is None:
                     cli = any_cli
+                _trace(
+                    "views_due",
+                    watch_id=watch_id,
+                    channel_id=channel_id,
+                    message_id=msg_id,
+                    matched_session=matched_session,
+                    session_used=session_name(cli),
+                )
                 msg: Message | None = None
                 try:
                     msg = await cli.get_messages(entity=channel_id, ids=msg_id)
                 except Exception as e:
                     _pylog.exception("views: get_messages failed (wid=%s cid=%s mid=%s): %s", watch_id, channel_id,
                                      msg_id, e)
+                    _trace(
+                        "views_get_messages_error",
+                        watch_id=watch_id,
+                        channel_id=channel_id,
+                        message_id=msg_id,
+                        error=str(e),
+                    )
                     # Спроба підвантажити entity через source_url (username/інвайт)
                     fallback_url: str | None = None
                     try:
@@ -378,6 +411,13 @@ async def _views_worker():
                                 channel_id,
                                 fallback_url,
                             )
+                            _trace(
+                                "views_fallback_entity",
+                                watch_id=watch_id,
+                                channel_id=channel_id,
+                                message_id=msg_id,
+                                fallback_url=fallback_url,
+                            )
                         except Exception as e2:
                             _pylog.exception(
                                 "views: fallback get_messages failed (wid=%s cid=%s url=%s): %s",
@@ -385,6 +425,14 @@ async def _views_worker():
                                 channel_id,
                                 fallback_url,
                                 e2,
+                            )
+                            _trace(
+                                "views_fallback_error",
+                                watch_id=watch_id,
+                                channel_id=channel_id,
+                                message_id=msg_id,
+                                fallback_url=fallback_url,
+                                error=str(e2),
                             )
 
                     # якщо не змогли отримати entity — вважаємо покритим, щоб не зациклитись
@@ -407,11 +455,24 @@ async def _views_worker():
                         except Exception:
                             _pylog.exception("views: mark_done_views failed (wid=%s) after entity miss", watch_id)
                         msg = None
+                        _trace(
+                            "views_entity_miss",
+                            watch_id=watch_id,
+                            channel_id=channel_id,
+                            message_id=msg_id,
+                        )
 
                 if msg is None:
                     continue
 
                 views = int(getattr(msg, "views", 0) or 0)
+                _trace(
+                    "views_got_message",
+                    watch_id=watch_id,
+                    channel_id=channel_id,
+                    message_id=msg_id,
+                    views=views,
+                )
                 try:
                     watch_proc_db.mark_done_views(watch_id, views)
                     watch_events_db.insert_watch_event(
@@ -427,6 +488,13 @@ async def _views_worker():
                         ),
                     )
                     log.info("views: wid=%s views=%s -> done", watch_id, views)
+                    _trace(
+                        "views_done",
+                        watch_id=watch_id,
+                        channel_id=channel_id,
+                        message_id=msg_id,
+                        views=views,
+                    )
                 except Exception:
                     _pylog.exception("views: mark_done_views failed (wid=%s)", watch_id)
 
@@ -542,6 +610,13 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             return
 
         _pylog.info("listen: found %s pending watches for cid=%s mid=%s sess=%s", len(pending), cid, mid, tag)
+        _trace(
+            "listen_new_message",
+            session=tag,
+            channel_id=cid,
+            message_id=mid,
+            pending_count=len(pending),
+        )
 
         try:
             msg_html = _HTML_RENDER(m) if _HTML_RENDER else (getattr(m, "message", "") or "")
@@ -591,6 +666,13 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                     tag,
                     len(expected_html_norm or ""),
                     len(msg_html_norm or ""),
+                )
+                _trace(
+                    "match_exact",
+                    watch_id=wid,
+                    channel_id=cid,
+                    message_id=mid,
+                    session=tag,
                 )
             _pylog.debug(
                 "similar_check: wid=%s cid=%s mid=%s ok=%s exp_len=%s msg_len=%s",
@@ -710,6 +792,16 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                             except Exception:
                                 _pylog.exception("similar: insert foreign event failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                             log.info("similar: wid=%s cid=%s mid=%s ratio=%.3f -> foreign (links mismatch)", wid, cid, mid, ratio)
+                            _trace(
+                                "match_foreign_links_mismatch",
+                                watch_id=wid,
+                                channel_id=cid,
+                                message_id=mid,
+                                similarity=ratio,
+                                similarity_text=ratio_text,
+                                expected_links=exp_links,
+                                candidate_links=cand_links,
+                            )
                         except Exception:
                             _pylog.exception("similar: insert foreign candidate failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                         continue
@@ -750,6 +842,15 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                             except Exception:
                                 _pylog.exception("similar: insert candidate event failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                             log.info("similar: wid=%s cid=%s mid=%s ratio=%.3f -> candidate", wid, cid, mid, ratio)
+                            _trace(
+                                "match_candidate",
+                                watch_id=wid,
+                                channel_id=cid,
+                                message_id=mid,
+                                similarity=ratio,
+                                similarity_text=ratio_text,
+                                text_hash=text_hash,
+                            )
                         except Exception:
                             _pylog.exception("similar: insert_watch_candidate failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                 else:
@@ -761,6 +862,15 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                         tag,
                         ratio,
                         ratio_text,
+                    )
+                    _trace(
+                        "match_no_match",
+                        watch_id=wid,
+                        channel_id=cid,
+                        message_id=mid,
+                        similarity=ratio,
+                        similarity_text=ratio_text,
+                        reason="ratio_low",
                     )
                 continue
 

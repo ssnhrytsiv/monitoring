@@ -220,11 +220,27 @@ def _extract_targets(text: str) -> List[str]:
 
 
 def _first_line_title(text: str) -> str:
+    """
+    Будує заголовок із перших двох слів, ігноруючи початкові символи/емодзі.
+    Якщо слів немає — повертає обрізаний текст або резервний рядок.
+    """
+    import re
+
     text = (text or "").strip()
     if not text:
-        return "bot_template"
-    first_word = text.split()[0]
-    return first_word[:80]
+        return ""
+
+    # прибираємо провідні не-алфанум символи (емодзі, знаки)
+    text = re.sub(r"^\W+", "", text, flags=re.UNICODE)
+
+    # вибираємо слова (букви/цифри/апостроф/дефіс)
+    raw_tokens = re.findall(r"[\w’'\-]+", text, flags=re.UNICODE)
+    tokens = [t for t in raw_tokens if re.search(r"\w", t, flags=re.UNICODE)]
+    if not tokens:
+        return text[:80]
+
+    title = " ".join(tokens[:2])
+    return title[:80]
 
 
 def _parse_template_id(res: Any) -> Optional[int]:
@@ -1064,30 +1080,52 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                 return
             tpl_html = tpl_meta.get("html")
             tpl_links_json = tpl_meta.get("links_json")
-            if not tpl_html:
-                log.warning("watch_net: template id=%s has empty html", tid)
-            else:
-                try:
-                    # Використовуємо той самий нормалізатор, що й у слухачі
+        if not tpl_html:
+            log.warning("watch_net: template id=%s has empty html", tid)
+        else:
+            try:
+                # Використовуємо той самий нормалізатор, що й у слухачі
                     from app.plugins.posts_watch_listener import _normalize_html_full, _strip_tags_to_text  # type: ignore
                     tpl_html_norm = _normalize_html_full(tpl_html)
                     tpl_plain = _strip_tags_to_text(tpl_html_norm)
                     tpl_html = tpl_html_norm
                     tpl_plain_len = len(tpl_plain or "")
-                except Exception:
-                    log.exception("watch_net: tpl normalization failed (tid=%s)", tid)
-                    tpl_plain_len = len(tpl_html or "")
+                    log.debug(
+                        "watch_net: tpl normalized tid=%s len_html=%s len_plain=%s sample_plain=%r",
+                        tid,
+                        len(tpl_html or ""),
+                        tpl_plain_len,
+                        (tpl_plain or "")[:120],
+                    )
+            except Exception:
+                log.exception("watch_net: tpl normalization failed (tid=%s)", tid)
+                tpl_plain_len = len(tpl_html or "")
+
+        # Заголовок групи (перші два слова без провідних символів/емодзі)
+        group_title_source = tpl_plain or tpl_html or (tpl_meta or {}).get("title") or ""
+        group_title = _first_line_title(group_title_source)
+        log.info(
+            "watch_net: group title resolved -> '%s' (source len=%s, tid=%s)",
+            group_title,
+            len(group_title_source or ""),
+            tid,
+        )
+        if not group_title:
+            log.warning(
+                "watch_net: empty group title, source_sample=%r", (group_title_source or "")[:120]
+            )
 
         group_id = None
         try:
             group_id = watch_posts_db.create_watch_group(
                 project=project,
-                title=None,
+                title=group_title,
                 created_by=cb.from_user.id if cb.from_user else None,
                 created_via="bot_fallback",
                 admin_id=admin_id,
                 network_id=net_id,
             )
+            log.info("watch_net: created group id=%s title='%s'", group_id, group_title)
         except Exception:
             log.warning("create_watch_group (fallback) failed", exc_info=True)
 
@@ -1101,7 +1139,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                 failed.append(t)
                 failed_reasons.append((t, "Порожній HTML шаблону"))
                 continue
-            watch_title: Optional[str] = tpl_meta.get("title") if tid else None  # type: ignore
+            watch_title: Optional[str] = None  # двослівний заголовок далі
             if tpl_plain:
                 try:
                     templates = post_watch_db.list_templates_full(limit=200)
@@ -1118,12 +1156,36 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                         watch_title = best_title
                 except Exception:
                     log.warning("watch_net: similarity match for title failed", exc_info=True)
+
+            # якщо нічого не підійшло — беремо перші два слова з тексту шаблону
+            base_title_source = watch_title or tpl_plain or tpl_html or titles_map.get(int(cid)) or ""
+            watch_title = _first_line_title(base_title_source)
+            log.debug(
+                "watch_net: watch title resolved -> '%s' (cid=%s, tid=%s, group_id=%s)",
+                watch_title,
+                cid,
+                tid,
+                group_id,
+            )
             if not watch_title:
-                try:
-                    first_line = (tpl_plain or tpl_html or "").splitlines()[0].strip()
-                except Exception:
-                    first_line = ""
-                watch_title = first_line or titles_map.get(int(cid)) or None
+                if group_title:
+                    watch_title = group_title
+                    log.info(
+                        "watch_net: watch title empty, fallback to group title -> '%s' (cid=%s, tid=%s, group_id=%s)",
+                        watch_title,
+                        cid,
+                        tid,
+                        group_id,
+                    )
+                else:
+                    watch_title = ""
+                log.warning(
+                    "watch_net: empty watch title for cid=%s tid=%s group_id=%s source_sample=%r",
+                    cid,
+                    tid,
+                    group_id,
+                    (base_title_source or "")[:120],
+                )
             try:
                 wid = watch_posts_db.create_watch(
                     channel_id=int(cid),

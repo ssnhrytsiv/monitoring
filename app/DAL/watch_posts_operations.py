@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
+import logging
 
 from sqlalchemy import or_, select, update
 
@@ -23,6 +24,8 @@ ALLOWED_STATUSES: Dict[str, str] = {
     "expired": "expired",
 }
 
+log = logging.getLogger(__name__)
+
 
 def _now_msk_str() -> str:
     return moscow_now().strftime(MOSCOW_TIME_FORMAT)
@@ -38,7 +41,7 @@ def _time_window_key(value: Any) -> Optional[str]:
 def list_active_watches(
     user_id: int,
     statuses: Optional[List[str]] = None,
-) -> List[Tuple[int, Optional[int], str, Optional[str], Optional[int], Optional[int]]]:
+) -> List[Tuple[int, Optional[int], str, Optional[str], Optional[int], Optional[int], Optional[int]]]:
     """
     Повертає активні вотчі користувача (або всі, якщо created_by NULL) з фільтром статусів.
     Результат відсортований за id DESC і обмежений 200 рядками.
@@ -52,19 +55,20 @@ def list_active_watches(
 
     db = WatchSessionLocal()
     try:
-        rows = db.execute(
-            select(
-                WatchPost.id,
-                WatchPost.template_id,
-                WatchPost.status,
-                WatchPost.time_window_end,
-                WatchPost.created_by,
-                WatchPost.channel_id,
-            )
-            .where(
-                or_(WatchPost.created_by == user_id, WatchPost.created_by.is_(None)),
-                WatchPost.status.in_(filtered_statuses),
-            )
+            rows = db.execute(
+                select(
+                    WatchPost.id,
+                    WatchPost.template_id,
+                    WatchPost.status,
+                    WatchPost.time_window_end,
+                    WatchPost.created_by,
+                    WatchPost.channel_id,
+                    WatchPost.group_id,
+                )
+                .where(
+                    or_(WatchPost.created_by == user_id, WatchPost.created_by.is_(None)),
+                    WatchPost.status.in_(filtered_statuses),
+                )
             .order_by(WatchPost.id.desc())
             .limit(200)
         ).all()
@@ -81,6 +85,7 @@ def list_active_watches(
                 str(row.time_window_end) if row.time_window_end else None,
                 int(row.created_by) if row.created_by is not None else None,
                 int(row.channel_id) if row.channel_id is not None else None,
+                int(row.group_id) if row.group_id is not None else None,
             )
         )
     return result
@@ -371,8 +376,8 @@ def update_watch_source_url(watch_id: int, source_url: str) -> bool:
 
 
 def group_active(
-    rows: List[Tuple[Any, Any, Any, Any, Any, Any]]
-) -> Dict[Tuple[Optional[int], Optional[str], Optional[int]], List[Tuple[int, int]]]:
+    rows: List[Tuple[Any, Any, Any, Any, Any, Any, Any]]
+) -> Dict[Tuple[Optional[int], Optional[int], Optional[str], Optional[int]], List[Tuple[int, int]]]:
     """
     Групує активні вотчі за:
       - template_id
@@ -381,10 +386,11 @@ def group_active(
 
     Повертає dict: ключ = (template_id, tw_end_minute, created_by), значення = список (watch_id, channel_id).
     """
-    groups: Dict[Tuple[Optional[int], Optional[str], Optional[int]], List[Tuple[int, int]]] = {}
+    groups: Dict[Tuple[Optional[int], Optional[int], Optional[str], Optional[int]], List[Tuple[int, int]]] = {}
 
-    for watch_id, template_id, status, time_window_end, created_by, channel_id in rows:
+    for watch_id, template_id, status, time_window_end, created_by, channel_id, group_id in rows:
         template_id_int = int(template_id) if template_id is not None else None
+        group_id_int = int(group_id) if group_id is not None else None
 
         if time_window_end is None:
             tw_end_string: Optional[str] = None
@@ -396,7 +402,7 @@ def group_active(
         watch_id_int = int(watch_id)
         channel_id_int = int(channel_id) if channel_id is not None else 0
 
-        key = (template_id_int, tw_end_string, created_by_int)
+        key = (group_id_int, template_id_int, tw_end_string, created_by_int)
         groups.setdefault(key, []).append((watch_id_int, channel_id_int))
 
     return groups
@@ -529,6 +535,16 @@ def create_watch_group(
         db.add(obj)
         db.commit()
         db.refresh(obj)
+        log.info(
+            "watch_group.create id=%s title=%r project=%r admin_id=%s network_id=%s created_by=%s via=%s",
+            obj.id,
+            obj.title,
+            obj.project,
+            obj.admin_id,
+            obj.network_id,
+            obj.created_by,
+            obj.created_via,
+        )
         return int(obj.id)
     except Exception:
         db.rollback()
@@ -592,6 +608,17 @@ def create_watch(
         db.add(wp)
         db.commit()
         db.refresh(wp)
+        log.info(
+            "watch.create id=%s group_id=%s channel_id=%s template_id=%s title=%r project=%r admin_id=%s network_id=%s",
+            wp.id,
+            wp.group_id,
+            wp.channel_id,
+            wp.template_id,
+            wp.title,
+            wp.project,
+            wp.admin_id,
+            wp.network_id,
+        )
         return int(wp.id)
     except Exception:
         db.rollback()

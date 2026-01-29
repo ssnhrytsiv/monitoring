@@ -9,6 +9,7 @@ from aiogram.client.default import DefaultBotProperties
 from app.notificator_bot.config import NOTIFIER_BOT_TOKEN, NOTIFIER_POLL_INTERVAL_SEC, NOTIFIER_TARGET_IDS
 from app.notificator_bot.service import send_notifications
 from app.notificator_bot.models import ensure_tables
+from app.notificator_bot.handlers import inline_handler
 
 
 log = logging.getLogger("notificator.run")
@@ -33,6 +34,7 @@ async def start_notificator_bot():
 
     bot = Bot(token=NOTIFIER_BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
+    dp.inline_query.register(inline_handler)
 
     asyncio.create_task(_worker(bot), name="notifier_worker")
     log.info("Notifier bot started (interval=%ss)", NOTIFIER_POLL_INTERVAL_SEC)

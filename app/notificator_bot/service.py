@@ -191,17 +191,17 @@ def _build_line(event_type: str, payload: dict, watch_info: dict, title: str, li
             views = watch_info.get("final_views")
         if views is not None:
             views_fmt = f"{views:,}".replace(",", " ")
-            desc = f"Отстоял (просмотры: {views_fmt})"
+            desc = f"Отстоял ✅ (просмотры: {views_fmt})"
         else:
-            desc = "Отстоял (просмотры: —)"
+            desc = "Отстоял ✅ (просмотры: —)"
     elif event_type == "deleted":
-        desc = "Пост удалён"
+        desc = "Пост удалён❗️"
     elif event_type == "edited_other":
-        desc = "Пост отредактирован"
+        desc = "Пост отредактирован❗️"
     elif event_type == "matched":
-        desc = "Опубликован"
+        desc = "Опубликован ☑️"
     elif event_type == "expired":
-        desc = "Не вышел"
+        desc = "Не вышел ❌"
     elif event_type == "cancelled":
         desc = "Вотч отменён"
     elif event_type == "created":
@@ -221,11 +221,11 @@ def _build_line(event_type: str, payload: dict, watch_info: dict, title: str, li
         sim = payload.get("similarity")
         if sim is not None:
             try:
-                desc = f"Кандидат (похожесть: {float(sim):.3f})"
+                desc = f"Кандидат 🔜 (похожесть: {float(sim):.3f})"
             except Exception:
-                desc = "Кандидат"
+                desc = "Кандидат 🔜"
         else:
-            desc = "Кандидат"
+            desc = "Кандидат 🔜"
     elif event_type == "edited_candidate":
         desc = "Кандидат отредактирован"
     elif event_type == "foreign":
@@ -536,7 +536,7 @@ async def send_notifications(bot: Bot, debounce_sec: int = 60) -> None:
             except Exception:
                 continue
         total_views = sum(views_values) if views_values else None
-        text = formatter.format_admin_message(project, admin, lines, total_views, post_title)
+        text = formatter.format_admin_message(project, admin, lines, total_views, post_title, group_id)
 
         for chat_id in NOTIFIER_TARGET_IDS:
             # Якщо є попереднє повідомлення по цьому group_id – видалимо
