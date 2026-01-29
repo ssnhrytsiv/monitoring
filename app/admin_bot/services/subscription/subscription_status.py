@@ -69,9 +69,9 @@ def render_html_with_statuses(
         elif "bot_error" in base or "error" in base:
             human = "❌ Ошибка"
         elif "joined" in base:
-            human = "✅ Подписался"
+            human = ""
         elif "already" in base:
-            human = "☑️ Был подписан"
+            human = ""
         elif "no_client" in base:
             human = "🛑 Нет доступных клиентов"
         elif "invalid" in base or "private" in base or "blocked" in base:
@@ -104,6 +104,13 @@ def render_html_with_statuses(
 
     norm_seen: Dict[str, int] = {}
     cid_seen: Dict[Optional[int], int] = {}
+    norm_first_idx: Dict[str, int] = {}
+    cid_first_idx: Dict[Optional[int], int] = {}
+    first_norm_index: Dict[str, int] = {}
+    for i, url in enumerate(render_order, start=1):
+        n = normalize_url(url)
+        if n and n not in first_norm_index:
+            first_norm_index[n] = i
     status_lines: List[str] = []
     idx_display = 0
 
@@ -124,6 +131,9 @@ def render_html_with_statuses(
         cid = item.get("channel_id")
         norm_seen[norm] = norm_seen.get(norm, 0) + 1
         cid_seen[cid] = cid_seen.get(cid, 0) + 1
+        norm_first_idx.setdefault(norm, idx_display)
+        if cid is not None:
+            cid_first_idx.setdefault(cid, idx_display)
 
         raw_status = item.get("status", "")
         human = _status_human(raw_status)
@@ -134,7 +144,13 @@ def render_html_with_statuses(
         if cid is not None and cid_counts.get(cid, 0) > 1 and cid_seen[cid] >= 2:
             is_dup = True
         if is_dup:
-            human = "🔁 Дубликат"
+            base_idx = first_norm_index.get(norm)
+            if base_idx is None:
+                base_idx = norm_first_idx.get(norm)
+            if base_idx is None and cid is not None:
+                base_idx = cid_first_idx.get(cid)
+            dup_suffix = f" ({base_idx})" if base_idx else ""
+            human = f"🔁 Дубликат{dup_suffix}"
             raw, sess = _split_status_session(raw_status)
             if sess:
                 human = f"{human} [{session_display(sess)}]"
@@ -143,9 +159,12 @@ def render_html_with_statuses(
         title_safe = html.escape(title or "")
         human_safe = html.escape(human or "")
         if href:
-            status_lines.append(f'{idx_display}) <a href="{href}">{title_safe}</a> — {human_safe}')
+            line = f'{idx_display}) <a href="{href}">{title_safe}</a>'
         else:
-            status_lines.append(f"{idx_display}) {title_safe} — {human_safe}")
+            line = f"{idx_display}) {title_safe}"
+        if human_safe:
+            line = f"{line} — {human_safe}"
+        status_lines.append(line)
 
     # Якщо щось залишилось у бакетах (не відображено), додаємо в кінці
     for items_left in buckets.values():
@@ -156,7 +175,10 @@ def render_html_with_statuses(
             human = _status_human(item.get("status", ""))
             title_safe = html.escape(title or "")
             human_safe = html.escape(human or "")
-            status_lines.append(f'{idx_display}) <a href="{href}">{title_safe}</a> — {human_safe}')
+            line = f'{idx_display}) <a href="{href}">{title_safe}</a>'
+            if human_safe:
+                line = f"{line} — {human_safe}"
+            status_lines.append(line)
 
     final_text = "\n".join(status_lines).strip()
     return final_text

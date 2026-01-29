@@ -118,6 +118,21 @@ class MembershipDAO:
         """Аліас для get_any_session_for_channel — для читабельності викликів."""
         return self.get_any_session_for_channel(channel_id)
 
+    def delete_membership(self, account: str, channel_id: int) -> int:
+        """
+        Видаляє запис membership для конкретної сесії в каналі.
+        Повертає кількість видалених рядків.
+        """
+        if not account or channel_id is None:
+            return 0
+        deleted = (
+            self.db.query(m.Membership)
+            .filter(m.Membership.channel_id == int(channel_id), m.Membership.account == account)
+            .delete(synchronize_session=False)
+        )
+        self.db.commit()
+        return deleted or 0
+
     # ---------- invite_map (інвайт-хеш -> channel_id, title) ----------
 
     def map_invite_set(self, invite_or_hash: str, channel_id: Optional[int], title: Optional[str] = None) -> None:
@@ -346,3 +361,11 @@ def url_get(db: Session, url: str) -> Optional[str]:
 
 def url_delete(db: Session, urls: list[str], statuses: Optional[list[str]] = None) -> int:
     return MembershipDAO(db).url_delete(urls, statuses)
+
+
+def get_session_by_channel(db: Session, channel_id: int) -> Optional[str]:
+    return MembershipDAO(db).get_session_by_channel(channel_id)
+
+
+def delete_membership(db: Session, account: str, channel_id: int) -> int:
+    return MembershipDAO(db).delete_membership(account, channel_id)

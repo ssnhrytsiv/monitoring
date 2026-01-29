@@ -15,24 +15,50 @@ depends_on = None
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+
+    def _missing(table: str, column: str) -> bool:
+        try:
+            cols = [c["name"] for c in inspector.get_columns(table)]
+            return column not in cols
+        except Exception:
+            return False
+
     with op.batch_alter_table("watch_groups") as batch:
-        batch.add_column(sa.Column("admin_id", sa.Integer(), nullable=True))
-        batch.add_column(sa.Column("network_id", sa.Integer(), nullable=True))
+        if _missing("watch_groups", "admin_id"):
+            batch.add_column(sa.Column("admin_id", sa.Integer(), nullable=True))
+        if _missing("watch_groups", "network_id"):
+            batch.add_column(sa.Column("network_id", sa.Integer(), nullable=True))
 
     with op.batch_alter_table("watch_posts") as batch:
-        batch.add_column(sa.Column("admin_id", sa.Integer(), nullable=True))
-        batch.add_column(sa.Column("network_id", sa.Integer(), nullable=True))
-        batch.add_column(sa.Column("posted_at", sa.Text(), nullable=True))
-        batch.add_column(sa.Column("views_at_post", sa.Integer(), nullable=True))
-        batch.add_column(sa.Column("subs_at_post", sa.Integer(), nullable=True))
-        batch.add_column(sa.Column("cpm_at_post", sa.Float(), nullable=True))
-        batch.add_column(sa.Column("price_at_post", sa.Float(), nullable=True))
+        if _missing("watch_posts", "admin_id"):
+            batch.add_column(sa.Column("admin_id", sa.Integer(), nullable=True))
+        if _missing("watch_posts", "network_id"):
+            batch.add_column(sa.Column("network_id", sa.Integer(), nullable=True))
+        if _missing("watch_posts", "posted_at"):
+            batch.add_column(sa.Column("posted_at", sa.Text(), nullable=True))
+        if _missing("watch_posts", "views_at_post"):
+            batch.add_column(sa.Column("views_at_post", sa.Integer(), nullable=True))
+        if _missing("watch_posts", "subs_at_post"):
+            batch.add_column(sa.Column("subs_at_post", sa.Integer(), nullable=True))
+        if _missing("watch_posts", "cpm_at_post"):
+            batch.add_column(sa.Column("cpm_at_post", sa.Float(), nullable=True))
+        if _missing("watch_posts", "price_at_post"):
+            batch.add_column(sa.Column("price_at_post", sa.Float(), nullable=True))
 
-    op.create_index("idx_wp_posted_at", "watch_posts", ["posted_at"], unique=False)
-    op.create_index("idx_wp_admin", "watch_posts", ["admin_id"], unique=False)
-    op.create_index("idx_wp_network", "watch_posts", ["network_id"], unique=False)
-    op.create_index("idx_wg_admin", "watch_groups", ["admin_id"], unique=False)
-    op.create_index("idx_wg_network", "watch_groups", ["network_id"], unique=False)
+    existing_wp = {ix["name"] for ix in inspector.get_indexes("watch_posts")}
+    existing_wg = {ix["name"] for ix in inspector.get_indexes("watch_groups")}
+    if "idx_wp_posted_at" not in existing_wp:
+        op.create_index("idx_wp_posted_at", "watch_posts", ["posted_at"], unique=False)
+    if "idx_wp_admin" not in existing_wp:
+        op.create_index("idx_wp_admin", "watch_posts", ["admin_id"], unique=False)
+    if "idx_wp_network" not in existing_wp:
+        op.create_index("idx_wp_network", "watch_posts", ["network_id"], unique=False)
+    if "idx_wg_admin" not in existing_wg:
+        op.create_index("idx_wg_admin", "watch_groups", ["admin_id"], unique=False)
+    if "idx_wg_network" not in existing_wg:
+        op.create_index("idx_wg_network", "watch_groups", ["network_id"], unique=False)
 
 
 def downgrade() -> None:

@@ -8,6 +8,7 @@ from datetime import datetime
 from app.utils.link_parser import extract_bot_username
 from app.sheet_bot.services import gsheets_writer as gw
 from app.DAL import SessionLocal
+from app.db.session import engine
 from app.DAL import bot_links_operations as blo
 from app.DAL import sheet_projects_operations as spo
 from app.DAL import watch_posts_operations as watch_posts_db
@@ -134,7 +135,7 @@ def _db_get_template_title(tid: int | None):
     if not tid:
         return None
     try:
-        conn = raw_connection()
+        conn = engine.raw_connection()
         cur = conn.cursor()
         cur.execute("SELECT title FROM post_template WHERE id = ? LIMIT 1", (int(tid),))
         row = cur.fetchone()

@@ -16,6 +16,7 @@ from telethon.tl.functions.messages import ImportChatInviteRequest,CheckChatInvi
 
 from app.DAL import SessionLocal
 from app.DAL.membership_operations import MembershipDAO, FINAL_GLOBAL
+from app.DAL import membership_operations as mem_db
 from app.utils.link_parser import sanitize_link
 from app.DAL import channels_operations as cho
 from app.services.account_pool import is_already_subscribed, session_name
@@ -26,6 +27,14 @@ log = logging.getLogger("services.joiner")
 def _log_exc(context: str) -> None:
     """Debug-log suppressed exceptions to trace why invite_map may not update."""
     log.debug("%s: suppressed exception", context, exc_info=True)
+
+
+def _trace_joiner(event: str, data: dict) -> None:
+    """Lightweight trace helper to avoid NameError in optional tracing."""
+    try:
+        log.debug("joiner.trace %s %s", event, data)
+    except Exception:
+        pass
 
 
 def _extract_invite_hash(url: str) -> str | None:
@@ -74,6 +83,18 @@ def _membership():
     db = SessionLocal()
     try:
         yield MembershipDAO(db)
+    finally:
+        db.close()
+
+
+@contextmanager
+def _db():
+    """
+    Локальний синонім SessionLocal для допоміжних читань/перевірок у ensure_join.
+    """
+    db = SessionLocal()
+    try:
+        yield db
     finally:
         db.close()
 
@@ -265,6 +286,12 @@ async def ensure_join(client, url: str):
 
     invite_hash = _extract_invite_hash(url)
     is_invite = bool(invite_hash)
+
+    sess_current = None
+    try:
+        sess_current = session_name(client)
+    except Exception:
+        _log_exc("ensure_join: session_name init")
     requested_limit = 2
 
     def _requested_status() -> str:
@@ -523,6 +550,37 @@ async def ensure_join(client, url: str):
             cid = int(getattr(ch, "id", 0) or 0) or None
             title = getattr(ch, "title", "?") if ch else "?"
 
+            # Якщо канал уже приєднаний іншою сесією — одразу leave і повертаємо already
+            if cid:
+                try:
+                    with _db() as db_chk:
+                        sess_other = mem_db.get_any_session_for_channel(db_chk, cid)
+                    if sess_other and sess_other != (sess_current or ""):
+                        _trace_joiner(
+                            "leave_due_to_other_session",
+                            {
+                                "cid": cid,
+                                "title": title,
+                                "sess_current": sess_current,
+                                "sess_other": sess_other,
+                                "url": url,
+                                "phase": "after_import_invite",
+                            },
+                        )
+                        try:
+                            from telethon.tl.functions.channels import LeaveChannelRequest
+
+                            await client(LeaveChannelRequest(ch))
+                        except Exception:
+                            _log_exc("ensure_join: leave other session (invite)")
+                        try:
+                            mem_db.delete_membership(db_chk, sess_current or "", cid)
+                        except Exception:
+                            _log_exc("ensure_join: delete_membership after leave (invite)")
+                        return "already", title, "invite", cid, invite_hash
+                except Exception:
+                    _log_exc("ensure_join: check other session after invite import")
+
             if invite_hash and cid:
                 try:
                     map_invite_set(invite_hash, cid, title or None)
@@ -578,6 +636,35 @@ async def ensure_join(client, url: str):
             await client(JoinChannelRequest(ent))
             title = getattr(ent, "title", "?")
             cid = int(getattr(ent, "id", 0) or 0) or None
+            if cid:
+                try:
+                    with _db() as db_chk:
+                        sess_other = mem_db.get_any_session_for_channel(db_chk, cid)
+                    if sess_other and sess_other != (sess_current or ""):
+                        _trace_joiner(
+                            "leave_due_to_other_session",
+                            {
+                                "cid": cid,
+                                "title": title,
+                                "sess_current": sess_current,
+                                "sess_other": sess_other,
+                                "url": url,
+                                "phase": "after_join_public",
+                            },
+                        )
+                        try:
+                            from telethon.tl.functions.channels import LeaveChannelRequest
+
+                            await client(LeaveChannelRequest(ent))
+                        except Exception:
+                            _log_exc("ensure_join: leave other session (public)")
+                        try:
+                            mem_db.delete_membership(db_chk, sess_current or "", cid)
+                        except Exception:
+                            _log_exc("ensure_join: delete_membership after leave (public)")
+                        return "already", title, "public", cid, invite_hash
+                except Exception:
+                    _log_exc("ensure_join: check other session after public join")
             # якщо це був інвайт-URL, збережемо мапу/статус навіть у public-гілці
             if invite_hash and cid:
                 try:

@@ -8,6 +8,7 @@ from sqlalchemy import func, select, update
 
 from app.admin_bot.db.session import SessionLocal
 from app.admin_bot.db import models as m
+from app.DAL import membership_operations as mem_db
 from app.DAL.watch_processing_operations import mark_matched as process_mark_matched
 from app.DAL.watch_events_operations import insert_watch_event
 from app.utils.time_utils import (
@@ -342,12 +343,18 @@ def accept_watch_candidate(
         if not watch_id or not message_id:
             continue
         coverage_at = _coverage_at_from_created(c.get("created_at"))
+        effective_session = matched_session
+        if effective_session is None and channel_id:
+            try:
+                effective_session = mem_db.get_any_session_for_channel(int(channel_id))
+            except Exception:
+                effective_session = None
         try:
             process_mark_matched(
                 int(watch_id),
                 int(message_id),
                 coverage_at,
-                matched_session=matched_session,
+                matched_session=effective_session,
             )
             insert_watch_event(
                 int(watch_id),
@@ -357,7 +364,7 @@ def accept_watch_candidate(
                         "watch_id": watch_id,
                         "channel_id": channel_id,
                         "message_id": message_id,
-                        "session": matched_session,
+                        "session": effective_session,
                         "via": "manual_candidate",
                         "candidate_id": cid,
                         "text_hash": text_hash,

@@ -328,8 +328,11 @@ async def _is_member(client, channel_id: int) -> "MemberStatus":
 
 async def run_requested_reconciler() -> None:
     log.debug("[reconciler.init] DB init start…")
-    rdb.init()
-    log.debug("[reconciler.init] DB init done")
+    if hasattr(rdb, "init"):
+        rdb.init()
+        log.debug("[reconciler.init] DB init done")
+    else:
+        log.warning("[reconciler.init] skipped: requested_operations.init not implemented")
 
     last_reset_day = None
 

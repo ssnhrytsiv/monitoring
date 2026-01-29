@@ -1,0 +1,250 @@
+cases:
+  - id: 1
+    input:
+      url_type: invite
+      identity_present: admin_id
+      pre_state: cache_none_links_none_membership_none
+      cid_owner_present: true
+    current_output:
+      final_status: owner_conflict_or_joined
+      side_effects:
+        write_cache: true
+        write_channels: "conflict:no ; ok:yes"
+        write_membership: "conflict:no ; ok:yes"
+        write_links: "conflict:no ; ok:yes"
+      cache_keys_written: url_norm_or_invite_hash
+      queue_transition: done
+    expected:
+      final_status: TBD
+      side_effects:
+        write_cache: TBD
+        write_channels: TBD
+        write_membership: TBD
+        write_links: TBD
+      cache_keys_written: TBD
+      queue_transition: TBD
+
+  - id: 2
+    input:
+      url_type: invite
+      identity_present: owner_display_only
+      pre_state: cache_none_links_none_membership_none
+      cid_owner_present: true
+    current_output:
+      final_status: owner_conflict_if_display_mismatch_else_joined
+      side_effects:
+        write_cache: true
+        write_channels: "conflict:no ; ok:yes"
+        write_membership: "conflict:no ; ok:yes"
+        write_links: "conflict:no ; ok:yes"
+      cache_keys_written: url_norm_or_invite_hash
+      queue_transition: done
+    expected:
+      final_status: TBD
+      side_effects:
+        write_cache: TBD
+        write_channels: TBD
+        write_membership: TBD
+        write_links: TBD
+      cache_keys_written: TBD
+      queue_transition: TBD
+
+  - id: 3
+    input:
+      url_type: invite
+      identity_present: none
+      pre_state: cache_none_links_none_membership_none
+      cid_owner_present: true
+    current_output:
+      final_status: joined_or_already
+      side_effects:
+        write_cache: true
+        write_channels: yes
+        write_membership: yes
+        write_links: yes
+      cache_keys_written: url_norm_or_invite_hash
+      queue_transition: done
+    expected:
+      final_status: TBD
+      side_effects:
+        write_cache: TBD
+        write_channels: TBD
+        write_membership: TBD
+        write_links: TBD
+      cache_keys_written: TBD
+      queue_transition: TBD
+
+  - id: 4
+    input:
+      url_type: invite
+      identity_present: admin_id
+      pre_state: cache_already_with_cid_owned_by_other
+      cid_owner_present: true
+    current_output:
+      final_status: already (cache short-circuit)
+      side_effects:
+        write_cache: false
+        write_channels: no
+        write_membership: no
+        write_links: no
+      cache_keys_written: none
+      queue_transition: done
+    expected:
+      final_status: TBD
+      side_effects:
+        write_cache: TBD
+        write_channels: TBD
+        write_membership: TBD
+        write_links: TBD
+      cache_keys_written: TBD
+      queue_transition: TBD
+
+  - id: 5
+    input:
+      url_type: invite
+      identity_present: owner_display_only
+      pre_state: cache_already_with_cid_owned_by_other
+      cid_owner_present: true
+    current_output:
+      final_status: owner_conflict (display override)
+      side_effects:
+        write_cache: true (owner_conflict)
+        write_channels: no
+        write_membership: no
+        write_links: no
+      cache_keys_written: url_norm_or_invite_hash
+      queue_transition: done
+    expected:
+      final_status: TBD
+      side_effects:
+        write_cache: TBD
+        write_channels: TBD
+        write_membership: TBD
+        write_links: TBD
+      cache_keys_written: TBD
+      queue_transition: TBD
+
+  - id: 6
+    input:
+      url_type: invite
+      identity_present: none
+      pre_state: cache_already_with_cid_owned_by_other
+      cid_owner_present: true
+    current_output:
+      final_status: already (conflict masked)
+      side_effects:
+        write_cache: false
+        write_channels: no
+        write_membership: no
+        write_links: no
+      cache_keys_written: none
+      queue_transition: done
+    expected:
+      final_status: TBD
+      side_effects:
+        write_cache: TBD
+        write_channels: TBD
+        write_membership: TBD
+        write_links: TBD
+      cache_keys_written: TBD
+      queue_transition: TBD
+
+  - id: 7
+    input:
+      url_type: invite_or_public
+      identity_present: any
+      pre_state: cache_owner_conflict
+      cid_owner_present: true
+    current_output:
+      final_status: owner_conflict
+      side_effects:
+        write_cache: true (sticky conflict)
+        write_channels: no
+        write_membership: no
+        write_links: no
+      cache_keys_written: url_norm_or_invite_hash
+      queue_transition: done
+    expected:
+      final_status: TBD
+      side_effects:
+        write_cache: TBD
+        write_channels: TBD
+        write_membership: TBD
+        write_links: TBD
+      cache_keys_written: TBD
+      queue_transition: TBD
+
+  - id: 14
+    input:
+      url_type: invite_or_public
+      identity_present: any
+      pre_state: links_with_cid_membership_final_global
+      cid_owner_present: true
+    current_output:
+      final_status: already (from membership)
+      side_effects:
+        write_cache: false
+        write_channels: no
+        write_membership: no
+        write_links: no
+      cache_keys_written: none
+      queue_transition: done
+    expected:
+      final_status: TBD
+      side_effects:
+        write_cache: TBD
+        write_channels: TBD
+        write_membership: TBD
+        write_links: TBD
+      cache_keys_written: TBD
+      queue_transition: TBD
+
+  - id: 15
+    input:
+      url_type: invite_or_public
+      identity_present: owner_display_only
+      pre_state: links_with_cid_owned_by_other
+      cid_owner_present: true
+    current_output:
+      final_status: owner_conflict (display mismatch)
+      side_effects:
+        write_cache: true (owner_conflict)
+        write_channels: no
+        write_membership: no
+        write_links: no
+      cache_keys_written: url_norm
+      queue_transition: done
+    expected:
+      final_status: TBD
+      side_effects:
+        write_cache: TBD
+        write_channels: TBD
+        write_membership: TBD
+        write_links: TBD
+      cache_keys_written: TBD
+      queue_transition: TBD
+
+  - id: 16
+    input:
+      url_type: invite_or_public
+      identity_present: none
+      pre_state: links_with_cid_owned_by_other
+      cid_owner_present: true
+    current_output:
+      final_status: already
+      side_effects:
+        write_cache: false
+        write_channels: no
+        write_membership: no
+        write_links: no
+      cache_keys_written: none
+      queue_transition: done
+    expected:
+      final_status: TBD
+      side_effects:
+        write_cache: TBD
+        write_channels: TBD
+        write_membership: TBD
+        write_links: TBD
+      cache_keys_written: TBD
+      queue_transition: TBD

@@ -508,7 +508,23 @@ async def process_batch(
                         other_name,
                     )
 
-            upsert_membership(db, channel_id=cid, account=(sess or ""), status=base_status)
+            # Не записуємо membership, якщо інша сесія вже закріплена за каналом
+            skip_membership = False
+            if base_status == "already" and cid and sess:
+                try:
+                    sess_known = membership_db.get_session_by_channel(cid)
+                    if sess_known and sess_known != sess:
+                        skip_membership = True
+                        log.debug(
+                            "queue_worker.skip_membership_other_session fast cid=%s sess=%s other=%s",
+                            cid,
+                            sess,
+                            sess_known,
+                        )
+                except Exception:
+                    pass
+            if not skip_membership:
+                upsert_membership(db, channel_id=cid, account=(sess or ""), status=base_status)
             link_queue.mark_done(item_id)
             try:
                 membership_db.url_put(url, status_for_report)
@@ -680,7 +696,23 @@ async def process_batch(
                         other_name,
                     )
 
-            upsert_membership(db, channel_id=cid, account=sess or "", status=base_status)
+            # Не записуємо membership, якщо інша сесія вже закріплена за каналом
+            skip_membership = False
+            if base_status == "already" and cid and sess:
+                try:
+                    sess_known = membership_db.get_session_by_channel(cid)
+                    if sess_known and sess_known != sess:
+                        skip_membership = True
+                        log.debug(
+                            "queue_worker.skip_membership_other_session slow cid=%s sess=%s other=%s",
+                            cid,
+                            sess,
+                            sess_known,
+                        )
+                except Exception:
+                    pass
+            if not skip_membership:
+                upsert_membership(db, channel_id=cid, account=sess or "", status=base_status)
             link_queue.mark_done(item_id)
             try:
                 membership_db.url_put(url, status_for_report)

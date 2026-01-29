@@ -8,6 +8,8 @@ from sqlalchemy import select, delete, text, or_
 from app.admin_bot.db import models as m
 from app.DAL import SessionLocal
 from app.DAL.membership_operations import MembershipDAO
+from app.DAL import channels_operations as cho
+from app.DAL import membership_operations as mem_db
 from app.services import link_queue
 from app.utils.link_parser import sanitize_link
 import re
@@ -43,6 +45,41 @@ def ensure_admin_schema(db: Session) -> None:
     except Exception:
         db.rollback()
         log.exception("ensure_admin_schema failed")
+
+
+def find_channel_id_by_url(db: Session, url: str) -> Optional[int]:
+    """
+    Резолвить channel_id за URL через links/Channel/InviteMap.
+    Повертає None, якщо нічого не знайшло.
+    """
+    if not url:
+        return None
+    try:
+        # точний match у links
+        row = cho.find_channel_by_link(db, url)
+        if row:
+            return int(row[0])
+    except Exception:
+        pass
+    try:
+        # спроба через sanitize/normalized варіанти
+        clean = sanitize_link(url) or url
+        if clean != url:
+            row = cho.find_channel_by_link(db, clean)
+            if row:
+                return int(row[0])
+    except Exception:
+        pass
+    try:
+        # через invite_map, якщо URL містить інвайт
+        inv = mem_db._extract_invite_hash(url)  # noqa: SLF001 використовується локально
+        if inv:
+            cid, _ = MembershipDAO(db).map_invite_get(inv)
+            if cid:
+                return int(cid)
+    except Exception:
+        pass
+    return None
 
 
 def _expand_url_variants(url: str) -> list[str]:

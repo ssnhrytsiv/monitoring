@@ -9,6 +9,8 @@ class AddAdminFlow(StatesGroup):
 class NetworkFlow(StatesGroup):
     waiting_name = State()
     waiting_links = State()
+    waiting_sort_urls = State()
+    waiting_status_urls = State()
 
 
 class RefreshChannelsFlow(StatesGroup):

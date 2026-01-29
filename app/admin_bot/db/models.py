@@ -220,6 +220,7 @@ class NetworkChannel(Base):
     note = Column(Text)
     created_at = Column(Integer)
     updated_at = Column(Integer)
+    sort_order = Column(Integer)
 
 
 class ChannelLink(Base):

@@ -35,6 +35,7 @@ def setup_logging():
 async def _main():
     setup_logging()
     log = get_logger("main")
+    SKIP_MAIN_CLIENT = os.getenv("SKIP_MAIN_CLIENT") == "1"
 
     reconciler_task = None
     exporter_task = None
@@ -65,17 +66,6 @@ async def _main():
         raise SystemExit(1)
     finally:
         log.debug("DB init took %.3fs", time.perf_counter() - t0)
-
-    log.info("Запускаю головний клієнт…")
-    t0 = time.perf_counter()
-    try:
-        await client.start()
-        log.debug("Main client started")
-    except Exception:
-        log.exception("Failed to start main client")
-        raise SystemExit(1)
-    finally:
-        log.debug("Main client start took %.3fs", time.perf_counter() - t0)
 
     log.info("Запускаю пул акаунтів…")
     t0 = time.perf_counter()
@@ -182,46 +172,34 @@ async def _main():
     except Exception:
         log.exception("Failed to start Admin bot task")
 
-    log.info("✅ Бот готовий. Чекаю подій…")
+    log.info("✅ Бот готовий. Головний клієнт вимкнений — чекаємо на задачі ботів.")
 
     try:
-        await client.run_until_disconnected()
+        await asyncio.gather(
+            *[t for t in (bot_task, forward_bot_task, notifier_task, admin_bot_task, exporter_task, reconciler_task) if t],
+            return_exceptions=False,
+        )
     except asyncio.CancelledError:
-        log.warning("Main run loop cancelled")
-        raise
+        log.warning("Main loop cancelled")
     except Exception:
-        log.exception("Main run loop error")
-        raise
+        log.exception("Main loop error")
     finally:
-        if bot_task:
-            log.info("Зупиняю Bot UI…")
-            bot_task.cancel()
+        for t, name in (
+            (bot_task, "Bot UI"),
+            (forward_bot_task, "Forward bot"),
+            (notifier_task, "Notifier bot"),
+            (admin_bot_task, "Admin bot"),
+        ):
+            if not t:
+                continue
+            log.info("Зупиняю %s…", name)
+            t.cancel()
             try:
-                await bot_task
+                await t
             except asyncio.CancelledError:
-                log.debug("Bot UI task cancelled")
+                log.debug("%s task cancelled", name)
             except Exception:
-                log.exception("Bot UI task finished with error")
-
-        if forward_bot_task:
-            log.info("Зупиняю Forward bot…")
-            forward_bot_task.cancel()
-            try:
-                await forward_bot_task
-            except asyncio.CancelledError:
-                log.debug("Forward bot task cancelled")
-            except Exception:
-                log.exception("Forward bot task finished with error")
-
-        if admin_bot_task:
-            log.info("Зупиняю admin bot…")
-            admin_bot_task.cancel()
-            try:
-                await admin_bot_task
-            except asyncio.CancelledError:
-                log.debug("Admin bot task cancelled")
-            except Exception:
-                log.exception("Admin bot task finished with error")
+                log.exception("%s task finished with error", name)
 
         if exporter_task:
             log.info("Зупиняю експортер каналів…")

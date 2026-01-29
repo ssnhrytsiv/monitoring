@@ -2,25 +2,31 @@ from __future__ import annotations
 
 import math
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from types import SimpleNamespace
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import StateFilter
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Message
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
-from sqlalchemy import select, func, exists
+from sqlalchemy import select, func, exists, text
 
 from app.admin_bot.db import models as m
 from app.admin_bot.db.session import SessionLocal
 from app.admin_bot.services import admins as svc_admins
 from app.admin_bot.services import networks as svc_networks
 from app.admin_bot.bot.keyboards import page_kb
-from app.admin_bot.bot.states import NetworkFlow, AdminParamsFlow, AdminResultsFlow
+from app.admin_bot.bot.states import NetworkFlow, AdminParamsFlow, AdminResultsFlow, AddAdminFlow
+from app.admin_bot.bot.handlers.admins import _is_allowed, _clean_urls
 from app.admin_bot.utils.messages import extract_links_from_message
 from app.admin_bot.services.networks import channel_hyperlink
 from app.services import account_pool
 from app.DAL import bot_links_operations as blo
 from app.DAL import watch_groups_operations as watch_groups_db
+from app.DAL.membership_operations import MembershipDAO, _extract_invite_hash
+from app.DAL import channels_operations as cho
+from app.admin_bot.services.subscription.subscription_status import render_html_with_statuses
+from app.utils.link_parser import sanitize_link
 from datetime import datetime, timedelta
 from telethon.tl.functions.contacts import BlockRequest
 from telethon.tl.functions.messages import DeleteHistoryRequest
@@ -54,6 +60,13 @@ def _db():
         db.close()
 
 
+def _resolve_channel_id(db, url: str) -> Optional[int]:
+    try:
+        return svc_admins.find_channel_id_by_url(db, url)
+    except Exception:
+        return None
+
+
 def _load_admins():
     db = next(_db())
     admins = svc_admins.list_admins(db)
@@ -66,6 +79,13 @@ def _list_bot_links(owner_display=None, owner_username=None):
         return blo.list_bot_links(db, owner_display=owner_display, owner_username=owner_username)
     finally:
         db.close()
+
+
+def _resolve_channel_id(db, url: str) -> Optional[int]:
+    try:
+        return svc_admins.find_channel_id_by_url(db, url)
+    except Exception:
+        return None
 
 
 def _delete_bot_link(username: str) -> bool:
@@ -269,7 +289,11 @@ def _net_channel_pages(db, net_id: int, net_name: str, per_page: int = 25) -> tu
         select(m.Channel)
         .join(m.NetworkChannel, m.NetworkChannel.channel_id == m.Channel.channel_id)
         .where(m.NetworkChannel.network_id == net_id)
-        .order_by(m.Channel.title)
+        .order_by(
+            m.NetworkChannel.sort_order.is_(None),
+            m.NetworkChannel.sort_order,
+            m.NetworkChannel.id,
+        )
     ).scalars().all()
     total = len(rows)
     if not rows:
@@ -286,6 +310,33 @@ def _net_channel_pages(db, net_id: int, net_name: str, per_page: int = 25) -> tu
     return pages, total
 
 
+@router.callback_query(F.data.startswith("admin_net_sort:"))
+async def cb_admin_net_sort(cb: CallbackQuery, state: FSMContext):
+    if not _is_allowed(cb.from_user.id):
+        return
+    try:
+        net_id = int(cb.data.split(":", 1)[1])
+    except Exception:
+        await cb.answer()
+        return
+    await state.set_state(NetworkFlow.waiting_sort_urls)
+    await state.update_data(net_id=net_id)
+    await cb.message.answer(
+        "Надішли список URL цієї сітки у бажаному порядку (по одному в рядок або всі разом).\n"
+        "Інший текст буде проігноровано.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Скасувати", callback_data="admin_sort_cancel")]]
+        ),
+    )
+    await cb.answer()
+
+
+@router.callback_query(StateFilter(NetworkFlow.waiting_sort_urls), F.data == "admin_sort_cancel")
+async def cb_admin_sort_cancel(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.answer("Скасовано", show_alert=False)
+
+
 def _render_net_page(net: m.Network, pages: list[str], page_idx: int):
     page_idx = max(0, min(page_idx, len(pages) - 1))
     text = pages[page_idx]
@@ -299,8 +350,9 @@ def _render_net_page(net: m.Network, pages: list[str], page_idx: int):
             InlineKeyboardButton(text="➡️", callback_data=next_cb),
         ])
     buttons = []
+    buttons.append([InlineKeyboardButton(text="🔄 Оновити сітку", callback_data=f"admin_net_refresh:{net.id}")])
+    buttons.append([InlineKeyboardButton(text="📋 Впорядкувати", callback_data=f"admin_net_sort:{net.id}")])
     if net.name != "Основные каналы":
-        buttons.append([InlineKeyboardButton(text="🔄 Оновити сітку", callback_data=f"admin_net_refresh:{net.id}")])
         buttons.append([InlineKeyboardButton(text="🗑 Видалити сітку", callback_data=f"admin_net_delete:{net.id}")])
     if nav:
         buttons += nav
@@ -877,6 +929,7 @@ async def cb_admin_net_edit(cb: CallbackQuery):
         await cb.answer()
         return
     rows = _build_networks_keyboard(db, nets, admin_id)
+    rows.append([InlineKeyboardButton(text="Получити статуси", callback_data=f"admin_statuses:{admin_id}")])
     rows.append([InlineKeyboardButton(text="Додати сітку", callback_data=f"admin_net_add:{admin_id}")])
     rows.append([
         InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin_id}"),
@@ -907,6 +960,110 @@ async def cb_admin_net_page(cb: CallbackQuery):
     svc_networks.move_orphans_to_primary(db, admin_id)
     # пагінації для списку сіток більше немає – повертаємо до admin_net_edit
     await cb_admin_net_edit(cb)
+
+
+@router.callback_query(F.data.startswith("admin_statuses:"))
+async def cb_admin_statuses(cb: CallbackQuery, state: FSMContext):
+    try:
+        admin_id = int(cb.data.split(":", 1)[1])
+    except Exception:
+        await cb.answer()
+        return
+    db = next(_db())
+    admin = svc_admins.get_admin_by_id(db, admin_id)
+    if not admin:
+        await cb.answer("Адміна не знайдено", show_alert=True)
+        return
+    await cb.message.edit_text("Надішли список URL (t.me/...), кожен з нового рядка. Я поверну статуси в тій самій послідовності.")
+    await state.set_state(NetworkFlow.waiting_status_urls)
+    await state.update_data(admin_id=admin_id)
+    await cb.answer()
+
+
+@router.message(StateFilter(NetworkFlow.waiting_status_urls))
+async def on_status_urls(m: Message, state: FSMContext):
+    # окремий флоу: не тригеримо інші FSM
+    data = await state.get_data()
+    urls = _clean_urls(extract_links_from_message(m))
+    if not urls:
+        urls = _clean_urls([u.strip() for u in (m.text or "").splitlines() if u.strip()])
+    await state.clear()
+    if not urls:
+        await m.answer("Не знайшов посилань. Надішли t.me/... рядками.")
+        return
+    db = next(_db())
+    dao = MembershipDAO(db)
+    result_items = []
+    for url in urls:
+        title = None
+        channel_id = None
+        invite_hash = _extract_invite_hash(url)
+        status = None
+        if invite_hash:
+            status = dao.invite_status_get(url)
+            if status is None:
+                status = dao.url_get(url)
+            channel_id, title = dao.map_invite_get(url)
+            if status == "requested":
+                sess_lbl = None
+                try:
+                    sess_lbl = dao.invite_check_last_session(url)
+                except Exception:
+                    sess_lbl = None
+                if sess_lbl:
+                    status = f"{status}[{sess_lbl}]"
+        else:
+            status = dao.url_get(url)
+            # спробуємо знайти публічний канал за посиланням
+            try:
+                norm = sanitize_link(url) or url
+                channel_row = cho.find_channel_by_link(db, norm)
+                if channel_row:
+                    channel_id, chan_title = channel_row
+                    title = chan_title or title
+            except Exception:
+                pass
+        result_items.append({
+            "url": url,
+            "channel_id": channel_id,
+            "title": title,
+            "status": status or "",
+        })
+
+    report_html = render_html_with_statuses(result_items, original_urls=urls)
+    total = len(result_items)
+    positive = 0
+    # Рахуємо позитивні тільки якщо статус не дубль і містить joined/already
+    norm_counts: Dict[str, int] = {}
+    cid_counts: Dict[Optional[int], int] = {}
+    for it in result_items:
+        n = (it.get("url") or "").strip()
+        if n:
+            norm_counts[n] = norm_counts.get(n, 0) + 1
+        cid = it.get("channel_id")
+        cid_counts[cid] = cid_counts.get(cid, 0) + 1
+    seen: Dict[str, int] = {}
+    seen_cid: Dict[Optional[int], int] = {}
+    for it in result_items:
+        url_val = (it.get("url") or "").strip()
+        seen[url_val] = seen.get(url_val, 0) + 1
+        cid = it.get("channel_id")
+        seen_cid[cid] = seen_cid.get(cid, 0) + 1
+        is_dup = False
+        if norm_counts.get(url_val, 0) > 1 and seen[url_val] >= 2:
+            is_dup = True
+        if cid is not None and cid_counts.get(cid, 0) > 1 and seen_cid[cid] >= 2:
+            is_dup = True
+        if is_dup:
+            continue
+        status_raw = it.get("status") or ""
+        if "joined" in status_raw or "already" in status_raw:
+            positive += 1
+    summary = f"\n\n{positive}/{total}" if total else ""
+    back_kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ До сіток", callback_data=f"admin_net_edit:{data.get('admin_id') or ''}")]]
+    )
+    await m.answer((report_html or "Статусів нема") + summary, parse_mode="HTML", disable_web_page_preview=True, reply_markup=back_kb)
 
 
 @router.callback_query(F.data.startswith("admin_back:"))
@@ -1253,3 +1410,59 @@ async def on_network_links(m, state: FSMContext):
         ),
     )
     await state.clear()
+
+
+@router.message(StateFilter(NetworkFlow.waiting_sort_urls))
+async def on_sort_urls(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    net_id = data.get("net_id")
+    urls = extract_links_from_message(msg)
+    if not urls:
+        await msg.answer("Не знайшов жодного URL. Надішли лише лінки в потрібному порядку.")
+        return
+    seen = set()
+    ordered_urls = []
+    for u in urls:
+        if u in seen:
+            continue
+        seen.add(u)
+        ordered_urls.append(u)
+
+    db = next(_db())
+    failed = []
+    order_updates = []
+    order_idx = 1
+    for u in ordered_urls:
+        cid = _resolve_channel_id(db, u)
+        if not cid:
+            failed.append(u)
+            continue
+        order_updates.append((cid, order_idx))
+        order_idx += 1
+
+    try:
+        db.execute(text("UPDATE network_channels SET sort_order = NULL WHERE network_id = :net_id"), {"net_id": net_id})
+        for cid, idx in order_updates:
+            db.execute(
+                text(
+                    "UPDATE network_channels SET sort_order = :idx "
+                    "WHERE network_id = :net_id AND channel_id = :cid"
+                ),
+                {"idx": idx, "net_id": net_id, "cid": cid},
+            )
+        db.commit()
+        msg_text = ["Порядок оновлено."]
+        if failed:
+            msg_text.append("Не знайшов канали для URL:")
+            msg_text.extend(failed)
+        await msg.answer(
+            "\n".join(msg_text),
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="⬅️ До сіток", callback_data="show_admins")]]
+            ),
+        )
+        await state.clear()
+    except Exception as e:
+        db.rollback()
+        log.exception("Failed to update sort order net_id=%s", net_id)
+        await msg.answer(f"Помилка при збереженні порядку: {e}")
