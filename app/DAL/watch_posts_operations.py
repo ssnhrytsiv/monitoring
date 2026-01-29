@@ -558,6 +558,7 @@ def create_watch(
     subs_at_post: Optional[int] = None,
     cpm_at_post: Optional[float] = None,
     price_at_post: Optional[float] = None,
+    title: Optional[str] = None,
 ) -> int:
     db = WatchSessionLocal()
     try:
@@ -586,6 +587,7 @@ def create_watch(
             subs_at_post=subs_at_post,
             cpm_at_post=cpm_at_post,
             price_at_post=price_at_post,
+            title=title,
         )
         db.add(wp)
         db.commit()
@@ -729,6 +731,7 @@ def get_watch_info(watch_id: int) -> Dict[str, Any]:
                 WatchPost.expected_text_hash,
                 WatchPost.time_window_start,
                 WatchPost.admin_id,
+                WatchPost.title,
             ).where(WatchPost.id == int(watch_id)).limit(1)
         ).first()
     finally:
@@ -753,6 +756,7 @@ def get_watch_info(watch_id: int) -> Dict[str, Any]:
         "expected_text_hash": row.expected_text_hash,
         "time_window_start": row.time_window_start,
         "admin_id": row.admin_id,
+        "title": row.title,
     }
 
 
@@ -773,6 +777,7 @@ def fetch_watches_by_group(group_id: int) -> List[Dict[str, Any]]:
                 WatchPost.updated_at,
                 WatchPost.deleted_at,
                 WatchPost.final_views,
+                WatchPost.title,
             )
             .where(WatchPost.group_id == int(group_id))
             .order_by(WatchPost.id.asc())
@@ -792,6 +797,7 @@ def fetch_watches_by_group(group_id: int) -> List[Dict[str, Any]]:
                 "updated_at": str(r.updated_at or ""),
                 "deleted_at": str(r.deleted_at or ""),
                 "final_views": r.final_views,
+                "title": r.title,
             }
         )
     return result

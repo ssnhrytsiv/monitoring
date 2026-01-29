@@ -1029,6 +1029,14 @@ async def on_status_urls(m: Message, state: FSMContext):
             "title": title,
             "status": status or "",
         })
+        # fallback: якщо публічний канал відомий у channels, але title не підтягнули з links/invite_map
+        if channel_id and not title:
+            try:
+                fetched_title, _owner = cho.get_channel_title_and_owner(channel_id)
+                if fetched_title:
+                    result_items[-1]["title"] = fetched_title
+            except Exception:
+                pass
 
     report_html = render_html_with_statuses(result_items, original_urls=urls)
     total = len(result_items)

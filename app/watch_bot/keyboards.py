@@ -28,6 +28,7 @@ def yes_no_kb(yes_cb: str, no_cb: str):
 
 def templates_kb(templates):
     rows = []
+    rows.append([InlineKeyboardButton(text="➕ Додати шаблон", callback_data="tpl:add")])
     for t in templates:
         tid = t["id"]
         title = t.get("title") or f"Template #{tid}"

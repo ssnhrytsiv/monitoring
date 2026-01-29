@@ -5,13 +5,14 @@ import logging
 import json
 import math
 import html
+from difflib import SequenceMatcher
 
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
 
-from app.watch_bot.states import CreateWatch
+from app.watch_bot.states import CreateWatch, TemplateCreate
 from app.DAL import SessionLocal
 from app.DAL import sheet_projects_operations as spo
 from app.DAL import post_templates_operations as post_watch_db
@@ -19,7 +20,7 @@ from app.DAL import watch_posts_operations as watch_posts_db
 from app.DAL import watch_events_operations as watch_events_db
 from app.sheet_bot.services import gsheets_writer as gsw
 from app.sheet_bot.services import gsheets_buffer as gsb
-from app.watch_bot.keyboards import main_menu_kb, back_to_menu_kb, yes_no_kb
+from app.watch_bot.keyboards import main_menu_kb, back_to_menu_kb, yes_no_kb, templates_kb
 from app.services.time_utils import msk_now
 from app.watch_bot.services.channels_repo import (
     resolve_cid_by_target,
@@ -33,6 +34,7 @@ from app.admin_bot.services import networks as svc_networks
 from app.admin_bot.services.networks import channel_hyperlink
 from app.admin_bot.db.session import SessionLocal as AdminSession
 from app.admin_bot.db import models as adm_models
+from app.DAL import channels_operations as cho
 
 router = Router()
 log = logging.getLogger("bot_create_watch")
@@ -385,7 +387,7 @@ def _extract_targets_from_message(msg: Message) -> List[str]:
     return _extract_targets(plain_text)
 
 
-async def _create_template_from_source(src: Message) -> Optional[int]:
+async def _create_template_from_source(src: Message) -> Optional[tuple[int, str]]:
     html_text = (
         getattr(src, "html_text", None)
         or getattr(src, "text_html", None)
@@ -424,28 +426,28 @@ async def _create_template_from_source(src: Message) -> Optional[int]:
         tid = _parse_template_id(res)
         if tid:
             log.info("create_template: created template id=%s title=%s", tid, title)
-            return tid
+            return tid, title
     except TypeError:
         try:
             res = fn(text=text_for_template, title=title, links=links_json)
             tid = _parse_template_id(res)
             if tid:
                 log.info("create_template: created template id=%s title=%s (fallback no mode)", tid, title)
-                return tid
+                return tid, title
         except TypeError:
             try:
                 res = fn(text=text_for_template, title=title)
                 tid = _parse_template_id(res)
                 if tid:
                     log.info("create_template: created template id=%s title=%s (fallback no links)", tid, title)
-                    return tid
+                    return tid, title
             except TypeError:
                 try:
                     res = fn(text_for_template)
                     tid = _parse_template_id(res)
                     if tid:
                         log.info("create_template: created template id=%s (legacy signature)", tid)
-                        return tid
+                        return tid, title
                 except Exception:
                     log.exception("create_template: add_template failed (legacy)")
                     return None
@@ -693,6 +695,48 @@ async def pick_admin_for_watch(cb: CallbackQuery, state: FSMContext):
     )
     await cb.answer()
 
+
+@router.callback_query(F.data == "menu:list_templates")
+async def list_templates(cb: CallbackQuery, state: FSMContext):
+    templates = post_watch_db.list_templates_full(limit=50)
+    items = [{"id": t[0], "title": t[5]} for t in templates]
+    kb = templates_kb(items)
+    await state.clear()
+    await cb.message.edit_text("Шаблони постів:", reply_markup=kb, disable_web_page_preview=True)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "tpl:add")
+async def tpl_add_start(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(TemplateCreate.title)
+    await cb.message.edit_text("Надішли назву для шаблону.", reply_markup=back_to_menu_kb())
+    await cb.answer()
+
+
+@router.message(TemplateCreate.title)
+async def tpl_add_title(m: Message, state: FSMContext):
+    title = (m.text or "").strip()
+    if not title:
+        await m.answer("Порожня назва. Надішли назву ще раз.", reply_markup=back_to_menu_kb())
+        return
+    await state.update_data(tpl_title=title)
+    await state.set_state(TemplateCreate.body)
+    await m.answer("Тепер надішли текст/пост для шаблону (буде збережений як є).", reply_markup=back_to_menu_kb())
+
+
+@router.message(TemplateCreate.body)
+async def tpl_add_body(m: Message, state: FSMContext):
+    body = m.html_text or m.text or ""
+    body = body.strip()
+    if not body:
+        await m.answer("Порожній текст. Надішли пост ще раз.", reply_markup=back_to_menu_kb())
+        return
+    data = await state.get_data()
+    title = data.get("tpl_title") or "Без назви"
+    tpl_id = post_watch_db.add_template(text=body, title=title, mode="exact")
+    await state.clear()
+    await m.answer(f"Шаблон збережено (id={tpl_id}).", reply_markup=back_to_menu_kb())
+
 @router.callback_query(CreateWatch.admin_pick, F.data.startswith("watchnet:page:"))
 async def paginate_admins(cb: CallbackQuery):
     try:
@@ -759,7 +803,9 @@ async def step_template_pick_manual(m: Message, state: FSMContext):
     if (not has_reply) and (not is_forward) and direct_text and re.fullmatch(r"\d{1,9}", direct_text):
         direct_id = _try_int(direct_text)
         if direct_id:
-            await state.update_data(template_id=direct_id)
+            tpl_meta = post_watch_db.get_template_by_id(int(direct_id))
+            tpl_title = tpl_meta[5] if tpl_meta else None
+            await state.update_data(template_id=direct_id, template_title=tpl_title)
             await state.set_state(CreateWatch.time_window)
             await m.answer(
                 "Вкажи час закінчення вікна СЬОГОДНІ у форматі HH:MM, наприклад 23:30.",
@@ -768,13 +814,15 @@ async def step_template_pick_manual(m: Message, state: FSMContext):
             return
 
     src = m.reply_to_message if has_reply else m
-    tid = await _create_template_from_source(src)
+    tpl_created = await _create_template_from_source(src)
+    tid = tpl_created[0] if tpl_created else None
+    tpl_title = tpl_created[1] if tpl_created else None
 
     if not tid:
         await m.answer("Не зміг створити шаблон. Надішли числовий template_id або інший пост.")
         return
 
-    await state.update_data(template_id=tid)
+    await state.update_data(template_id=tid, template_title=tpl_title)
     await state.set_state(CreateWatch.time_window)
     await m.answer(
         f"Шаблон додано (id={tid}). Вкажи час закінчення вікна СЬОГОДНІ у форматі HH:MM, наприклад 23:30.",
@@ -820,6 +868,7 @@ async def step_time_window(m: Message, state: FSMContext):
     data = await state.get_data()
     targets: List[str] = data.get("targets") or []
     tid = data.get("template_id")
+    tpl_title = data.get("template_title")
 
     await state.update_data(time_window_start=tw_start, time_window_end=tw_end, mins=mins)
 
@@ -829,6 +878,45 @@ async def step_time_window(m: Message, state: FSMContext):
         if cid_val:
             cids.append(cid_val)
     links_map = get_links_by_channel_ids(cids)
+    # доповнюємо з channel_links/username/invite_map, якщо нема в links_map
+    if cids:
+        try:
+            extra_links = cho.get_links_by_channel_ids(cids)
+            for cid_val, link_val in extra_links.items():
+                links_map.setdefault(cid_val, link_val)
+            missing = [cid for cid in cids if cid not in links_map]
+            if missing:
+                db_tmp = AdminSession()
+                try:
+                    # ChannelLink fallback
+                    rows = (
+                        db_tmp.query(adm_models.ChannelLink.channel_id, adm_models.ChannelLink.link_url_norm)
+                        .filter(adm_models.ChannelLink.channel_id.in_(missing))
+                        .all()
+                    )
+                    for cid_val, link_val in rows:
+                        if link_val:
+                            links_map.setdefault(int(cid_val), str(link_val))
+                    missing2 = [cid for cid in missing if cid not in links_map]
+                    if missing2:
+                        # останній raw_url із links як крайнє джерело
+                        rows_links = (
+                            db_tmp.query(adm_models.Link.channel_id, adm_models.Link.raw_url)
+                            .filter(adm_models.Link.channel_id.in_(missing2), adm_models.Link.raw_url != None)  # noqa: E711
+                            .order_by(adm_models.Link.id.desc())
+                            .all()
+                        )
+                        for cid_val, raw_url in rows_links:
+                            if raw_url:
+                                try:
+                                    href = sanitize_link(raw_url) or raw_url
+                                except Exception:
+                                    href = raw_url
+                                links_map.setdefault(int(cid_val), str(href))
+                finally:
+                    db_tmp.close()
+        except Exception:
+            log.warning("watch_net: failed to enrich links_map from channel_links", exc_info=True)
     titles_map = get_titles_by_channel_ids(cids)
     targets_txt = "\n".join(
         f"• <a href=\"{links_map.get(resolve_cid_by_target(t), t)}\">"
@@ -840,6 +928,7 @@ async def step_time_window(m: Message, state: FSMContext):
         f"Підтверди створення watch:\n\n"
         f"targets:\n{targets_txt}\n\n"
         f"template_id: {tid or '—'}\n"
+        f"Назва поста: {tpl_title or '—'}\n"
         f"вікно: {mins} хв\n"
         f"до: {tw_end}\n"
     )
@@ -965,6 +1054,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
     if (not control_id) or (control_id and not sent_ok):
         tpl_html = None
         tpl_links_json = None
+        tpl_plain = None
         if tid:
             tpl_meta = _load_template(int(tid))
             if not tpl_meta:
@@ -1011,6 +1101,29 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                 failed.append(t)
                 failed_reasons.append((t, "Порожній HTML шаблону"))
                 continue
+            watch_title: Optional[str] = tpl_meta.get("title") if tid else None  # type: ignore
+            if tpl_plain:
+                try:
+                    templates = post_watch_db.list_templates_full(limit=200)
+                    best_ratio = 0.0
+                    best_title = None
+                    for tpl_id, tpl_text, tpl_mode, tpl_threshold, tpl_created_at, tpl_title, tpl_links in templates:
+                        if not tpl_title:
+                            continue
+                        ratio = SequenceMatcher(None, tpl_plain, tpl_text or "").ratio()
+                        if ratio >= 0.8 and ratio > best_ratio:
+                            best_ratio = ratio
+                            best_title = tpl_title
+                    if best_title:
+                        watch_title = best_title
+                except Exception:
+                    log.warning("watch_net: similarity match for title failed", exc_info=True)
+            if not watch_title:
+                try:
+                    first_line = (tpl_plain or tpl_html or "").splitlines()[0].strip()
+                except Exception:
+                    first_line = ""
+                watch_title = first_line or titles_map.get(int(cid)) or None
             try:
                 wid = watch_posts_db.create_watch(
                     channel_id=int(cid),
@@ -1027,6 +1140,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                     admin_id=admin_id,
                     network_id=net_id,
                     group_id=group_id,
+                    title=watch_title,
                 )
                 log.info(
                     "watch_net: created watch wid=%s cid=%s admin=%s net=%s project=%s links=%s",

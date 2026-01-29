@@ -17,3 +17,8 @@ class CreateWatch(StatesGroup):
 class EditWatch(StatesGroup):
     time_window = State()
     source_input = State()
+
+
+class TemplateCreate(StatesGroup):
+    title = State()
+    body = State()

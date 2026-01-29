@@ -371,6 +371,7 @@ class WatchPost(Base):
     subs_at_post = Column(Integer, nullable=True)
     cpm_at_post = Column(Float, nullable=True)
     price_at_post = Column(Float, nullable=True)
+    title = Column(Text, nullable=True)
 
     __table_args__ = (
         Index(

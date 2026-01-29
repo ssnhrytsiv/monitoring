@@ -175,6 +175,32 @@ def get_links_by_channel_ids(ids: List[int]) -> Dict[int, str]:
         db.close()
 
 
+def get_raw_links_by_channel_ids(ids: List[int]) -> Dict[int, str]:
+    clean_ids = [int(x) for x in ids or [] if x]
+    if not clean_ids:
+        return {}
+    db = SessionLocal()
+    try:
+        rows = (
+            db.execute(
+                select(m.Link.channel_id, m.Link.raw_url)
+                .where(m.Link.channel_id.in_(clean_ids), m.Link.raw_url.isnot(None))
+                .order_by(m.Link.id.desc())
+            )
+            .all()
+        )
+        result: Dict[int, str] = {}
+        for cid, raw_url in rows:
+            if cid is None or not raw_url:
+                continue
+            cid_i = int(cid)
+            if cid_i not in result:
+                result[cid_i] = str(raw_url)
+        return result
+    finally:
+        db.close()
+
+
 def get_owners_by_channel_ids(ids: List[int]) -> Dict[int, str]:
     clean_ids = [int(x) for x in ids or [] if x]
     if not clean_ids:

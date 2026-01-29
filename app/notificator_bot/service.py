@@ -135,6 +135,14 @@ def _channel_meta(channel_id: int, fallback_url: str | None) -> Tuple[str, str]:
             else:
                 log.debug("notificator: bot_link not found for username=%s (fallback_url=%s)", bot_username, fallback_url)
     if not link:
+        try:
+            raw_links = cho.get_raw_links_by_channel_ids([channel_id]) or {}
+            raw_link = raw_links.get(channel_id)
+            if raw_link:
+                link = raw_link
+        except Exception:
+            pass
+    if not link:
         link = _fetch_channel_link(channel_id) or link
 
     log.debug("notificator: channel_meta resolved cid=%s -> title=%s link=%s", channel_id, title, link)
@@ -331,6 +339,7 @@ def collect_grouped_events(
                 "ts": ts,
                 "watch_id": watch_id,
                 "views": views_val,
+                "post_title": watch_info.get("title"),
             },
         )
         processed_ids.append(ev_id)
@@ -383,6 +392,7 @@ def collect_grouped_events(
                         "group_id": gid,
                         "status": status,
                         "final_views": row.get("final_views"),
+                        "title": row.get("title"),
                     },
                     title,
                     link,
@@ -398,6 +408,7 @@ def collect_grouped_events(
                         "ts": _parse_ts(row.get("updated_at") or row.get("created_at")),
                         "watch_id": watch_id,
                         "views": views_val,
+                        "post_title": row.get("title"),
                     },
                 )
 
@@ -498,15 +509,23 @@ async def send_notifications(bot: Bot, debounce_sec: int = 60) -> None:
     # Надсилаємо по кожній групі (project, admin, group_id)
     for (project, admin, group_id), bucket in grouped.items():
         entries = list(bucket.values())
-        # Сортуємо: спочатку pending/matched, потім expired
+        def _status_order(ev: str) -> int:
+            if ev in {"candidate", "pending_candidate", "edited_candidate"}:
+                return 1
+            if ev in {"expired", "cancelled", "foreign"}:
+                return 2
+            return 0  # успішні та решта
+
         entries.sort(
             key=lambda x: (
+                _status_order(x.get("ev_type")),
                 _priority_of(x.get("ev_type")),
                 x.get("ts", 0.0),
                 x.get("watch_id", 0),
             )
         )
         lines = [e["line"] for e in entries]
+        post_title = next((e.get("post_title") for e in entries if e.get("post_title")), None)
         views_values: List[int] = []
         for e in entries:
             v = e.get("views")
@@ -517,7 +536,7 @@ async def send_notifications(bot: Bot, debounce_sec: int = 60) -> None:
             except Exception:
                 continue
         total_views = sum(views_values) if views_values else None
-        text = formatter.format_admin_message(project, admin, lines, total_views)
+        text = formatter.format_admin_message(project, admin, lines, total_views, post_title)
 
         for chat_id in NOTIFIER_TARGET_IDS:
             # Якщо є попереднє повідомлення по цьому group_id – видалимо
