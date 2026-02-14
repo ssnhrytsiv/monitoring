@@ -44,7 +44,7 @@ def list_active_watches(
 ) -> List[Tuple[int, Optional[int], str, Optional[str], Optional[int], Optional[int], Optional[int]]]:
     """
     Повертає активні вотчі користувача (або всі, якщо created_by NULL) з фільтром статусів.
-    Результат відсортований за id DESC і обмежений 200 рядками.
+    Результат відсортований за id DESC.
     """
     if not statuses:
         statuses = ["pending", "matched"]
@@ -55,27 +55,26 @@ def list_active_watches(
 
     db = WatchSessionLocal()
     try:
-            rows = db.execute(
-                select(
-                    WatchPost.id,
-                    WatchPost.template_id,
-                    WatchPost.status,
-                    WatchPost.time_window_end,
-                    WatchPost.created_by,
-                    WatchPost.channel_id,
-                    WatchPost.group_id,
-                )
-                .where(
-                    or_(WatchPost.created_by == user_id, WatchPost.created_by.is_(None)),
-                    WatchPost.status.in_(filtered_statuses),
-                )
+        rows = db.execute(
+            select(
+                WatchPost.id,
+                WatchPost.template_id,
+                WatchPost.status,
+                WatchPost.time_window_end,
+                WatchPost.created_by,
+                WatchPost.channel_id,
+                WatchPost.group_id,
+            )
+            .where(
+                or_(WatchPost.created_by == user_id, WatchPost.created_by.is_(None)),
+                WatchPost.status.in_(filtered_statuses),
+            )
             .order_by(WatchPost.id.desc())
-            .limit(200)
         ).all()
     finally:
         db.close()
 
-    result: List[Tuple[int, Optional[int], str, Optional[str], Optional[int], Optional[int]]] = []
+    result: List[Tuple[int, Optional[int], str, Optional[str], Optional[int], Optional[int], Optional[int]]] = []
     for row in rows:
         result.append(
             (

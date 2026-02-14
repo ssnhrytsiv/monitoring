@@ -1038,7 +1038,7 @@ async def on_status_urls(m: Message, state: FSMContext):
             except Exception:
                 pass
 
-    report_html = render_html_with_statuses(result_items, original_urls=urls)
+    report_html = render_html_with_statuses(result_items, original_urls=urls, hide_positive=True)
     total = len(result_items)
     positive = 0
     # Рахуємо позитивні тільки якщо статус не дубль і містить joined/already

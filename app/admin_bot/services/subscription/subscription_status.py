@@ -20,6 +20,7 @@ def normalize_url(url: str) -> str:
 def render_html_with_statuses(
     result_items: List[Dict],
     original_urls: Optional[List[str]] = None,
+    hide_positive: bool = False,
 ) -> str:
     """
     Рендерить тільки фінальний нумерований список лінків зі статусами
@@ -69,9 +70,9 @@ def render_html_with_statuses(
         elif "bot_error" in base or "error" in base:
             human = "❌ Ошибка"
         elif "joined" in base:
-            human = ""
+            human = "" if hide_positive else "✅ Подписался"
         elif "already" in base:
-            human = ""
+            human = "" if hide_positive else "☑️ Был подписан"
         elif "no_client" in base:
             human = "🛑 Нет доступных клиентов"
         elif "invalid" in base or "private" in base or "blocked" in base:
