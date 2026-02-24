@@ -62,6 +62,11 @@ def count_processing() -> int:
         return dao.count_processing()
 
 
+def count_processing_recent(max_processing_age_seconds: int) -> int:
+    with _dao() as dao:
+        return dao.count_processing_recent(max_processing_age_seconds)
+
+
 def mark_processing(item_id: int):
     with _dao() as dao:
         return dao.mark_processing(item_id)

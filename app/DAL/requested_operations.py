@@ -129,6 +129,56 @@ class RequestedDAO:
         rows = self.db.execute(q).scalars().all()
         return [r for r in rows if r]
 
+    def enqueue_missing_requested_invites_for_recheck(
+        self,
+        session_names: Sequence[str],
+        limit: int = 100,
+        start_after_sec: int = 60,
+    ) -> int:
+        available_session_names = [session_name for session_name in session_names if session_name]
+        if not available_session_names:
+            return 0
+
+        invite_check_exists_expression = (
+            select(sm.InviteCheck.invite_hash)
+            .where(sm.InviteCheck.invite_hash == sm.InviteStatus.invite_hash)
+            .exists()
+        )
+        missing_invite_hash_values = self.db.execute(
+            select(sm.InviteStatus.invite_hash)
+            .where(sm.InviteStatus.status.in_(("requested", "requested_fast")))
+            .where(~invite_check_exists_expression)
+            .order_by(sm.InviteStatus.ts.desc())
+            .limit(int(limit))
+        ).scalars().all()
+
+        if not missing_invite_hash_values:
+            return 0
+
+        current_epoch_seconds = _now()
+        created_invite_check_records_count = 0
+        start_delay_seconds = max(0, int(start_after_sec))
+        for invite_index, invite_hash_value in enumerate(missing_invite_hash_values):
+            selected_session_name = available_session_names[invite_index % len(available_session_names)]
+            existing_record = self.db.get(
+                sm.InviteCheck,
+                {"invite_hash": invite_hash_value, "session": selected_session_name},
+            )
+            if existing_record is not None:
+                continue
+            self.db.add(
+                sm.InviteCheck(
+                    invite_hash=invite_hash_value,
+                    session=selected_session_name,
+                    noted_at=current_epoch_seconds,
+                    next_check_at=current_epoch_seconds + start_delay_seconds,
+                    tries=0,
+                )
+            )
+            created_invite_check_records_count += 1
+        self.db.commit()
+        return created_invite_check_records_count
+
     def due_invites(self, sessions: Sequence[str], limit: int) -> List[sm.InviteCheck]:
         if not sessions:
             return []
@@ -286,6 +336,27 @@ def get_invite_sessions(invite_hash: str, db: Optional[Session] = None) -> List[
         close = True
     try:
         return RequestedDAO(db).get_invite_sessions(invite_hash)
+    finally:
+        if close:
+            db.close()
+
+
+def enqueue_missing_requested_invites_for_recheck(
+    session_names: Sequence[str],
+    limit: int = 100,
+    start_after_sec: int = 60,
+    db: Optional[Session] = None,
+) -> int:
+    close = False
+    if db is None:
+        db = SessionLocal()
+        close = True
+    try:
+        return RequestedDAO(db).enqueue_missing_requested_invites_for_recheck(
+            session_names=session_names,
+            limit=limit,
+            start_after_sec=start_after_sec,
+        )
     finally:
         if close:
             db.close()

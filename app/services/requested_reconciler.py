@@ -27,6 +27,19 @@ log = logging.getLogger("services.requested_reconciler")
 
 TICK_SEC = int(os.getenv("REQUESTED_RECONCILER_TICK", str(60 * 60)) or str(60 * 60))
 BATCH_LIMIT = int(os.getenv("REQUESTED_RECONCILER_BATCH", "90") or "90")
+PROCESSING_STALE_SEC = int(
+    os.getenv("REQUESTED_RECONCILER_PROCESSING_STALE_SEC", str(15 * 60)) or str(15 * 60)
+)
+BACKFILL_MISSING_REQUESTED_INVITES_LIMIT = int(
+    os.getenv(
+        "REQUESTED_RECONCILER_BACKFILL_MISSING_REQUESTED_INVITES_LIMIT",
+        str(BATCH_LIMIT),
+    )
+    or str(BATCH_LIMIT)
+)
+BACKFILL_MISSING_REQUESTED_INVITES_START_AFTER_SEC = int(
+    os.getenv("REQUESTED_RECONCILER_BACKFILL_MISSING_REQUESTED_INVITES_START_AFTER_SEC", "60") or "60"
+)
 
 # Локальні короткі паузи між запитами
 INTER_DELAY_INV = float(os.getenv("REQUESTED_RECONCILER_INTER_DELAY_INVITE", "3.0") or "3.0")
@@ -40,19 +53,21 @@ PER_SESSION_REQUESTED = int(os.getenv("REQUESTED_RECONCILER_PER_SESSION_REQUESTE
 # Rate limit для CheckChatInvite на одну сесію
 INVITE_RL_MAX_CALLS = int(os.getenv("REQUESTED_RECONCILER_INVITE_RL_MAX_CALLS", "6") or "6")
 INVITE_RL_WINDOW_SEC = int(os.getenv("REQUESTED_RECONCILER_INVITE_RL_WINDOW_SEC", "600") or "600")
-# ПІДНЯТО мін. інтервал (факт. 40s)
-INVITE_MIN_SPACING_SEC = float(os.getenv("REQUESTED_RECONCILER_INVITE_MIN_SPACING_SEC", "40.0") or "40.0")
+# Мін. інтервал між invite-запитами на одну сесію: 5 хв
+INVITE_MIN_SPACING_SEC = float(os.getenv("REQUESTED_RECONCILER_INVITE_MIN_SPACING_SEC", "300.0") or "300.0")
 # ВИМКНУТО джиттер (щоб він не «з’їв» інтервал)
 INVITE_SPACING_JITTER = float(os.getenv("REQUESTED_RECONCILER_INVITE_SPACING_JITTER", "0.0") or "0.0")
-# ПІДЛОГА 40s — ефективний мінімум не нижче 40s
-INVITE_MIN_SPACING_FLOOR_SEC = float(os.getenv("REQUESTED_RECONCILER_INVITE_MIN_SPACING_FLOOR_SEC", "40.0") or "40.0")
+# ПІДЛОГА 5 хв — ефективний мінімум не нижче 300s
+INVITE_MIN_SPACING_FLOOR_SEC = float(os.getenv("REQUESTED_RECONCILER_INVITE_MIN_SPACING_FLOOR_SEC", "300.0") or "300.0")
 
 # Rate limit для requested-перевірок (get_entity/GetParticipantRequest) на одну сесію
 REQUESTED_RL_MAX_CALLS = int(os.getenv("REQUESTED_RECONCILER_REQUESTED_RL_MAX_CALLS", "30") or "30")
 REQUESTED_RL_WINDOW_SEC = int(os.getenv("REQUESTED_RECONCILER_REQUESTED_RL_WINDOW_SEC", "600") or "600")
-REQUESTED_MIN_SPACING_SEC = float(os.getenv("REQUESTED_RECONCILER_REQUESTED_MIN_SPACING_SEC", "4.0") or "4.0")
+REQUESTED_MIN_SPACING_SEC = float(os.getenv("REQUESTED_RECONCILER_REQUESTED_MIN_SPACING_SEC", "300.0") or "300.0")
 REQUESTED_SPACING_JITTER = float(os.getenv("REQUESTED_RECONCILER_REQUESTED_SPACING_JITTER", "0.7") or "0.7")
-REQUESTED_MIN_SPACING_FLOOR_SEC = float(os.getenv("REQUESTED_RECONCILER_REQUESTED_MIN_SPACING_FLOOR_SEC", "0.8") or "0.8")
+REQUESTED_MIN_SPACING_FLOOR_SEC = float(
+    os.getenv("REQUESTED_RECONCILER_REQUESTED_MIN_SPACING_FLOOR_SEC", "300.0") or "300.0"
+)
 
 FLOOD_SLACK_SEC = int(os.getenv("REQUESTED_RECONCILER_FLOOD_SLACK_SEC", "45") or "45")
 FLOOD_MAX_WAIT_SEC = int(os.getenv("REQUESTED_RECONCILER_FLOOD_MAX_WAIT", "3600") or "3600")
@@ -341,11 +356,25 @@ async def run_requested_reconciler() -> None:
         try:
             # Якщо зараз активні батчі (link_queue має processing), не заважаємо основному воркеру
             try:
-                active_processing = link_queue.count_processing()
-                if active_processing > 0:
-                    log.debug("[reconciler] skip tick: active processing=%d", active_processing)
-                    await asyncio.sleep(TICK_SEC)
-                    continue
+                active_processing_total = link_queue.count_processing()
+                if active_processing_total > 0:
+                    active_processing_recent = link_queue.count_processing_recent(PROCESSING_STALE_SEC)
+                    stale_processing_count = max(0, active_processing_total - active_processing_recent)
+                    if active_processing_recent > 0:
+                        log.debug(
+                            "[reconciler] skip tick: processing_total=%d processing_recent=%d stale=%d",
+                            active_processing_total,
+                            active_processing_recent,
+                            stale_processing_count,
+                        )
+                        await asyncio.sleep(TICK_SEC)
+                        continue
+                    log.warning(
+                        "[reconciler] stale processing detected: total=%d stale=%d older_than=%ss; continue checks",
+                        active_processing_total,
+                        stale_processing_count,
+                        PROCESSING_STALE_SEC,
+                    )
             except Exception as e:
                 log.debug("[reconciler] active-processing check failed: %s", e)
 
@@ -364,6 +393,23 @@ async def run_requested_reconciler() -> None:
             if not sessions:
                 await asyncio.sleep(TICK_SEC)
                 continue
+
+            try:
+                backfilled_invite_checks_count = rdb.enqueue_missing_requested_invites_for_recheck(
+                    session_names=sessions,
+                    limit=BACKFILL_MISSING_REQUESTED_INVITES_LIMIT,
+                    start_after_sec=BACKFILL_MISSING_REQUESTED_INVITES_START_AFTER_SEC,
+                )
+                if backfilled_invite_checks_count > 0:
+                    log.info(
+                        "[reconciler.invites] backfilled missing requested invite checks: count=%d",
+                        backfilled_invite_checks_count,
+                    )
+            except Exception as exception:
+                log.debug(
+                    "[reconciler.invites] backfill missing requested invite checks failed: %s",
+                    exception,
+                )
 
             # --- 1) INVITES ---
             if FAIR_INVITES_FETCH:

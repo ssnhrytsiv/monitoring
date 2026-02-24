@@ -158,8 +158,24 @@ class LinkQueueDAO:
         row = self.db.query(m.LinkQueue).filter(m.LinkQueue.state == "processing").count()
         return int(row or 0)
 
+    def count_processing_recent(self, max_processing_age_seconds: int) -> int:
+        current_epoch_seconds = int(time.time())
+        cutoff_epoch_seconds = current_epoch_seconds - max(0, int(max_processing_age_seconds))
+        row = (
+            self.db.query(m.LinkQueue)
+            .filter(
+                m.LinkQueue.state == "processing",
+                m.LinkQueue.next_try_ts >= cutoff_epoch_seconds,
+            )
+            .count()
+        )
+        return int(row or 0)
+
     def mark_processing(self, item_id: int) -> None:
-        self.db.query(m.LinkQueue).filter(m.LinkQueue.id == item_id).update({"state": "processing"})
+        current_epoch_seconds = int(time.time())
+        self.db.query(m.LinkQueue).filter(m.LinkQueue.id == item_id).update(
+            {"state": "processing", "next_try_ts": current_epoch_seconds}
+        )
         self.db.commit()
 
     def mark_done(self, item_id: int) -> None:
@@ -252,6 +268,10 @@ def fetch_batch_due(
 
 def count_processing(db: Session) -> int:
     return LinkQueueDAO(db).count_processing()
+
+
+def count_processing_recent(db: Session, max_processing_age_seconds: int) -> int:
+    return LinkQueueDAO(db).count_processing_recent(max_processing_age_seconds)
 
 
 def mark_processing(db: Session, item_id: int):

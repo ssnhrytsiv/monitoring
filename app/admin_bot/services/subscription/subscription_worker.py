@@ -33,6 +33,7 @@ from app.admin_bot.services.subscription.subscription_report import answer_with_
 from app.admin_bot.services.subscription.subscription_utils import norm_keys as collect_norm_keys
 from app.logging_json import get_logger, configure_logging
 from app.DAL import channels_operations as cho
+from app.DAL import requested_operations as requested_checks_db
 from app.DAL.membership_operations import _extract_invite_hash
 
 # Гарантований мінімальний логер (на випадок, якщо головний процес не налаштував logging).
@@ -242,7 +243,7 @@ async def process_batch(
                 st_inv = membership_db.invite_status_get(inv_hash)
             except Exception:
                 st_inv = None
-            if st_inv and st_inv != "requested":
+            if st_inv and st_inv not in ("requested", "requested_fast"):
                 final_norm = "already" if st_inv == "joined" else st_inv
                 data = (final_norm, None, None, "invite_status", None)
                 _register_preknown(url, data)
@@ -609,6 +610,40 @@ async def process_batch(
 
             base_status = status or "unknown"
             status_display = f"{base_status}[{sess}]" if sess else base_status
+
+            if base_status in ("requested", "requested_fast"):
+                if invite_hash and sess:
+                    try:
+                        requested_checks_db.note_requested_invite(
+                            session=sess,
+                            invite_hash=invite_hash,
+                            start_after_sec=90,
+                        )
+                    except Exception:
+                        log.debug(
+                            "queue_worker.requested_note_invite_failed batch_id=%s idx=%s invite=%s sess=%s",
+                            batch_id,
+                            idx,
+                            invite_hash,
+                            sess,
+                            exc_info=True,
+                        )
+                if cid and sess:
+                    try:
+                        requested_checks_db.note_requested(
+                            session=sess,
+                            channel_id=int(cid),
+                            start_after_sec=90,
+                        )
+                    except Exception:
+                        log.debug(
+                            "queue_worker.requested_note_channel_failed batch_id=%s idx=%s cid=%s sess=%s",
+                            batch_id,
+                            idx,
+                            cid,
+                            sess,
+                            exc_info=True,
+                        )
 
             if cid is None:
                 link_queue.mark_failed(item_id, base_status, backoff_sec=backoff_seconds)

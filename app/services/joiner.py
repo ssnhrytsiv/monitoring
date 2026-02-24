@@ -414,13 +414,9 @@ async def ensure_join(client, url: str):
                     st_norm = _requested_status()
                 log.debug("ensure_join(invite): cached status=%s(invite=%s cid=%s) -> %s", st, invite_hash, cid_known, st_norm)
 
-                # Якщо досягли ліміту спроб — повертаємо fast-path без додаткових запитів
-                if st_norm == "requested_fast":
-                    return st_norm, (title_known or None), "invite", (int(cid_known) if cid_known else None), invite_hash
-
-                # Якщо в кеші "requested", спробуємо перепитати CheckChatInvite на випадок,
+                # Якщо в кеші "requested"/"requested_fast", спробуємо перепитати CheckChatInvite на випадок,
                 # коли канал вже прийняв, щоб прибрати "заявку".
-                if st == "requested":
+                if st in ("requested", "requested_fast"):
                     try:
                         await throttle_invite()
                         inv = await client(CheckChatInviteRequest(invite_hash))
@@ -431,17 +427,22 @@ async def ensure_join(client, url: str):
                             try:
                                 map_invite_set(invite_hash, cid_new, title_new or None)
                                 log.debug(
-                                    "ensure_join(invite_cache): map_invite_set invite=%s cid=%s title=%r (requested->already)",
+                                    "ensure_join(invite_cache): map_invite_set invite=%s cid=%s title=%r (%s->already)",
                                     invite_hash,
                                     cid_new,
                                     title_new,
+                                    st,
                                 )
                             except Exception:
                                 _log_exc("ensure_join: map_invite_set requested->already")
-                            log.info("ensure_join(invite): requested->already via recheck invite=%s cid=%s", invite_hash, cid_new)
+                            try:
+                                invite_status_put(invite_hash, "already")
+                            except Exception:
+                                _log_exc("ensure_join: invite_status_put(already) recheck")
+                            log.info("ensure_join(invite): %s->already via recheck invite=%s cid=%s", st, invite_hash, cid_new)
                             return "already", (title_new or title_known or None), "invite", cid_new, invite_hash
                     except InviteRequestSentError:
-                        # все ще заявка, залишаємо requested
+                        # все ще заявка, залишаємо requested/requested_fast
                         pass
                     except FloodWaitError as e:
                         log.warning("ensure_join(invite): recheck FloodWait %ss", e.seconds)

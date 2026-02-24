@@ -546,13 +546,31 @@ async def refresh_channels_for_admin(
                 # Канал уже прив'язаний до іншого адміна, але конфлікт не записаний у таблиці
                 conflict_with = ac_display or str(ac_admin_id) or "невідомий адмін"
                 status_raw = f"owner_conflict(existing={conflict_with})"
-            # Якщо є активна підписка в membership — вважаємо, що був підписаний
-            first_membership = db.execute(
+            # Якщо є активна підписка в membership — синхронізуємо статус із фактичним membership.
+            membership_account = db.execute(
                 select(m.Membership.account).where(m.Membership.channel_id == cid).limit(1)
             ).scalar_one_or_none()
-            if first_membership:
-                if not session_hint:
-                    session_hint = str(first_membership)
+            if membership_account and not session_hint:
+                session_hint = str(membership_account)
+
+            normalized_membership_status = None
+            try:
+                membership_status = dao.any_final_for_channel(int(cid))
+                if membership_status:
+                    normalized_membership_status = "already" if membership_status == "joined" else membership_status
+            except Exception:
+                normalized_membership_status = None
+
+            if normalized_membership_status:
+                status_raw_lower = (status_raw or "").lower()
+                if "owner_conflict" not in status_raw_lower:
+                    if (
+                        not status_raw
+                        or "requested" in status_raw_lower
+                        or ("joined" in status_raw_lower and "already" not in status_raw_lower)
+                    ):
+                        status_raw = normalized_membership_status
+            elif membership_account:
                 if not status_raw:
                     status_raw = "already"
                 elif "joined" in (status_raw or "").lower() and "already" not in (status_raw or "").lower():
