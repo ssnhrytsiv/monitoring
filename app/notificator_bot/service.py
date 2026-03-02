@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from typing import Dict, List, Tuple
@@ -12,6 +14,13 @@ from aiogram.exceptions import TelegramAPIError
 
 from app.notificator_bot import formatter
 from app.notificator_bot.config import NOTIFIER_TARGET_IDS
+from app.notificator_bot.handlers import (
+    attach_notification_page_session_to_message,
+    build_notification_navigation_markup,
+    create_notification_page_session,
+    discard_notification_page_session,
+    remove_notification_page_session_for_message,
+)
 from app.notificator_bot.models import NotifierMessage
 from app.DAL import SessionLocal
 from app.DAL import channels_operations as cho
@@ -25,6 +34,8 @@ from app.DAL import watch_posts_operations as watch_posts_db
 from app.utils.link_parser import extract_bot_username
 
 log = logging.getLogger("notificator.service")
+
+TELEGRAM_MESSAGE_MAX_LENGTH = 4096
 
 PRIORITY = {
     "pending": 0,
@@ -287,21 +298,227 @@ def _add_entry(
         bucket[watch_id] = entry
 
 
+def _build_single_notification_page_text(
+    project: str,
+    admin: str,
+    notification_lines: List[str],
+    total_views: int | None,
+    post_title: str | None,
+    group_id: int | None,
+    first_item_number: int = 1,
+) -> str:
+    return formatter.format_admin_message(
+        project,
+        admin,
+        notification_lines,
+        total_views,
+        post_title,
+        group_id,
+        first_item_number=first_item_number,
+    )
+
+
+def _strip_html_markup_from_notification_line(notification_line: str) -> str:
+    return re.sub(r"<[^>]+>", "", notification_line)
+
+
+def _build_forced_single_line_page_text(
+    project: str,
+    admin: str,
+    notification_line: str,
+    total_views: int | None,
+    post_title: str | None,
+    group_id: int | None,
+    message_max_length: int,
+    first_item_number: int,
+) -> str:
+    notification_line_without_markup = _strip_html_markup_from_notification_line(notification_line) or "..."
+    best_page_text: str | None = None
+
+    left_border = 1
+    right_border = len(notification_line_without_markup)
+    while left_border <= right_border:
+        middle_position = (left_border + right_border) // 2
+        candidate_line = notification_line_without_markup[:middle_position]
+        if middle_position < len(notification_line_without_markup):
+            candidate_line = candidate_line.rstrip() + "..."
+        escaped_candidate_line = html.escape(candidate_line)
+        candidate_page_text = _build_single_notification_page_text(
+            project,
+            admin,
+            [escaped_candidate_line],
+            total_views,
+            post_title,
+            group_id,
+            first_item_number=first_item_number,
+        )
+        if len(candidate_page_text) <= message_max_length:
+            best_page_text = candidate_page_text
+            left_border = middle_position + 1
+        else:
+            right_border = middle_position - 1
+
+    if best_page_text:
+        return best_page_text
+
+    page_without_lines_and_post_title = _build_single_notification_page_text(
+        project,
+        admin,
+        [],
+        total_views,
+        None,
+        group_id,
+        first_item_number=first_item_number,
+    )
+    if len(page_without_lines_and_post_title) <= message_max_length:
+        return page_without_lines_and_post_title
+
+    if message_max_length <= 3:
+        return page_without_lines_and_post_title[:message_max_length]
+    return page_without_lines_and_post_title[: message_max_length - 3] + "..."
+
+
+def _build_notification_pages_with_length_limit(
+    project: str,
+    admin: str,
+    lines: List[str],
+    total_views: int | None,
+    post_title: str | None,
+    group_id: int | None,
+    message_max_length: int = TELEGRAM_MESSAGE_MAX_LENGTH,
+) -> List[str]:
+    complete_notification_text = _build_single_notification_page_text(project, admin, lines, total_views, post_title, group_id)
+    if len(complete_notification_text) <= message_max_length:
+        return [complete_notification_text]
+
+    notification_page_texts: List[str] = []
+    current_page_lines: List[str] = []
+    emitted_line_count = 0
+
+    for notification_line in lines:
+        candidate_page_lines = current_page_lines + [notification_line]
+        candidate_page_text = _build_single_notification_page_text(
+            project,
+            admin,
+            candidate_page_lines,
+            total_views,
+            post_title,
+            group_id,
+            first_item_number=emitted_line_count + 1,
+        )
+        if len(candidate_page_text) <= message_max_length:
+            current_page_lines = candidate_page_lines
+            continue
+
+        if current_page_lines:
+            notification_page_texts.append(
+                _build_single_notification_page_text(
+                    project,
+                    admin,
+                    current_page_lines,
+                    total_views,
+                    post_title,
+                    group_id,
+                    first_item_number=emitted_line_count + 1,
+                )
+            )
+            emitted_line_count += len(current_page_lines)
+            current_page_lines = []
+
+        single_line_page_text = _build_single_notification_page_text(
+            project,
+            admin,
+            [notification_line],
+            total_views,
+            post_title,
+            group_id,
+            first_item_number=emitted_line_count + 1,
+        )
+        if len(single_line_page_text) <= message_max_length:
+            current_page_lines = [notification_line]
+            continue
+
+        notification_page_texts.append(
+            _build_forced_single_line_page_text(
+                project,
+                admin,
+                notification_line,
+                total_views,
+                post_title,
+                group_id,
+                message_max_length,
+                first_item_number=emitted_line_count + 1,
+            )
+        )
+        emitted_line_count += 1
+
+    if current_page_lines:
+        notification_page_texts.append(
+            _build_single_notification_page_text(
+                project,
+                admin,
+                current_page_lines,
+                total_views,
+                post_title,
+                group_id,
+                first_item_number=emitted_line_count + 1,
+            )
+        )
+        emitted_line_count += len(current_page_lines)
+
+    if notification_page_texts:
+        return notification_page_texts
+
+    page_without_lines = _build_single_notification_page_text(
+        project,
+        admin,
+        [],
+        total_views,
+        post_title,
+        group_id,
+        first_item_number=emitted_line_count + 1,
+    )
+    if len(page_without_lines) <= message_max_length:
+        return [page_without_lines]
+
+    page_without_lines_and_post_title = _build_single_notification_page_text(
+        project,
+        admin,
+        [],
+        total_views,
+        None,
+        group_id,
+        first_item_number=emitted_line_count + 1,
+    )
+    if len(page_without_lines_and_post_title) <= message_max_length:
+        return [page_without_lines_and_post_title]
+
+    if message_max_length <= 3:
+        return [page_without_lines_and_post_title[:message_max_length]]
+    return [page_without_lines_and_post_title[: message_max_length - 3] + "..."]
+
+
 def collect_grouped_events(
     exclude_ids: set[int] | None = None,
-) -> Tuple[Dict[Tuple[str, str, int], Dict[int, dict]], List[int]]:
+) -> Tuple[
+    Dict[Tuple[str, str, int], Dict[int, dict]],
+    List[int],
+    Dict[Tuple[str, str, int], List[int]],
+]:
     """
-    Читає unsent events, групує по (project, admin, group_id), повертає (grouped, event_ids).
+    Читає unsent events, групує по (project, admin, group_id),
+    повертає (grouped, event_ids, grouped_event_ids).
     Всередині групи по кожному watch_id залишаємо найпріоритетніший запис.
     """
     events = fetch_unsent_events(limit=1000)
     log.debug("notificator: fetched unsent events count=%s", len(events))
     if not events:
         log.debug("notificator: no unsent events")
-        return {}, []
+        return {}, [], {}
 
     grouped: Dict[Tuple[str, str, int], Dict[int, dict]] = {}
     processed_ids: List[int] = []
+    grouped_event_ids: Dict[Tuple[str, str, int], List[int]] = {}
     pending_groups: Dict[Tuple[str, str, int], set] = {}
 
     for ev_id, watch_id, ev_type, payload_json, created_at in events:
@@ -343,6 +560,7 @@ def collect_grouped_events(
             },
         )
         processed_ids.append(ev_id)
+        grouped_event_ids.setdefault(key, []).append(ev_id)
         if gid:
             pending_groups.setdefault(key, set()).add(gid)
 
@@ -412,7 +630,7 @@ def collect_grouped_events(
                     },
                 )
 
-    return grouped, processed_ids
+    return grouped, processed_ids, grouped_event_ids
 
 
 def _get_prev_message(chat_id: int, project: str, admin: str, group_id: int) -> int | None:
@@ -473,7 +691,7 @@ async def send_notifications(bot: Bot, debounce_sec: int = 60) -> None:
     Якщо є події, збираємо їх протягом debounce_sec, потім шлемо одним батчем.
     Щоб не спамити БД, робимо лише два читання: на старті та після дебаунса.
     """
-    grouped, event_ids = collect_grouped_events()
+    grouped, event_ids, grouped_event_ids = collect_grouped_events()
     if not grouped or not event_ids:
         log.debug("notificator: nothing to send")
         return
@@ -492,11 +710,13 @@ async def send_notifications(bot: Bot, debounce_sec: int = 60) -> None:
     # Чекаємо дебаунс і читаємо ще раз, щоб добрати хвилю подій
     await asyncio.sleep(max(1, debounce_sec))
     exclude_ids = set(event_ids)
-    more_grouped, more_ids = collect_grouped_events(exclude_ids=exclude_ids)
+    more_grouped, more_ids, more_grouped_event_ids = collect_grouped_events(exclude_ids=exclude_ids)
     if more_grouped and more_ids:
         for key, bucket in more_grouped.items():
             for watch_id, entry in bucket.items():
                 _add_entry(grouped, key, watch_id, entry)
+        for key, event_id_list in more_grouped_event_ids.items():
+            grouped_event_ids.setdefault(key, []).extend(event_id_list)
         event_ids.extend(more_ids)
         log.info(
             "notificator: merged after debounce: +%s events, total=%s",
@@ -505,6 +725,8 @@ async def send_notifications(bot: Bot, debounce_sec: int = 60) -> None:
         )
     else:
         log.debug("notificator: no new events after debounce (exclude=%s)", len(exclude_ids))
+
+    sent_event_ids: List[int] = []
 
     # Надсилаємо по кожній групі (project, admin, group_id)
     for (project, admin, group_id), bucket in grouped.items():
@@ -536,7 +758,16 @@ async def send_notifications(bot: Bot, debounce_sec: int = 60) -> None:
             except Exception:
                 continue
         total_views = sum(views_values) if views_values else None
-        text = formatter.format_admin_message(project, admin, lines, total_views, post_title, group_id)
+        notification_page_texts = _build_notification_pages_with_length_limit(
+            project,
+            admin,
+            lines,
+            total_views,
+            post_title,
+            group_id,
+        )
+        first_page_text = notification_page_texts[0]
+        group_sent_successfully = False
 
         for chat_id in NOTIFIER_TARGET_IDS:
             # Якщо є попереднє повідомлення по цьому group_id – видалимо
@@ -571,32 +802,67 @@ async def send_notifications(bot: Bot, debounce_sec: int = 60) -> None:
                             group_id,
                             e,
                         )
+                    finally:
+                        remove_notification_page_session_for_message(chat_id, prev_msg_id)
+
+            notification_page_session_identifier: str | None = None
+            navigation_markup = None
+            if len(notification_page_texts) > 1:
+                notification_page_session_identifier = create_notification_page_session(notification_page_texts)
+                navigation_markup = build_notification_navigation_markup(
+                    notification_page_session_identifier,
+                    current_page_number=0,
+                    total_page_count=len(notification_page_texts),
+                )
 
             try:
                 sent_msg = await bot.send_message(
                     chat_id=chat_id,
-                    text=text,
+                    text=first_page_text,
                     parse_mode="HTML",
                     disable_web_page_preview=True,
+                    reply_markup=navigation_markup,
                 )
                 log.info(
-                    "notificator: sent notification to %s for project=%s admin=%s lines=%s group_id=%s",
+                    "notificator: sent notification to %s for project=%s admin=%s lines=%s pages=%s group_id=%s",
                     chat_id,
                     project,
                     admin,
                     len(lines),
+                    len(notification_page_texts),
                     group_id,
                 )
+                group_sent_successfully = True
+                if notification_page_session_identifier:
+                    attach_notification_page_session_to_message(
+                        chat_id=chat_id,
+                        message_id=sent_msg.message_id,
+                        notification_page_session_identifier=notification_page_session_identifier,
+                    )
                 if group_id:
                     _upsert_message(chat_id, project, admin, group_id, sent_msg.message_id)
             except TelegramAPIError as e:
+                if notification_page_session_identifier:
+                    discard_notification_page_session(notification_page_session_identifier)
                 log.error("Failed to send notify to %s (project=%s admin=%s): %s", chat_id, project, admin, e)
             except Exception as e:
+                if notification_page_session_identifier:
+                    discard_notification_page_session(notification_page_session_identifier)
                 log.exception("Unexpected send error to %s (project=%s admin=%s): %s", chat_id, project, admin, e)
 
-    # Позначаємо відправленими (уникаємо дублів) (використовуємо перший chat_id або 0)
+        if group_sent_successfully:
+            sent_event_ids.extend(grouped_event_ids.get((project, admin, group_id), []))
+        else:
+            log.warning(
+                "notificator: notification not sent to any target for project=%s admin=%s group_id=%s",
+                project,
+                admin,
+                group_id,
+            )
+
+    # Позначаємо відправленими лише події по групах, що реально пішли хоча б в один таргет
     sent_to = NOTIFIER_TARGET_IDS[0] if NOTIFIER_TARGET_IDS else 0
-    for ev_id in dict.fromkeys(event_ids):
+    for ev_id in dict.fromkeys(sent_event_ids):
         try:
             mark_event_sent(ev_id, sent_to)
         except Exception as e:

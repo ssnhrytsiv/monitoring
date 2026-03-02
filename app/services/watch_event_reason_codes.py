@@ -1,0 +1,21 @@
+from __future__ import annotations
+
+# Match decision reasons
+WATCH_EVENT_REASON_CODE_EXACT_HTML_MATCH = "exact_html_match"
+WATCH_EVENT_REASON_CODE_SIMILARITY_ABOVE_THRESHOLD = "similarity_above_threshold"
+WATCH_EVENT_REASON_CODE_SIMILARITY_BELOW_THRESHOLD = "similarity_below_threshold"
+WATCH_EVENT_REASON_CODE_LINKS_MISMATCH = "links_mismatch"
+WATCH_EVENT_REASON_CODE_MISSING_EXPECTED_HTML = "missing_expected_html"
+WATCH_EVENT_REASON_CODE_CANDIDATE_DUPLICATE_WITHIN_TTL = "candidate_duplicate_within_ttl"
+
+# Lifecycle reasons
+WATCH_EVENT_REASON_CODE_PENDING_WINDOW_EXPIRED = "pending_window_expired"
+WATCH_EVENT_REASON_CODE_VIEWS_COVERAGE_CHECK = "views_coverage_check"
+WATCH_EVENT_REASON_CODE_VIEWS_ENTITY_MISS = "views_entity_miss"
+WATCH_EVENT_REASON_CODE_VIEWS_MESSAGE_NOT_FOUND = "views_message_not_found"
+WATCH_EVENT_REASON_CODE_EDIT_DETECTED = "edit_detected"
+WATCH_EVENT_REASON_CODE_MESSAGE_DELETED = "message_deleted"
+
+# Manual flow reasons
+WATCH_EVENT_REASON_CODE_MANUAL_CANDIDATE_ACCEPTED = "manual_candidate_accepted"
+WATCH_EVENT_REASON_CODE_MANUAL_MATCHED = "manual_matched"

@@ -11,6 +11,7 @@ from app.admin_bot.db import models as m
 from app.DAL import membership_operations as mem_db
 from app.DAL.watch_processing_operations import mark_matched as process_mark_matched
 from app.DAL.watch_events_operations import insert_watch_event
+from app.services import watch_event_reason_codes
 from app.utils.time_utils import (
     MOSCOW_TIME_FORMAT,
     ensure_moscow_timezone,
@@ -369,6 +370,9 @@ def accept_watch_candidate(
                         "via": "manual_candidate",
                         "candidate_id": cid,
                         "text_hash": text_hash,
+                        "reason_code": (
+                            watch_event_reason_codes.WATCH_EVENT_REASON_CODE_MANUAL_CANDIDATE_ACCEPTED
+                        ),
                     }
                 ),
             )

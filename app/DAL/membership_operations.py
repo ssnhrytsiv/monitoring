@@ -14,8 +14,8 @@ from app.services import models as sm  # InviteCheck/RequestedCheck live here
 
 log = logging.getLogger(__name__)
 
-FINAL_GLOBAL = ("joined", "already", "requested", "invalid", "private")
-FINAL_PER_ACC = ("joined", "already", "requested", "invalid", "private", "blocked", "too_many")
+FINAL_GLOBAL = ("joined", "already", "requested", "invalid")
+FINAL_PER_ACC = ("joined", "already", "requested", "invalid", "blocked", "too_many")
 
 
 def _now_ts() -> int:

@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections import Counter
 from datetime import datetime, timedelta
+from threading import Lock
 from typing import Callable, Optional, Dict, Any
 import re
 from difflib import SequenceMatcher
@@ -24,6 +26,7 @@ from app.services.html_match import exact_html_equal
 from app.services.account_pool import iter_pool_clients, session_name
 from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now
 from app.services.post_matcher import normalize_text, extract_links_norm
+from app.services import watch_event_reason_codes
 from app.admin_bot.db import models as m
 from app.admin_bot.db.session import SessionLocal
 from app import config
@@ -57,11 +60,220 @@ if not trace_logger.handlers:
     trace_logger.propagate = False
 
 
+_WATCH_NOTIFIER_GROUP_IDENTIFIER_CACHE: Dict[int, int | None] = {}
+
+
+def _parse_watch_identifier_from_trace_payload(trace_payload: dict[str, Any]) -> int | None:
+    watch_identifier_value = trace_payload.get("watch_id")
+    if isinstance(watch_identifier_value, int):
+        return watch_identifier_value
+    if isinstance(watch_identifier_value, str):
+        normalized_watch_identifier_value = watch_identifier_value.strip()
+        if not normalized_watch_identifier_value:
+            return None
+        try:
+            return int(normalized_watch_identifier_value)
+        except Exception:
+            return None
+    return None
+
+
+def _resolve_notifier_group_identifier_by_watch_id(watch_id: int) -> int | None:
+    cached_notifier_group_identifier = _WATCH_NOTIFIER_GROUP_IDENTIFIER_CACHE.get(watch_id)
+    if cached_notifier_group_identifier is not None:
+        return cached_notifier_group_identifier
+    if watch_id in _WATCH_NOTIFIER_GROUP_IDENTIFIER_CACHE:
+        return None
+
+    try:
+        watch_information = watch_posts_db.get_watch_info(watch_id)
+    except Exception:
+        _pylog.exception("trace: failed to read watch info for notifier group id (watch_id=%s)", watch_id)
+        _WATCH_NOTIFIER_GROUP_IDENTIFIER_CACHE[watch_id] = None
+        return None
+
+    notifier_group_identifier_value = watch_information.get("group_id") if watch_information else None
+    if notifier_group_identifier_value is None:
+        _WATCH_NOTIFIER_GROUP_IDENTIFIER_CACHE[watch_id] = None
+        return None
+
+    try:
+        normalized_notifier_group_identifier = int(notifier_group_identifier_value)
+    except Exception:
+        _WATCH_NOTIFIER_GROUP_IDENTIFIER_CACHE[watch_id] = None
+        return None
+
+    _WATCH_NOTIFIER_GROUP_IDENTIFIER_CACHE[watch_id] = normalized_notifier_group_identifier
+    return normalized_notifier_group_identifier
+
+
+def _inject_notifier_group_identifier_into_trace_payload(trace_payload: dict[str, Any]) -> None:
+    existing_notifier_group_identifier = trace_payload.get("notifier_group_id")
+    if isinstance(existing_notifier_group_identifier, int):
+        return
+    if isinstance(existing_notifier_group_identifier, str):
+        normalized_notifier_group_identifier_value = existing_notifier_group_identifier.strip()
+        if normalized_notifier_group_identifier_value:
+            return
+
+    watch_identifier = _parse_watch_identifier_from_trace_payload(trace_payload)
+    if watch_identifier is None:
+        return
+
+    resolved_notifier_group_identifier = _resolve_notifier_group_identifier_by_watch_id(watch_identifier)
+    if resolved_notifier_group_identifier is None:
+        return
+
+    trace_payload["notifier_group_id"] = resolved_notifier_group_identifier
+
+
 def _trace(event: str, **payload):
+    try:
+        _inject_notifier_group_identifier_into_trace_payload(payload)
+    except Exception:
+        pass
+    try:
+        _record_reason_code_summary_event(event_name=event, event_payload=payload)
+    except Exception:
+        pass
     try:
         trace_logger.info(json.dumps({"event": event, **payload}, ensure_ascii=False))
     except Exception:
         pass
+
+
+MATCH_DIAGNOSTIC_TEXT_MAX_LENGTH = 1200
+
+
+def _truncate_text_for_match_diagnostics(
+    source_text: str | None,
+    maximum_length: int = MATCH_DIAGNOSTIC_TEXT_MAX_LENGTH,
+) -> str:
+    normalized_source_text = str(source_text or "")
+    if len(normalized_source_text) <= maximum_length:
+        return normalized_source_text
+    if maximum_length <= 3:
+        return normalized_source_text[:maximum_length]
+    return normalized_source_text[: maximum_length - 3] + "..."
+
+
+def _normalize_links_for_match_diagnostics(source_links: list[str]) -> list[str]:
+    normalized_unique_links: list[str] = []
+    seen_normalized_links: set[str] = set()
+    for source_link in source_links:
+        normalized_link = str(source_link or "").strip()
+        if not normalized_link:
+            continue
+        if normalized_link in seen_normalized_links:
+            continue
+        seen_normalized_links.add(normalized_link)
+        normalized_unique_links.append(normalized_link)
+    return normalized_unique_links
+
+
+def _build_link_difference_payload(
+    expected_links_values: list[str],
+    actual_links_values: list[str],
+) -> dict[str, list[str]]:
+    normalized_expected_links = _normalize_links_for_match_diagnostics(expected_links_values)
+    normalized_actual_links = _normalize_links_for_match_diagnostics(actual_links_values)
+
+    normalized_actual_links_set = set(normalized_actual_links)
+    normalized_expected_links_set = set(normalized_expected_links)
+
+    expected_only_links = [
+        expected_link_value
+        for expected_link_value in normalized_expected_links
+        if expected_link_value not in normalized_actual_links_set
+    ]
+    actual_only_links = [
+        actual_link_value
+        for actual_link_value in normalized_actual_links
+        if actual_link_value not in normalized_expected_links_set
+    ]
+    return {
+        "expected_only_links": expected_only_links,
+        "actual_only_links": actual_only_links,
+    }
+
+
+def _build_match_diagnostics_payload(
+    expected_html_text: str,
+    actual_html_text: str,
+    expected_plain_text: str,
+    actual_plain_text: str,
+    expected_links_values: list[str],
+    actual_links_values: list[str],
+) -> dict[str, Any]:
+    expected_html_text_value = expected_html_text or ""
+    actual_html_text_value = actual_html_text or ""
+    expected_plain_text_value = expected_plain_text or ""
+    actual_plain_text_value = actual_plain_text or ""
+    normalized_expected_links = _normalize_links_for_match_diagnostics(expected_links_values)
+    normalized_actual_links = _normalize_links_for_match_diagnostics(actual_links_values)
+    return {
+        "expected_html_length": len(expected_html_text_value),
+        "actual_html_length": len(actual_html_text_value),
+        "expected_plain_length": len(expected_plain_text_value),
+        "actual_plain_length": len(actual_plain_text_value),
+        "expected_links": normalized_expected_links,
+        "actual_links": normalized_actual_links,
+        **_build_link_difference_payload(
+            expected_links_values=normalized_expected_links,
+            actual_links_values=normalized_actual_links,
+        ),
+        "expected_html_excerpt": _truncate_text_for_match_diagnostics(expected_html_text_value),
+        "actual_html_excerpt": _truncate_text_for_match_diagnostics(actual_html_text_value),
+        "expected_plain_excerpt": _truncate_text_for_match_diagnostics(expected_plain_text_value),
+        "actual_plain_excerpt": _truncate_text_for_match_diagnostics(actual_plain_text_value),
+    }
+
+
+def _trace_match_decision_trail(
+    *,
+    watch_id: int,
+    channel_id: int,
+    message_id: int,
+    session_name: str,
+    exact_html_match_succeeded: bool,
+    html_similarity_ratio: float,
+    plain_text_similarity_ratio: float,
+    similarity_threshold: float,
+    similarity_threshold_passed: bool,
+    links_mismatch_detected: bool | None,
+    final_watch_status: str,
+    reason_code: str,
+    expected_links_values: list[str],
+    actual_links_values: list[str],
+) -> None:
+    links_check_result = "not_checked"
+    if links_mismatch_detected is True:
+        links_check_result = "links_mismatch"
+    elif links_mismatch_detected is False:
+        links_check_result = "links_match"
+
+    _trace(
+        "match_decision_trail",
+        watch_id=watch_id,
+        channel_id=channel_id,
+        message_id=message_id,
+        session=session_name,
+        similarity=html_similarity_ratio,
+        similarity_text=plain_text_similarity_ratio,
+        similarity_threshold=similarity_threshold,
+        decision_stages={
+            "normalize_html_for_edit": True,
+            "exact_html_match_succeeded": exact_html_match_succeeded,
+            "similarity_threshold_passed": similarity_threshold_passed,
+            "links_check_result": links_check_result,
+        },
+        final_watch_status=final_watch_status,
+        reason_code=reason_code,
+        **_build_link_difference_payload(
+            expected_links_values=expected_links_values,
+            actual_links_values=actual_links_values,
+        ),
+    )
 
 COVERAGE_POLL_TICK_SEC = 30
 
@@ -75,6 +287,101 @@ NEAR_IDENTICAL_TEXT_THRESHOLD = 0.99
 GROUP_NEAR_IDENTICAL_THRESHOLD = 0.95
 # Редагування: дрібні відмінності не вважаємо суттєвими, якщо ratio майже 1.0
 EDIT_NEAR_THRESHOLD = 0.99
+
+
+def _read_reason_code_summary_enabled() -> bool:
+    watch_reason_code_summary_enabled_raw_value = str(os.getenv("WATCH_REASON_CODE_SUMMARY_ENABLED", "1") or "").strip().lower()
+    return watch_reason_code_summary_enabled_raw_value not in {"0", "false", "no", "off"}
+
+
+def _read_reason_code_summary_flush_interval_seconds() -> int:
+    watch_reason_code_summary_flush_interval_raw_value = str(
+        os.getenv("WATCH_REASON_CODE_SUMMARY_FLUSH_INTERVAL_SECONDS", "3600") or ""
+    ).strip()
+    try:
+        watch_reason_code_summary_flush_interval_seconds = int(watch_reason_code_summary_flush_interval_raw_value)
+    except Exception:
+        return 3600
+    return max(60, watch_reason_code_summary_flush_interval_seconds)
+
+
+WATCH_REASON_CODE_SUMMARY_ENABLED = _read_reason_code_summary_enabled()
+WATCH_REASON_CODE_SUMMARY_FLUSH_INTERVAL_SECONDS = _read_reason_code_summary_flush_interval_seconds()
+WATCH_REASON_CODE_SUMMARY_SOURCE_EVENT_NAMES = {
+    "match_decision_trail",
+    "views_done",
+    "views_entity_miss",
+    "views_message_not_found",
+    "pending_expired",
+    "edited_other_detected",
+    "deleted_detected",
+}
+WATCH_REASON_CODE_SUMMARY_TRACE_EVENT_NAME = "watch_reason_code_summary"
+
+_WATCH_REASON_CODE_SUMMARY_LOCK = Lock()
+_WATCH_REASON_CODE_SUMMARY_PERIOD_STARTED_AT: str | None = None
+_WATCH_REASON_CODE_SUMMARY_TOTAL_EVENTS = 0
+_WATCH_REASON_CODE_SUMMARY_REASON_CODE_COUNTS: Counter[str] = Counter()
+_WATCH_REASON_CODE_SUMMARY_EVENT_REASON_CODE_COUNTS: Counter[str] = Counter()
+
+
+def _format_event_reason_code_key(event_name: str, reason_code_value: str) -> str:
+    return f"{event_name}:{reason_code_value}"
+
+
+def _sorted_counter_to_dictionary(source_counter: Counter[str]) -> dict[str, int]:
+    sorted_counter_items = sorted(source_counter.items(), key=lambda source_item: (-source_item[1], source_item[0]))
+    return {source_key: source_value for source_key, source_value in sorted_counter_items}
+
+
+def _record_reason_code_summary_event(event_name: str, event_payload: dict[str, Any]) -> None:
+    if event_name not in WATCH_REASON_CODE_SUMMARY_SOURCE_EVENT_NAMES:
+        return
+    reason_code_value = event_payload.get("reason_code")
+    if not isinstance(reason_code_value, str):
+        return
+    normalized_reason_code_value = reason_code_value.strip()
+    if not normalized_reason_code_value:
+        return
+
+    reason_code_event_key = _format_event_reason_code_key(event_name, normalized_reason_code_value)
+    with _WATCH_REASON_CODE_SUMMARY_LOCK:
+        global _WATCH_REASON_CODE_SUMMARY_PERIOD_STARTED_AT
+        global _WATCH_REASON_CODE_SUMMARY_TOTAL_EVENTS
+        if _WATCH_REASON_CODE_SUMMARY_PERIOD_STARTED_AT is None:
+            _WATCH_REASON_CODE_SUMMARY_PERIOD_STARTED_AT = _human(moscow_now())
+        _WATCH_REASON_CODE_SUMMARY_TOTAL_EVENTS += 1
+        _WATCH_REASON_CODE_SUMMARY_REASON_CODE_COUNTS[normalized_reason_code_value] += 1
+        _WATCH_REASON_CODE_SUMMARY_EVENT_REASON_CODE_COUNTS[reason_code_event_key] += 1
+
+
+def _consume_reason_code_summary_snapshot() -> dict[str, Any] | None:
+    period_finished_at = _human(moscow_now())
+    with _WATCH_REASON_CODE_SUMMARY_LOCK:
+        global _WATCH_REASON_CODE_SUMMARY_PERIOD_STARTED_AT
+        global _WATCH_REASON_CODE_SUMMARY_TOTAL_EVENTS
+        if _WATCH_REASON_CODE_SUMMARY_TOTAL_EVENTS <= 0:
+            if _WATCH_REASON_CODE_SUMMARY_PERIOD_STARTED_AT is None:
+                _WATCH_REASON_CODE_SUMMARY_PERIOD_STARTED_AT = period_finished_at
+            return None
+
+        period_started_at = _WATCH_REASON_CODE_SUMMARY_PERIOD_STARTED_AT or period_finished_at
+        total_reasoned_events = int(_WATCH_REASON_CODE_SUMMARY_TOTAL_EVENTS)
+        reason_code_counts = _sorted_counter_to_dictionary(_WATCH_REASON_CODE_SUMMARY_REASON_CODE_COUNTS)
+        event_reason_code_counts = _sorted_counter_to_dictionary(_WATCH_REASON_CODE_SUMMARY_EVENT_REASON_CODE_COUNTS)
+
+        _WATCH_REASON_CODE_SUMMARY_PERIOD_STARTED_AT = period_finished_at
+        _WATCH_REASON_CODE_SUMMARY_TOTAL_EVENTS = 0
+        _WATCH_REASON_CODE_SUMMARY_REASON_CODE_COUNTS.clear()
+        _WATCH_REASON_CODE_SUMMARY_EVENT_REASON_CODE_COUNTS.clear()
+
+    return {
+        "period_started_at": period_started_at,
+        "period_finished_at": period_finished_at,
+        "total_reasoned_events": total_reasoned_events,
+        "reason_code_counts": reason_code_counts,
+        "event_reason_code_counts": event_reason_code_counts,
+    }
 
 
 def _now_monotonic() -> float:
@@ -449,6 +756,7 @@ async def _views_worker():
                                         "message_id": msg_id,
                                         "views": 0,
                                         "status": "entity_miss",
+                                        "reason_code": watch_event_reason_codes.WATCH_EVENT_REASON_CODE_VIEWS_ENTITY_MISS,
                                     }
                                 ),
                             )
@@ -460,9 +768,26 @@ async def _views_worker():
                             watch_id=watch_id,
                             channel_id=channel_id,
                             message_id=msg_id,
+                            reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_VIEWS_ENTITY_MISS,
                         )
 
                 if msg is None:
+                    _pylog.warning(
+                        "views: get_messages returned no message (wid=%s cid=%s mid=%s sess=%s)",
+                        watch_id,
+                        channel_id,
+                        msg_id,
+                        session_name(cli),
+                    )
+                    _trace(
+                        "views_message_not_found",
+                        watch_id=watch_id,
+                        channel_id=channel_id,
+                        message_id=msg_id,
+                        matched_session=matched_session,
+                        session_used=session_name(cli),
+                        reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_VIEWS_MESSAGE_NOT_FOUND,
+                    )
                     continue
 
                 views = int(getattr(msg, "views", 0) or 0)
@@ -484,6 +809,7 @@ async def _views_worker():
                                 "channel_id": channel_id,
                                 "message_id": msg_id,
                                 "views": views,
+                                "reason_code": watch_event_reason_codes.WATCH_EVENT_REASON_CODE_VIEWS_COVERAGE_CHECK,
                             }
                         ),
                     )
@@ -494,6 +820,7 @@ async def _views_worker():
                         channel_id=channel_id,
                         message_id=msg_id,
                         views=views,
+                        reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_VIEWS_COVERAGE_CHECK,
                     )
                 except Exception:
                     _pylog.exception("views: mark_done_views failed (wid=%s)", watch_id)
@@ -524,7 +851,17 @@ async def _pending_expire_worker():
                     watch_events_db.insert_watch_event(
                         wid,
                         "expired",
-                        json.dumps({"watch_id": wid}),
+                        json.dumps(
+                            {
+                                "watch_id": wid,
+                                "reason_code": watch_event_reason_codes.WATCH_EVENT_REASON_CODE_PENDING_WINDOW_EXPIRED,
+                            }
+                        ),
+                    )
+                    _trace(
+                        "pending_expired",
+                        watch_id=wid,
+                        reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_PENDING_WINDOW_EXPIRED,
                     )
                     log.info("expire: wid=%s -> expired", wid)
                 except Exception:
@@ -543,6 +880,45 @@ async def _pending_expire_worker():
             _pylog.exception("pending-expire tick failed")
 
         await asyncio.sleep(COVERAGE_POLL_TICK_SEC)
+
+
+async def _reason_code_summary_worker():
+    if not WATCH_REASON_CODE_SUMMARY_ENABLED:
+        log.info("posts_watch_listener: reason-code summary worker disabled")
+        return
+
+    log.info(
+        "posts_watch_listener: reason-code summary worker started (tick=%ss)",
+        WATCH_REASON_CODE_SUMMARY_FLUSH_INTERVAL_SECONDS,
+    )
+    while True:
+        try:
+            await asyncio.sleep(WATCH_REASON_CODE_SUMMARY_FLUSH_INTERVAL_SECONDS)
+            reason_code_summary_payload = _consume_reason_code_summary_snapshot()
+            if not reason_code_summary_payload:
+                continue
+            _trace(
+                WATCH_REASON_CODE_SUMMARY_TRACE_EVENT_NAME,
+                **reason_code_summary_payload,
+            )
+            _pylog.info(
+                "reason-summary: period=(%s..%s) total=%s reasons=%s",
+                reason_code_summary_payload.get("period_started_at"),
+                reason_code_summary_payload.get("period_finished_at"),
+                reason_code_summary_payload.get("total_reasoned_events"),
+                reason_code_summary_payload.get("reason_code_counts"),
+            )
+        except asyncio.CancelledError:
+            reason_code_summary_payload = _consume_reason_code_summary_snapshot()
+            if reason_code_summary_payload:
+                _trace(
+                    WATCH_REASON_CODE_SUMMARY_TRACE_EVENT_NAME,
+                    **reason_code_summary_payload,
+                )
+            log.warning("reason-code summary worker cancelled")
+            break
+        except Exception:
+            _pylog.exception("reason-code summary worker tick failed")
 
 
 def _mark_done_edited_other(wid: int) -> str:
@@ -633,6 +1009,31 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             group_id = row.get("group_id")
             if not expected_html:
                 _pylog.warning("listen: wid=%s cid=%s mid=%s has no expected_html, skip", wid, cid, mid)
+                _trace(
+                    "match_skipped_missing_expected_html",
+                    watch_id=wid,
+                    channel_id=cid,
+                    message_id=mid,
+                    session=tag,
+                    reason=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_MISSING_EXPECTED_HTML,
+                    reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_MISSING_EXPECTED_HTML,
+                )
+                _trace_match_decision_trail(
+                    watch_id=wid,
+                    channel_id=cid,
+                    message_id=mid,
+                    session_name=tag,
+                    exact_html_match_succeeded=False,
+                    html_similarity_ratio=0.0,
+                    plain_text_similarity_ratio=0.0,
+                    similarity_threshold=CANDIDATE_SIM_THRESHOLD,
+                    similarity_threshold_passed=False,
+                    links_mismatch_detected=None,
+                    final_watch_status="skipped",
+                    reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_MISSING_EXPECTED_HTML,
+                    expected_links_values=[],
+                    actual_links_values=[],
+                )
                 continue
             _pylog.debug(
                 "listen: match_start wid=%s cid=%s mid=%s exp_len=%s links=%s tw=(%s,%s)",
@@ -648,6 +1049,10 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             expected_html_norm = expected_html
             ratio = 0.0
             ratio_text = 0.0
+            expected_plain_text_for_diagnostics = expected_html_norm or ""
+            actual_plain_text_for_diagnostics = msg_html_norm or ""
+            expected_links_for_diagnostics: list[str] = []
+            actual_links_for_diagnostics: list[str] = []
 
             try:
                 # Строга нормалізація: мінімальні правки (пробіл/перенос) не ігноруються.
@@ -658,6 +1063,14 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 _pylog.exception("listen: exact_html_equal failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
                 ok = False
             if ok:
+                try:
+                    expected_links_for_diagnostics = _collect_links_from_html(expected_html_norm)
+                except Exception:
+                    expected_links_for_diagnostics = []
+                try:
+                    actual_links_for_diagnostics = _collect_links_from_html(msg_html_norm)
+                except Exception:
+                    actual_links_for_diagnostics = []
                 _pylog.info(
                     "listen: exact_match wid=%s cid=%s mid=%s sess=%s exp_len=%s msg_len=%s",
                     wid,
@@ -673,6 +1086,23 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                     channel_id=cid,
                     message_id=mid,
                     session=tag,
+                    reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_EXACT_HTML_MATCH,
+                )
+                _trace_match_decision_trail(
+                    watch_id=wid,
+                    channel_id=cid,
+                    message_id=mid,
+                    session_name=tag,
+                    exact_html_match_succeeded=True,
+                    html_similarity_ratio=1.0,
+                    plain_text_similarity_ratio=1.0,
+                    similarity_threshold=CANDIDATE_SIM_THRESHOLD,
+                    similarity_threshold_passed=True,
+                    links_mismatch_detected=False,
+                    final_watch_status="matched",
+                    reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_EXACT_HTML_MATCH,
+                    expected_links_values=expected_links_for_diagnostics,
+                    actual_links_values=actual_links_for_diagnostics,
                 )
             _pylog.debug(
                 "similar_check: wid=%s cid=%s mid=%s ok=%s exp_len=%s msg_len=%s",
@@ -699,6 +1129,10 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 except Exception:
                     msg_plain = msg_html_norm
                     expected_plain = expected_html_norm
+                expected_links_for_diagnostics = list(exp_links_dbg)
+                actual_links_for_diagnostics = list(msg_links_dbg)
+                expected_plain_text_for_diagnostics = expected_plain or ""
+                actual_plain_text_for_diagnostics = msg_plain or ""
                 _pylog.debug(
                     "listen: no_exact wid=%s cid=%s mid=%s exp_links=%s msg_links=%s "
                     "exp_snip=%r msg_snip=%r plain_exp_snip=%r plain_msg_snip=%r",
@@ -744,6 +1178,8 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                         except Exception:
                             pass
                     cand_links = _collect_links_from_html(msg_html_norm)
+                    expected_links_for_diagnostics = list(exp_links)
+                    actual_links_for_diagnostics = list(cand_links)
 
                     links_mismatch = False
                     if exp_links and cand_links and sorted(exp_links) != sorted(cand_links):
@@ -764,6 +1200,8 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                     )
 
                     if links_mismatch:
+                        expected_links_for_diagnostics = list(exp_links)
+                        actual_links_for_diagnostics = list(cand_links)
                         try:
                             watch_proc_db.insert_watch_candidate(
                                 watch_id=wid,
@@ -785,7 +1223,8 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                                             "channel_id": cid,
                                             "message_id": mid,
                                             "similarity": ratio,
-                                            "reason": "links_mismatch",
+                                            "reason": watch_event_reason_codes.WATCH_EVENT_REASON_CODE_LINKS_MISMATCH,
+                                            "reason_code": watch_event_reason_codes.WATCH_EVENT_REASON_CODE_LINKS_MISMATCH,
                                         }
                                     ),
                                 )
@@ -799,8 +1238,35 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                                 message_id=mid,
                                 similarity=ratio,
                                 similarity_text=ratio_text,
+                                similarity_threshold=CANDIDATE_SIM_THRESHOLD,
+                                reason=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_LINKS_MISMATCH,
+                                reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_LINKS_MISMATCH,
                                 expected_links=exp_links,
                                 candidate_links=cand_links,
+                                **_build_match_diagnostics_payload(
+                                    expected_html_text=expected_html_norm or "",
+                                    actual_html_text=msg_html_norm or "",
+                                    expected_plain_text=expected_plain_text_for_diagnostics,
+                                    actual_plain_text=actual_plain_text_for_diagnostics,
+                                    expected_links_values=expected_links_for_diagnostics,
+                                    actual_links_values=actual_links_for_diagnostics,
+                                ),
+                            )
+                            _trace_match_decision_trail(
+                                watch_id=wid,
+                                channel_id=cid,
+                                message_id=mid,
+                                session_name=tag,
+                                exact_html_match_succeeded=False,
+                                html_similarity_ratio=ratio,
+                                plain_text_similarity_ratio=ratio_text,
+                                similarity_threshold=CANDIDATE_SIM_THRESHOLD,
+                                similarity_threshold_passed=True,
+                                links_mismatch_detected=True,
+                                final_watch_status="foreign",
+                                reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_LINKS_MISMATCH,
+                                expected_links_values=expected_links_for_diagnostics,
+                                actual_links_values=actual_links_for_diagnostics,
                             )
                         except Exception:
                             _pylog.exception("similar: insert foreign candidate failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
@@ -836,6 +1302,9 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                                             "message_id": mid,
                                             "similarity": ratio,
                                             "text_hash": text_hash,
+                                            "reason_code": (
+                                                watch_event_reason_codes.WATCH_EVENT_REASON_CODE_SIMILARITY_ABOVE_THRESHOLD
+                                            ),
                                         }
                                     ),
                                 )
@@ -849,10 +1318,87 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                                 message_id=mid,
                                 similarity=ratio,
                                 similarity_text=ratio_text,
+                                similarity_threshold=CANDIDATE_SIM_THRESHOLD,
                                 text_hash=text_hash,
+                                reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_SIMILARITY_ABOVE_THRESHOLD,
+                                **_build_match_diagnostics_payload(
+                                    expected_html_text=expected_html_norm or "",
+                                    actual_html_text=msg_html_norm or "",
+                                    expected_plain_text=expected_plain_text_for_diagnostics,
+                                    actual_plain_text=actual_plain_text_for_diagnostics,
+                                    expected_links_values=expected_links_for_diagnostics,
+                                    actual_links_values=actual_links_for_diagnostics,
+                                ),
+                            )
+                            _trace_match_decision_trail(
+                                watch_id=wid,
+                                channel_id=cid,
+                                message_id=mid,
+                                session_name=tag,
+                                exact_html_match_succeeded=False,
+                                html_similarity_ratio=ratio,
+                                plain_text_similarity_ratio=ratio_text,
+                                similarity_threshold=CANDIDATE_SIM_THRESHOLD,
+                                similarity_threshold_passed=True,
+                                links_mismatch_detected=False,
+                                final_watch_status="candidate",
+                                reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_SIMILARITY_ABOVE_THRESHOLD,
+                                expected_links_values=expected_links_for_diagnostics,
+                                actual_links_values=actual_links_for_diagnostics,
                             )
                         except Exception:
                             _pylog.exception("similar: insert_watch_candidate failed (wid=%s cid=%s mid=%s)", wid, cid, mid)
+                    else:
+                        candidate_seen_age_seconds = now_m - last_seen
+                        _pylog.info(
+                            "similar: wid=%s cid=%s mid=%s ratio=%.3f -> candidate_suppressed "
+                            "(duplicate within ttl age=%.1fs ttl=%ss)",
+                            wid,
+                            cid,
+                            mid,
+                            ratio,
+                            candidate_seen_age_seconds,
+                            CANDIDATE_SEEN_TTL,
+                        )
+                        _trace(
+                            "match_candidate_suppressed_duplicate_ttl",
+                            watch_id=wid,
+                            channel_id=cid,
+                            message_id=mid,
+                            session=tag,
+                            similarity=ratio,
+                            similarity_text=ratio_text,
+                            similarity_threshold=CANDIDATE_SIM_THRESHOLD,
+                            text_hash=text_hash,
+                            duplicate_seen_age_seconds=candidate_seen_age_seconds,
+                            duplicate_ttl_seconds=CANDIDATE_SEEN_TTL,
+                            reason=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_CANDIDATE_DUPLICATE_WITHIN_TTL,
+                            reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_CANDIDATE_DUPLICATE_WITHIN_TTL,
+                            **_build_match_diagnostics_payload(
+                                expected_html_text=expected_html_norm or "",
+                                actual_html_text=msg_html_norm or "",
+                                expected_plain_text=expected_plain_text_for_diagnostics,
+                                actual_plain_text=actual_plain_text_for_diagnostics,
+                                expected_links_values=expected_links_for_diagnostics,
+                                actual_links_values=actual_links_for_diagnostics,
+                            ),
+                        )
+                        _trace_match_decision_trail(
+                            watch_id=wid,
+                            channel_id=cid,
+                            message_id=mid,
+                            session_name=tag,
+                            exact_html_match_succeeded=False,
+                            html_similarity_ratio=ratio,
+                            plain_text_similarity_ratio=ratio_text,
+                            similarity_threshold=CANDIDATE_SIM_THRESHOLD,
+                            similarity_threshold_passed=True,
+                            links_mismatch_detected=False,
+                            final_watch_status="candidate_suppressed_duplicate",
+                            reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_CANDIDATE_DUPLICATE_WITHIN_TTL,
+                            expected_links_values=expected_links_for_diagnostics,
+                            actual_links_values=actual_links_for_diagnostics,
+                        )
                 else:
                     _pylog.info(
                         "listen: no_match wid=%s cid=%s mid=%s sess=%s ratio=%.3f ratio_text=%.3f reason=ratio_low",
@@ -868,9 +1414,36 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                         watch_id=wid,
                         channel_id=cid,
                         message_id=mid,
+                        session=tag,
                         similarity=ratio,
                         similarity_text=ratio_text,
-                        reason="ratio_low",
+                        similarity_threshold=CANDIDATE_SIM_THRESHOLD,
+                        reason=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_SIMILARITY_BELOW_THRESHOLD,
+                        reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_SIMILARITY_BELOW_THRESHOLD,
+                        **_build_match_diagnostics_payload(
+                            expected_html_text=expected_html_norm or "",
+                            actual_html_text=msg_html_norm or "",
+                            expected_plain_text=expected_plain_text_for_diagnostics,
+                            actual_plain_text=actual_plain_text_for_diagnostics,
+                            expected_links_values=expected_links_for_diagnostics,
+                            actual_links_values=actual_links_for_diagnostics,
+                        ),
+                    )
+                    _trace_match_decision_trail(
+                        watch_id=wid,
+                        channel_id=cid,
+                        message_id=mid,
+                        session_name=tag,
+                        exact_html_match_succeeded=False,
+                        html_similarity_ratio=ratio,
+                        plain_text_similarity_ratio=ratio_text,
+                        similarity_threshold=CANDIDATE_SIM_THRESHOLD,
+                        similarity_threshold_passed=False,
+                        links_mismatch_detected=None,
+                        final_watch_status="no_match",
+                        reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_SIMILARITY_BELOW_THRESHOLD,
+                        expected_links_values=expected_links_for_diagnostics,
+                        actual_links_values=actual_links_for_diagnostics,
                     )
                 continue
 
@@ -889,6 +1462,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                             "channel_id": cid,
                             "message_id": mid,
                             "session": matched_session,
+                            "reason_code": watch_event_reason_codes.WATCH_EVENT_REASON_CODE_EXACT_HTML_MATCH,
                         }
                     ),
                 )
@@ -1007,8 +1581,8 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             )
 
             now_str = _mark_done_edited_other(int(wid))
+            event_type = "edited_other" if wid in wids else "edited_candidate"
             try:
-                event_type = "edited_other" if wid in wids else "edited_candidate"
                 watch_events_db.insert_watch_event(
                     int(wid),
                     event_type,
@@ -1018,11 +1592,21 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                             "channel_id": cid,
                             "message_id": mid,
                             "edited_at": now_str,
+                            "reason_code": watch_event_reason_codes.WATCH_EVENT_REASON_CODE_EDIT_DETECTED,
                         }
                     ),
                 )
             except Exception:
                 pass
+            _trace(
+                "edited_other_detected",
+                watch_id=int(wid),
+                channel_id=cid,
+                message_id=mid,
+                event_type=event_type,
+                edited_at=now_str,
+                reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_EDIT_DETECTED,
+            )
 
             if wid not in wids and candidate_entries:
                 for c in candidate_entries:
@@ -1115,8 +1699,16 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                                 "watch_id": wid,
                                 "channel_id": cid,
                                 "message_id": int(mid),
+                                "reason_code": watch_event_reason_codes.WATCH_EVENT_REASON_CODE_MESSAGE_DELETED,
                             }
                         ),
+                    )
+                    _trace(
+                        "deleted_detected",
+                        watch_id=wid,
+                        channel_id=cid,
+                        message_id=int(mid),
+                        reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_MESSAGE_DELETED,
                     )
                     log.info("deleted: wid=%s cid=%s mid=%s -> deleted", wid, cid, mid)
                 except Exception:
@@ -1164,6 +1756,10 @@ def setup(client=None, control_peer=None, monitor_buffer=None, **_):
 
     loop.create_task(_pending_expire_worker(), name="posts_watch_expire_pending")
     log.info("posts_watch_listener: pending-expire worker scheduled")
+
+    if WATCH_REASON_CODE_SUMMARY_ENABLED:
+        loop.create_task(_reason_code_summary_worker(), name="posts_watch_reason_code_summary")
+        log.info("posts_watch_listener: reason-code summary worker scheduled")
 
     try:
         missing = watch_proc_db.list_pending_without_expected(limit=50)

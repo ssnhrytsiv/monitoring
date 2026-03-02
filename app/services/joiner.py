@@ -407,56 +407,10 @@ async def ensure_join(client, url: str):
             # Кешований too_many прив'язаний до інвайта, але це ліміт акаунта, тож його ігноруємо.
             if st == "too_many":
                 pass
-            elif st in ("invalid", "private", "requested", "requested_fast", "blocked"):
+            elif st in ("invalid", "blocked"):
                 cid_known, title_known = map_invite_get(invite_hash)
                 st_norm = _final_from_cache(st)
-                if st == "requested":
-                    st_norm = _requested_status()
                 log.debug("ensure_join(invite): cached status=%s(invite=%s cid=%s) -> %s", st, invite_hash, cid_known, st_norm)
-
-                # Якщо в кеші "requested"/"requested_fast", спробуємо перепитати CheckChatInvite на випадок,
-                # коли канал вже прийняв, щоб прибрати "заявку".
-                if st in ("requested", "requested_fast"):
-                    try:
-                        await throttle_invite()
-                        inv = await client(CheckChatInviteRequest(invite_hash))
-                        chat = getattr(inv, "chat", None)
-                        cid_new = int(getattr(chat, "id", 0) or 0) if chat else None
-                        title_new = getattr(chat, "title", None)
-                        if cid_new:
-                            try:
-                                map_invite_set(invite_hash, cid_new, title_new or None)
-                                log.debug(
-                                    "ensure_join(invite_cache): map_invite_set invite=%s cid=%s title=%r (%s->already)",
-                                    invite_hash,
-                                    cid_new,
-                                    title_new,
-                                    st,
-                                )
-                            except Exception:
-                                _log_exc("ensure_join: map_invite_set requested->already")
-                            try:
-                                invite_status_put(invite_hash, "already")
-                            except Exception:
-                                _log_exc("ensure_join: invite_status_put(already) recheck")
-                            log.info("ensure_join(invite): %s->already via recheck invite=%s cid=%s", st, invite_hash, cid_new)
-                            return "already", (title_new or title_known or None), "invite", cid_new, invite_hash
-                    except InviteRequestSentError:
-                        # все ще заявка, залишаємо requested/requested_fast
-                        pass
-                    except FloodWaitError as e:
-                        log.warning("ensure_join(invite): recheck FloodWait %ss", e.seconds)
-                    except Exception as e:
-                        msg = str(e)
-                        if "expired and is not valid anymore" in msg:
-                            try:
-                                invite_status_put(invite_hash, "invalid")
-                            except Exception:
-                                _log_exc("ensure_join: invite_status_put(invalid) recheck")
-                            log.info("ensure_join(invite): requested->invalid via recheck invite=%s", invite_hash)
-                            return "invalid", (title_known or None), "invite", None, invite_hash
-                        log.debug("ensure_join(invite): recheck failed invite=%s: %s", invite_hash, e)
-
                 if invite_hash:
                     log.debug(
                         "ensure_join(invite_cache): cached status=%s invite=%s cid=%s -> invite_map not updated",
@@ -465,6 +419,58 @@ async def ensure_join(client, url: str):
                         cid_known,
                     )
                 return st_norm, (title_known or None), "invite", (int(cid_known) if cid_known else None), invite_hash
+            elif st in ("requested", "requested_fast", "private"):
+                cid_known, title_known = map_invite_get(invite_hash)
+                st_norm = _final_from_cache(st)
+                if st == "requested":
+                    st_norm = _requested_status()
+                log.debug("ensure_join(invite): cached status=%s(invite=%s cid=%s) -> %s", st, invite_hash, cid_known, st_norm)
+
+                try:
+                    await throttle_invite()
+                    inv = await client(CheckChatInviteRequest(invite_hash))
+                    chat = getattr(inv, "chat", None)
+                    cid_new = int(getattr(chat, "id", 0) or 0) if chat else None
+                    title_new = getattr(chat, "title", None)
+                    if cid_new:
+                        try:
+                            map_invite_set(invite_hash, cid_new, title_new or None)
+                            log.debug(
+                                "ensure_join(invite_cache): map_invite_set invite=%s cid=%s title=%r (%s->already)",
+                                invite_hash,
+                                cid_new,
+                                title_new,
+                                st,
+                            )
+                        except Exception:
+                            _log_exc("ensure_join: map_invite_set requested->already")
+                        try:
+                            invite_status_put(invite_hash, "already")
+                        except Exception:
+                            _log_exc("ensure_join: invite_status_put(already) recheck")
+                        log.info("ensure_join(invite): %s->already via recheck invite=%s cid=%s", st, invite_hash, cid_new)
+                        return "already", (title_new or title_known or None), "invite", cid_new, invite_hash
+                except InviteRequestSentError:
+                    # Заявка ще pending; продовжимо до ImportChatInviteRequest, щоб повторно натиснути "request".
+                    pass
+                except FloodWaitError as e:
+                    log.warning("ensure_join(invite): recheck FloodWait %ss", e.seconds)
+                except Exception as e:
+                    msg = str(e)
+                    if "expired and is not valid anymore" in msg:
+                        try:
+                            invite_status_put(invite_hash, "invalid")
+                        except Exception:
+                            _log_exc("ensure_join: invite_status_put(invalid) recheck")
+                        log.info("ensure_join(invite): requested->invalid via recheck invite=%s", invite_hash)
+                        return "invalid", (title_known or None), "invite", None, invite_hash
+                    log.debug("ensure_join(invite): recheck failed invite=%s: %s", invite_hash, e)
+
+                log.debug(
+                    "ensure_join(invite): cached status=%s invite=%s -> continue with ImportChatInviteRequest",
+                    st_norm,
+                    invite_hash,
+                )
 
             # --- КРОК 1: реальна спроба приєднатися
             # Спершу легка перевірка інвайта без join: якщо вже є фінальний статус по channel_id,
@@ -781,18 +787,6 @@ async def ensure_join(client, url: str):
         log.debug("ensure_join(%s): invalid/expired/not_occupied", kind)
         return "invalid", None, kind, None, invite_hash
 
-    except Exception as e:
-        # Якщо маємо кешований requested і Telegram каже, що інвайт протух (CheckChatInviteRequest),
-        # відмічаємо як invalid, щоб не ходити по ньому знову.
-        if is_invite and invite_hash and "expired and is not valid anymore" in str(e):
-            try:
-                invite_status_put(invite_hash, "invalid")
-            except Exception:
-                _log_exc("ensure_join: invite_status_put(invalid) unexpected")
-            log.info("ensure_join(invite): expired -> invalid invite=%s", invite_hash)
-            return "invalid", None, "invite", None, invite_hash
-        raise
-
     except ChannelPrivateError:
         if is_invite and invite_hash:
             invite_status_put(invite_hash, "private")
@@ -813,6 +807,13 @@ async def ensure_join(client, url: str):
     except Exception as e:
         msg = str(e) if e else "error"
         kind = "invite" if is_invite else "public"
+        if is_invite and invite_hash and "expired and is not valid anymore" in msg:
+            try:
+                invite_status_put(invite_hash, "invalid")
+            except Exception:
+                _log_exc("ensure_join: invite_status_put(invalid) unexpected")
+            log.info("ensure_join(invite): expired -> invalid invite=%s", invite_hash)
+            return "invalid", None, "invite", None, invite_hash
         if "Too many channels" in msg or "CHANNELS_TOO_MUCH" in msg:
             log.warning("ensure_join(%s): too_many channels", kind)
             return "too_many", None, kind, None, invite_hash

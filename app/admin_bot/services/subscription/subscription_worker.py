@@ -243,7 +243,7 @@ async def process_batch(
                 st_inv = membership_db.invite_status_get(inv_hash)
             except Exception:
                 st_inv = None
-            if st_inv and st_inv not in ("requested", "requested_fast"):
+            if st_inv and st_inv not in ("requested", "requested_fast", "private"):
                 final_norm = "already" if st_inv == "joined" else st_inv
                 data = (final_norm, None, None, "invite_status", None)
                 _register_preknown(url, data)

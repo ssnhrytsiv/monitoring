@@ -124,7 +124,6 @@ class MemberStatus(Enum):
     MEMBER = "member"
     NOT_MEMBER = "not_member"
     TRANSIENT = "transient"
-    PRIVATE = "private"
     BLOCKED = "blocked"
     TOO_MANY = "too_many"
 
@@ -330,7 +329,12 @@ async def _is_member(client, channel_id: int) -> "MemberStatus":
                     sess, channel_id, e.seconds)
         return MemberStatus.TRANSIENT
     except errors.ChannelPrivateError:
-        return MemberStatus.PRIVATE
+        log.debug(
+            "[reconciler.requested] ChannelPrivateError (sess=%s, cid=%s) -> treat as pending",
+            sess,
+            channel_id,
+        )
+        return MemberStatus.NOT_MEMBER
     except errors.UserBannedInChannelError:
         return MemberStatus.BLOCKED
     except errors.ChannelsTooMuchError:
@@ -543,7 +547,7 @@ async def run_requested_reconciler() -> None:
                     for row in rows:
                         cid = row.channel_id
                         st = membership_db.get_membership(sess, cid)
-                        if st in ("joined", "already", "invalid", "private", "blocked", "too_many"):
+                        if st in ("joined", "already", "invalid", "blocked", "too_many"):
                             rdb.clear(sess, cid)
                             log.debug("[reconciler.requested] finalized via membership(%s,%s)=%s -> cleared", sess, cid, st)
                             await asyncio.sleep(_sleep_delay(INTER_DELAY_REQ))
@@ -574,14 +578,6 @@ async def run_requested_reconciler() -> None:
                             else:
                                 log.debug("[reconciler.requested] transient(cooldown); skip backoff sess=%s cid=%s",
                                           sess, cid)
-
-                        elif mstat is MemberStatus.PRIVATE:
-                            try:
-                                membership_db.upsert_membership(sess, cid, "private")
-                            except Exception:
-                                pass
-                            rdb.clear(sess, cid)
-                            log.debug("[reconciler.requested] terminal -> private; cleared (sess=%s, cid=%s)", sess, cid)
 
                         elif mstat is MemberStatus.BLOCKED:
                             try:

@@ -14,6 +14,7 @@ from app.notificator_bot.db.posts_watch_result_models import (
 )
 from app.DAL.watch_processing_operations import get_session_for_source_url as process_get_session_for_source_url
 from app.DAL.watch_events_operations import insert_watch_event
+from app.services import watch_event_reason_codes
 from app.admin_bot.db import models as m
 from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now
 
@@ -497,6 +498,7 @@ def manual_mark_matched(
                 "message_id": message_id,
                 "session": session_label,
                 "manual": bool(is_manual),
+                "reason_code": watch_event_reason_codes.WATCH_EVENT_REASON_CODE_MANUAL_MATCHED,
             }
         )
         insert_watch_event(

@@ -318,6 +318,57 @@ class SheetProjectArchive(Base):
     archived_at = Column(Text)
 
 
+class PlanningRequest(Base):
+    __tablename__ = "planning_requests"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    request_source = Column(Text, nullable=False)
+    request_kind = Column(Text, nullable=False)
+    source_query_text = Column(Text)
+    source_message_text = Column(Text)
+    source_message_id = Column(BigInteger)
+    telegram_user_id = Column(BigInteger)
+    telegram_username = Column(Text)
+    telegram_first_name = Column(Text)
+    telegram_last_name = Column(Text)
+    client_name = Column(Text)
+    administrator_name = Column(Text)
+    client_reference_number = Column(Text)
+    price_amount = Column(Integer)
+    posts_count = Column(Integer)
+    thousand_message_price = Column(Integer)
+    comment_text = Column(Text)
+    links_json = Column(Text, nullable=False, default="[]")
+    created_at = Column(Integer, nullable=False)
+    updated_at = Column(Integer, nullable=False)
+
+    __table_args__ = (
+        Index("idx_planning_requests_created_at", "created_at"),
+        Index("idx_planning_requests_telegram_user_id", "telegram_user_id"),
+        Index("idx_planning_requests_request_source", "request_source"),
+    )
+
+
+class PlanningRequestReceiverContext(Base):
+    __tablename__ = "planning_request_receiver_contexts"
+    __table_args__ = (
+        UniqueConstraint("receiver_chat_id", "order_message_id", name="uq_planning_request_receiver_context_message"),
+        Index("idx_planning_request_receiver_contexts_planning_request_id", "planning_request_id"),
+        Index("idx_planning_request_receiver_contexts_receiver_chat_id", "receiver_chat_id"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    planning_request_id = Column(Integer, nullable=True)
+    receiver_chat_id = Column(BigInteger, nullable=False)
+    order_message_id = Column(BigInteger, nullable=False)
+    administrator_name = Column(Text, nullable=True)
+    order_message_text = Column(Text, nullable=False)
+    order_links_json = Column(Text, nullable=False, default="[]")
+    is_added_to_schedule = Column(Integer, nullable=False, default=0)
+    created_at = Column(Integer, nullable=False)
+    updated_at = Column(Integer, nullable=False)
+
+
 # ------------------ Watch tracking (перенесено зі старого posts_watch_result_models) ------------------ #
 
 

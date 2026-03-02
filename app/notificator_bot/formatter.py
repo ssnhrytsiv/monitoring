@@ -23,6 +23,7 @@ def format_admin_message(
     total_views: int | None = None,
     post_title: str | None = None,
     group_id: int | None = None,
+    first_item_number: int = 1,
 ) -> str:
     """
     Формує текст повідомлення для одного адміна всередині проекту.
@@ -32,8 +33,8 @@ def format_admin_message(
         lines.append(f"<b>ID:</b> {group_id}")
     if post_title:
         lines.append(f"<b>Пост:</b> {post_title}")
-    for idx, line in enumerate(items, 1):
-        lines.append(f"{idx}) {line}")
+    for item_number, line in enumerate(items, max(1, int(first_item_number))):
+        lines.append(f"{item_number}) {line}")
     if total_views is not None:
         total_fmt = f"{total_views:,}".replace(",", " ")
     else:
