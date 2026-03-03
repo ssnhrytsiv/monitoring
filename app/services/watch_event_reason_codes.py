@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # Match decision reasons
 WATCH_EVENT_REASON_CODE_EXACT_HTML_MATCH = "exact_html_match"
+WATCH_EVENT_REASON_CODE_NEAR_EXACT_TEXT_LINKS_MATCH = "near_exact_text_links_match"
 WATCH_EVENT_REASON_CODE_SIMILARITY_ABOVE_THRESHOLD = "similarity_above_threshold"
 WATCH_EVENT_REASON_CODE_SIMILARITY_BELOW_THRESHOLD = "similarity_below_threshold"
 WATCH_EVENT_REASON_CODE_LINKS_MISMATCH = "links_mismatch"

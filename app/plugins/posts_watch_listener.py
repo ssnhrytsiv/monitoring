@@ -282,6 +282,7 @@ GLOBAL_DELETED_TTL = 180.0
 _GLOBAL_CANDIDATE_SEEN: Dict[tuple[int, int], float] = {}
 CANDIDATE_SEEN_TTL = 24 * 60 * 60  # 1 доба
 CANDIDATE_SIM_THRESHOLD = 0.70
+AUTO_MATCH_NEAR_EXACT_HTML_SIMILARITY_THRESHOLD = 0.901
 # Якщо текстові кандидат-пости схожі >= 0.99, вважаємо їх одним і тим самим кандидатам (не дублюємо).
 NEAR_IDENTICAL_TEXT_THRESHOLD = 0.99
 GROUP_NEAR_IDENTICAL_THRESHOLD = 0.95
@@ -1053,6 +1054,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
             actual_plain_text_for_diagnostics = msg_html_norm or ""
             expected_links_for_diagnostics: list[str] = []
             actual_links_for_diagnostics: list[str] = []
+            matched_reason_code = watch_event_reason_codes.WATCH_EVENT_REASON_CODE_EXACT_HTML_MATCH
 
             try:
                 # Строга нормалізація: мінімальні правки (пробіл/перенос) не ігноруються.
@@ -1086,7 +1088,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                     channel_id=cid,
                     message_id=mid,
                     session=tag,
-                    reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_EXACT_HTML_MATCH,
+                    reason_code=matched_reason_code,
                 )
                 _trace_match_decision_trail(
                     watch_id=wid,
@@ -1100,7 +1102,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                     similarity_threshold_passed=True,
                     links_mismatch_detected=False,
                     final_watch_status="matched",
-                    reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_EXACT_HTML_MATCH,
+                    reason_code=matched_reason_code,
                     expected_links_values=expected_links_for_diagnostics,
                     actual_links_values=actual_links_for_diagnostics,
                 )
@@ -1159,7 +1161,79 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                 except Exception:
                     ratio_text = 0.0
 
-                if ratio >= CANDIDATE_SIM_THRESHOLD or ratio_text >= CANDIDATE_SIM_THRESHOLD:
+                expected_links_for_auto_match = list(exp_links_dbg)
+                if not expected_links_for_auto_match and expected_links_json:
+                    try:
+                        expected_links_json_data = json.loads(expected_links_json)
+                        if isinstance(expected_links_json_data, list):
+                            expected_links_for_auto_match = [str(link_value) for link_value in expected_links_json_data if link_value]
+                    except Exception:
+                        pass
+                actual_links_for_auto_match = list(msg_links_dbg)
+                normalized_expected_links_for_auto_match = _normalize_links_for_match_diagnostics(expected_links_for_auto_match)
+                normalized_actual_links_for_auto_match = _normalize_links_for_match_diagnostics(actual_links_for_auto_match)
+
+                expected_links_for_diagnostics = list(normalized_expected_links_for_auto_match)
+                actual_links_for_diagnostics = list(normalized_actual_links_for_auto_match)
+
+                plain_texts_are_equal = expected_plain_text_for_diagnostics == actual_plain_text_for_diagnostics
+                links_are_equal = sorted(normalized_expected_links_for_auto_match) == sorted(normalized_actual_links_for_auto_match)
+                is_near_exact_auto_match = (
+                    ratio > AUTO_MATCH_NEAR_EXACT_HTML_SIMILARITY_THRESHOLD
+                    and plain_texts_are_equal
+                    and links_are_equal
+                )
+
+                if is_near_exact_auto_match:
+                    matched_reason_code = watch_event_reason_codes.WATCH_EVENT_REASON_CODE_NEAR_EXACT_TEXT_LINKS_MATCH
+                    _pylog.info(
+                        "listen: auto_match_near_exact wid=%s cid=%s mid=%s sess=%s ratio=%.3f ratio_text=%.3f",
+                        wid,
+                        cid,
+                        mid,
+                        tag,
+                        ratio,
+                        ratio_text,
+                    )
+                    _trace(
+                        "match_auto_matched_near_exact",
+                        watch_id=wid,
+                        channel_id=cid,
+                        message_id=mid,
+                        session=tag,
+                        similarity=ratio,
+                        similarity_text=ratio_text,
+                        similarity_threshold=AUTO_MATCH_NEAR_EXACT_HTML_SIMILARITY_THRESHOLD,
+                        plain_texts_equal=plain_texts_are_equal,
+                        links_equal=links_are_equal,
+                        reason_code=matched_reason_code,
+                        **_build_match_diagnostics_payload(
+                            expected_html_text=expected_html_norm or "",
+                            actual_html_text=msg_html_norm or "",
+                            expected_plain_text=expected_plain_text_for_diagnostics,
+                            actual_plain_text=actual_plain_text_for_diagnostics,
+                            expected_links_values=expected_links_for_diagnostics,
+                            actual_links_values=actual_links_for_diagnostics,
+                        ),
+                    )
+                    _trace_match_decision_trail(
+                        watch_id=wid,
+                        channel_id=cid,
+                        message_id=mid,
+                        session_name=tag,
+                        exact_html_match_succeeded=False,
+                        html_similarity_ratio=ratio,
+                        plain_text_similarity_ratio=ratio_text,
+                        similarity_threshold=AUTO_MATCH_NEAR_EXACT_HTML_SIMILARITY_THRESHOLD,
+                        similarity_threshold_passed=True,
+                        links_mismatch_detected=False,
+                        final_watch_status="matched",
+                        reason_code=matched_reason_code,
+                        expected_links_values=expected_links_for_diagnostics,
+                        actual_links_values=actual_links_for_diagnostics,
+                    )
+                    ok = True
+                elif ratio >= CANDIDATE_SIM_THRESHOLD or ratio_text >= CANDIDATE_SIM_THRESHOLD:
                     _pylog.debug(
                         "listen: fuzzy_candidate wid=%s cid=%s mid=%s ratio=%.3f ratio_text=%.3f",
                         wid,
@@ -1445,7 +1519,8 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                         expected_links_values=expected_links_for_diagnostics,
                         actual_links_values=actual_links_for_diagnostics,
                     )
-                continue
+                if not is_near_exact_auto_match:
+                    continue
 
             # exact match пройшов — фіксуємо matched
             coverage_at = _calc_coverage_at()
@@ -1462,7 +1537,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                             "channel_id": cid,
                             "message_id": mid,
                             "session": matched_session,
-                            "reason_code": watch_event_reason_codes.WATCH_EVENT_REASON_CODE_EXACT_HTML_MATCH,
+                            "reason_code": matched_reason_code,
                         }
                     ),
                 )
