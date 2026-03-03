@@ -48,12 +48,17 @@ except Exception:
 log = get_logger("plugin.posts_watch_listener")
 _pylog = logging.getLogger("plugin.posts_watch_listener")
 trace_logger = logging.getLogger("plugin.posts_watch_trace")
+WATCH_TRACE_LOG_PATH = str(os.getenv("WATCH_TRACE_LOG_PATH", "logs/posts_watch_trace_v2.log") or "").strip()
+if not WATCH_TRACE_LOG_PATH:
+    WATCH_TRACE_LOG_PATH = "logs/posts_watch_trace_v2.log"
 if not trace_logger.handlers:
     try:
-        os.makedirs("logs", exist_ok=True)
+        trace_log_directory_path = os.path.dirname(WATCH_TRACE_LOG_PATH)
+        if trace_log_directory_path:
+            os.makedirs(trace_log_directory_path, exist_ok=True)
     except Exception:
         pass
-    handler = logging.FileHandler("logs/posts_watch_trace.log", encoding="utf-8")
+    handler = logging.FileHandler(WATCH_TRACE_LOG_PATH, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(message)s"))
     trace_logger.addHandler(handler)
     trace_logger.setLevel(logging.INFO)

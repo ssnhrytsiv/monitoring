@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter
+import os
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -14,7 +15,8 @@ def parse_command_line_arguments() -> argparse.Namespace:
     )
     argument_parser.add_argument(
         "--trace",
-        default="logs/posts_watch_trace.log",
+        default=str(os.getenv("WATCH_TRACE_LOG_PATH", "logs/posts_watch_trace_v2.log") or "").strip()
+        or "logs/posts_watch_trace_v2.log",
         help="Path to posts watch trace log file (JSON per line).",
     )
     argument_parser.add_argument(
