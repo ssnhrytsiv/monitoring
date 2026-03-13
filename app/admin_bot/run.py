@@ -32,7 +32,7 @@ async def run_admin_bot():
     log.info("Admin bot starting polling…")
     while True:
         try:
-            await dp.start_polling(bot)
+            await dp.start_polling(bot, handle_signals=False)
             break
         except TelegramNetworkError as e:
             log.warning("Admin bot polling network error: %s; retrying in 5s", e)

@@ -21,7 +21,7 @@ async def start_planning_bot():
 
     while True:
         try:
-            await dp.start_polling(bot)
+            await dp.start_polling(bot, handle_signals=False)
             break
         except TelegramUnauthorizedError:
             log.error("planning_bot unauthorized: invalid or revoked PLANNING_BOT_TOKEN; bot stopped")

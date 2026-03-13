@@ -205,6 +205,36 @@ async def _main():
     except Exception:
         log.exception("Main loop error")
     finally:
+        shutdown_t0 = time.perf_counter()
+        log.warning("Shutdown sequence started")
+
+        async def _cancel_named_task(task: asyncio.Task | None, name: str) -> None:
+            if not task:
+                log.debug("shutdown: skip %s (task is None)", name)
+                return
+            if task.done():
+                log.info("shutdown: %s already done", name)
+                try:
+                    exc = task.exception()
+                except asyncio.CancelledError:
+                    log.debug("shutdown: %s already cancelled", name)
+                    return
+                except Exception:
+                    log.exception("shutdown: %s done-state inspection failed", name)
+                    return
+                if exc:
+                    log.warning("shutdown: %s already finished with error: %s", name, exc)
+                return
+
+            log.info("shutdown: cancelling %s...", name)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                log.info("shutdown: %s cancelled", name)
+            except Exception:
+                log.exception("shutdown: %s finished with error after cancel", name)
+
         for t, name in (
             (bot_task, "Bot UI"),
             (forward_bot_task, "Forward bot"),
@@ -212,46 +242,39 @@ async def _main():
             (planning_bot_task, "Planning bot"),
             (admin_bot_task, "Admin bot"),
         ):
-            if not t:
-                continue
-            log.info("Зупиняю %s…", name)
-            t.cancel()
-            try:
-                await t
-            except asyncio.CancelledError:
-                log.debug("%s task cancelled", name)
-            except Exception:
-                log.exception("%s task finished with error", name)
+            await _cancel_named_task(t, name)
 
         if exporter_task:
-            log.info("Зупиняю експортер каналів…")
+            log.info("shutdown: stopping channels exporter...")
             try:
                 await stop_channels_exporter()
+                log.info("shutdown: channels exporter stopped")
             except Exception:
-                log.exception("Channels exporter stop failed")
+                log.exception("shutdown: channels exporter stop failed")
 
         if reconciler_task:
-            log.info("Зупиняю reconciler…")
-            reconciler_task.cancel()
-            try:
-                await reconciler_task
-            except asyncio.CancelledError:
-                log.debug("Reconciler task cancelled")
-            except Exception:
-                log.exception("Reconciler task finished with error")
+            await _cancel_named_task(reconciler_task, "Reconciler")
 
-        log.info("Зупиняю пул акаунтів…")
+        log.info("shutdown: stopping account pool...")
         try:
             await stop_pool()
+            log.info("shutdown: account pool stopped")
         except Exception:
-            log.exception("stop_pool() failed")
+            log.exception("shutdown: stop_pool() failed")
 
-        log.info("Від'єдную головний клієнт…")
+        log.info("shutdown: disconnecting main client...")
         try:
             await client.disconnect()
+            log.info("shutdown: main client disconnected")
         except Exception:
-            log.exception("client.disconnect() failed")
+            log.exception("shutdown: client.disconnect() failed")
+
+        log.warning("Shutdown sequence completed in %.3fs", time.perf_counter() - shutdown_t0)
 
 
 if __name__ == "__main__":
-    asyncio.run(_main())
+    try:
+        asyncio.run(_main())
+    except KeyboardInterrupt:
+        # Second Ctrl+C during graceful shutdown should terminate quietly
+        pass

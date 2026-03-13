@@ -39,7 +39,7 @@ async def start_forward_bot():
     dp.message.register(on_any_message)
 
     log.info("Relay bot started, forwarding to chat_id=%s", TARGET_CHAT_ID)
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, handle_signals=False)
 
 
 def main():

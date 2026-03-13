@@ -24,6 +24,9 @@ async def _worker(bot: Bot):
     while True:
         try:
             await send_notifications(bot, debounce_sec=30)
+        except asyncio.CancelledError:
+            log.info("notifier worker cancelled")
+            raise
         except Exception:
             log.exception("notifier tick failed")
         await asyncio.sleep(max(1, NOTIFIER_POLL_INTERVAL_SEC))
@@ -44,6 +47,13 @@ async def start_notificator_bot():
         F.data.startswith(f"{NOTIFICATION_PAGE_CALLBACK_PREFIX}:"),
     )
 
-    asyncio.create_task(_worker(bot), name="notifier_worker")
+    worker_task = asyncio.create_task(_worker(bot), name="notifier_worker")
     log.info("Notifier bot started (interval=%ss)", NOTIFIER_POLL_INTERVAL_SEC)
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot, handle_signals=False)
+    finally:
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass

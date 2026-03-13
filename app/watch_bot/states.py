@@ -10,6 +10,7 @@ class CreateWatch(StatesGroup):
     network_pick = State()
     channel_input = State()
     template_pick = State()
+    day_pick = State()
     time_window = State()
     confirm = State()
     project_pick = State()

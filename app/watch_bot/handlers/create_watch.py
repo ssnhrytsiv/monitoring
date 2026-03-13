@@ -5,6 +5,7 @@ import logging
 import json
 import math
 import html
+from datetime import timedelta, date
 from difflib import SequenceMatcher
 
 from aiogram import Router, F
@@ -18,6 +19,9 @@ from app.DAL import sheet_projects_operations as spo
 from app.DAL import post_templates_operations as post_watch_db
 from app.DAL import watch_posts_operations as watch_posts_db
 from app.DAL import watch_events_operations as watch_events_db
+from app.DAL.channel_subscription_audit_operations import (
+    count_missing_channels_for_all_admins,
+)
 from app.sheet_bot.services import gsheets_writer as gsw
 from app.sheet_bot.services import gsheets_buffer as gsb
 from app.watch_bot.keyboards import main_menu_kb, back_to_menu_kb, yes_no_kb, templates_kb
@@ -193,6 +197,42 @@ def _project_kb(prefix: str):
                 InlineKeyboardButton(text="PATRON", callback_data=f"{prefix}:PATRON"),
                 InlineKeyboardButton(text="EXPRESS", callback_data=f"{prefix}:EXPRESS"),
             ]
+        ]
+    )
+
+
+def _parse_iso_date(value: str) -> Optional[date]:
+    try:
+        return date.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def _watch_day_kb() -> InlineKeyboardMarkup:
+    now = msk_now()
+    d1 = (now + timedelta(days=1)).date()
+    d2 = (now + timedelta(days=2)).date()
+    d3 = (now + timedelta(days=3)).date()
+    rows = [
+        [
+            InlineKeyboardButton(text=f"Завтра • {d1.strftime('%d.%m')}", callback_data=f"watch_day:{d1.isoformat()}"),
+            InlineKeyboardButton(text=f"Послезавтра • {d2.strftime('%d.%m')}", callback_data=f"watch_day:{d2.isoformat()}"),
+            InlineKeyboardButton(text=d3.strftime("%d.%m"), callback_data=f"watch_day:{d3.isoformat()}"),
+        ],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _watch_time_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="17:00", callback_data="watch_time:17:00"),
+                InlineKeyboardButton(text="19:00", callback_data="watch_time:19:00"),
+                InlineKeyboardButton(text="21:00", callback_data="watch_time:21:00"),
+            ],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")],
         ]
     )
 
@@ -504,6 +544,18 @@ async def menu_home(cb: CallbackQuery, state: FSMContext):
         await cb.message.edit_text("Меню:", reply_markup=main_menu_kb())
     except TelegramBadRequest:
         await cb.message.answer("Меню:", reply_markup=main_menu_kb())
+
+
+@router.callback_query(F.data == "menu:missing_channels")
+async def menu_missing_channels(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    total_missing_channels_count = count_missing_channels_for_all_admins()
+    response_text = f"Missing к-сть каналів: {total_missing_channels_count}"
+    try:
+        await cb.message.edit_text(response_text, reply_markup=main_menu_kb())
+    except TelegramBadRequest:
+        await cb.message.answer(response_text, reply_markup=main_menu_kb())
+    await cb.answer()
 
 
 @router.callback_query(F.data == "menu:sheet_mgmt")
@@ -822,10 +874,10 @@ async def step_template_pick_manual(m: Message, state: FSMContext):
             tpl_meta = post_watch_db.get_template_by_id(int(direct_id))
             tpl_title = tpl_meta[5] if tpl_meta else None
             await state.update_data(template_id=direct_id, template_title=tpl_title)
-            await state.set_state(CreateWatch.time_window)
+            await state.set_state(CreateWatch.day_pick)
             await m.answer(
-                "Вкажи час закінчення вікна СЬОГОДНІ у форматі HH:MM, наприклад 23:30.",
-                reply_markup=back_to_menu_kb()
+                "Обери день закінчення вікна:",
+                reply_markup=_watch_day_kb(),
             )
             return
 
@@ -839,54 +891,111 @@ async def step_template_pick_manual(m: Message, state: FSMContext):
         return
 
     await state.update_data(template_id=tid, template_title=tpl_title)
-    await state.set_state(CreateWatch.time_window)
+    await state.set_state(CreateWatch.day_pick)
     await m.answer(
-        f"Шаблон додано (id={tid}). Вкажи час закінчення вікна СЬОГОДНІ у форматі HH:MM, наприклад 23:30.",
-        reply_markup=back_to_menu_kb()
+        f"Шаблон додано (id={tid}). Обери день закінчення вікна:",
+        reply_markup=_watch_day_kb(),
     )
 
 
-@router.message(CreateWatch.time_window)
-async def step_time_window(m: Message, state: FSMContext):
-    text = (m.text or "").strip()
-    m_time = re.fullmatch(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", text)
-    if not m_time:
-        await m.answer("Введи час у форматі HH:MM, наприклад 23:30.")
+@router.callback_query(CreateWatch.day_pick, F.data.startswith("watch_day:"))
+async def step_day_pick(cb: CallbackQuery, state: FSMContext):
+    selected_day_raw = cb.data.split("watch_day:", 1)[1].strip()
+    selected_day = _parse_iso_date(selected_day_raw)
+    now = msk_now()
+    if not selected_day:
+        await cb.answer("Невірна дата", show_alert=True)
+        return
+    if selected_day <= now.date():
+        await cb.answer("Оберіть майбутню дату", show_alert=True)
         return
 
+    await state.update_data(selected_day=selected_day.isoformat())
+    await state.set_state(CreateWatch.time_window)
+    await cb.message.edit_text(
+        f"Обрано день: {selected_day.strftime('%d.%m.%Y')}\n"
+        "Обери час кнопкою або введи вручну у форматі HH:MM.",
+        reply_markup=_watch_time_kb(),
+    )
+    await cb.answer()
+
+
+def _parse_time_parts(text: str) -> tuple[int, int, int] | None:
+    m_time = re.fullmatch(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", (text or "").strip())
+    if not m_time:
+        return None
     h = _try_int(m_time.group(1))
     mi = _try_int(m_time.group(2))
     s = _try_int(m_time.group(3) or "0")
-    if h is None or mi is None or s is None or not (0 <= h <= 23) or not (0 <= mi <= 59) or not (0 <= s <= 59):
-        await m.answer("Невірний час. Приклад: 23:30.")
-        return
+    if h is None or mi is None or s is None:
+        return None
+    if not (0 <= h <= 23 and 0 <= mi <= 59 and 0 <= s <= 59):
+        return None
+    return h, mi, s
+
+
+async def _process_time_window_value(
+    *,
+    state: FSMContext,
+    time_text: str,
+    respond: Callable[..., Any],
+) -> bool:
+    parsed = _parse_time_parts(time_text)
+    if not parsed:
+        await respond(
+            "Введи час у форматі HH:MM (або обери кнопку нижче).",
+            reply_markup=_watch_time_kb(),
+        )
+        return False
+    h, mi, _ = parsed
 
     now = msk_now()
+    data = await state.get_data()
+    selected_day = _parse_iso_date(str(data.get("selected_day") or ""))
+    if not selected_day:
+        selected_day = now.date()
 
-    # НОРМАЛІЗАЦІЯ: вікно "до HH:MM" → завжди секунда = 0
-    tw_end_dt = now.replace(hour=h, minute=mi, second=0, microsecond=0)
+    tw_end_dt = now.replace(
+        year=selected_day.year,
+        month=selected_day.month,
+        day=selected_day.day,
+        hour=h,
+        minute=mi,
+        second=0,
+        microsecond=0,
+    )
 
     if tw_end_dt <= now:
-        await m.answer("Час закінчення має бути пізніше за поточний. Вкажи інший час.")
-        return
+        await respond(
+            f"Для дати {selected_day.strftime('%d.%m.%Y')} час має бути пізніше за поточний момент. "
+            "Вкажи інший час.",
+            reply_markup=_watch_time_kb(),
+        )
+        return False
 
     delta = tw_end_dt - now
     mins = int(delta.total_seconds() // 60)
     if mins <= 0:
-        await m.answer("Вікно має бути хоча б кілька хвилин. Вкажи інший час.")
-        return
+        await respond(
+            "Вікно має бути хоча б кілька хвилин. Вкажи інший час.",
+            reply_markup=_watch_time_kb(),
+        )
+        return False
 
-    tw_start_dt = now
-
-    tw_start = tw_start_dt.strftime("%Y-%m-%d %H:%M:%S")
+    tw_start = now.strftime("%Y-%m-%d %H:%M:%S")
     tw_end = tw_end_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    data = await state.get_data()
     targets: List[str] = data.get("targets") or []
     tid = data.get("template_id")
     tpl_title = data.get("template_title")
 
-    await state.update_data(time_window_start=tw_start, time_window_end=tw_end, mins=mins)
+    await state.update_data(
+        selected_day=selected_day.isoformat(),
+        selected_time=f"{h:02d}:{mi:02d}",
+        time_window_start=tw_start,
+        time_window_end=tw_end,
+        mins=mins,
+    )
 
     cids: List[int] = []
     for t in targets:
@@ -958,11 +1067,37 @@ async def step_time_window(m: Message, state: FSMContext):
             ]
         ]
     )
-    await m.answer(
+    await respond(
         txt + "\nОбери проєкт:",
         reply_markup=kb,
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
+    return True
+
+
+@router.message(CreateWatch.time_window)
+async def step_time_window(m: Message, state: FSMContext):
+    await _process_time_window_value(
+        state=state,
+        time_text=(m.text or "").strip(),
+        respond=m.answer,
+    )
+
+
+@router.callback_query(CreateWatch.time_window, F.data.startswith("watch_time:"))
+async def step_time_window_button_pick(cb: CallbackQuery, state: FSMContext):
+    time_text = cb.data.split("watch_time:", 1)[1].strip()
+    is_success = await _process_time_window_value(
+        state=state,
+        time_text=time_text,
+        respond=cb.message.answer,
+    )
+    if is_success:
+        try:
+            await cb.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    await cb.answer()
 
 
 @router.callback_query(CreateWatch.project_pick, F.data.startswith("watch_proj:"))
