@@ -1,11 +1,29 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+from app.DAL.channel_subscription_audit_operations import (
+    count_missing_channels_for_all_admins,
+)
+
+
+def _get_total_missing_channels_count_for_menu() -> int:
+    try:
+        return max(0, int(count_missing_channels_for_all_admins()))
+    except Exception:
+        return 0
+
 
 def main_menu_kb():
+    total_missing_channels_count = _get_total_missing_channels_count_for_menu()
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Додати watch", callback_data="menu:add_watch")],
         [InlineKeyboardButton(text="➕ Додати watch (сітка)", callback_data="menu:add_watch_net")],
         [InlineKeyboardButton(text="📋 Мої активні watch", callback_data="menu:list_active")],
+        [
+            InlineKeyboardButton(
+                text=f"Missing к-сть каналів ({total_missing_channels_count})",
+                callback_data="menu:missing_channels",
+            )
+        ],
         [InlineKeyboardButton(text="🧩 Шаблони постів", callback_data="menu:list_templates")],
         [InlineKeyboardButton(text="📑 Управління таблицями", callback_data="menu:sheet_mgmt")],
     ])

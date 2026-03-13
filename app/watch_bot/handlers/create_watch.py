@@ -210,14 +210,14 @@ def _parse_iso_date(value: str) -> Optional[date]:
 
 def _watch_day_kb() -> InlineKeyboardMarkup:
     now = msk_now()
+    d0 = now.date()
     d1 = (now + timedelta(days=1)).date()
     d2 = (now + timedelta(days=2)).date()
-    d3 = (now + timedelta(days=3)).date()
     rows = [
         [
+            InlineKeyboardButton(text="Сьогодні", callback_data=f"watch_day:{d0.isoformat()}"),
             InlineKeyboardButton(text=f"Завтра • {d1.strftime('%d.%m')}", callback_data=f"watch_day:{d1.isoformat()}"),
-            InlineKeyboardButton(text=f"Послезавтра • {d2.strftime('%d.%m')}", callback_data=f"watch_day:{d2.isoformat()}"),
-            InlineKeyboardButton(text=d3.strftime("%d.%m"), callback_data=f"watch_day:{d3.isoformat()}"),
+            InlineKeyboardButton(text=f"Післязавтра • {d2.strftime('%d.%m')}", callback_data=f"watch_day:{d2.isoformat()}"),
         ],
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")],
     ]
@@ -906,8 +906,8 @@ async def step_day_pick(cb: CallbackQuery, state: FSMContext):
     if not selected_day:
         await cb.answer("Невірна дата", show_alert=True)
         return
-    if selected_day <= now.date():
-        await cb.answer("Оберіть майбутню дату", show_alert=True)
+    if selected_day < now.date():
+        await cb.answer("Оберіть сьогодні або майбутню дату", show_alert=True)
         return
 
     await state.update_data(selected_day=selected_day.isoformat())

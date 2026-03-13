@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import html
 from typing import List, Optional, Set, Dict
 from types import SimpleNamespace
 
@@ -75,6 +76,66 @@ def _resolve_channel_id(url: str) -> Optional[int]:
         return None
     finally:
         db.close()
+
+
+def _build_normalized_link_key_set(link_value: Optional[str]) -> Set[str]:
+    normalized_link_key_set: Set[str] = set()
+    if not link_value:
+        return normalized_link_key_set
+    try:
+        sanitized_link_value = sanitize_link(link_value) or link_value
+    except Exception:
+        sanitized_link_value = link_value
+
+    for link_candidate in (link_value, sanitized_link_value):
+        if not link_candidate:
+            continue
+        for normalized_link_key in collect_norm_keys(link_candidate):
+            if normalized_link_key:
+                normalized_link_key_set.add(normalized_link_key)
+    return normalized_link_key_set
+
+
+def _collect_pre_refresh_normalized_link_keys_by_channel_identifier(
+    database_session,
+    channel_identifier_set: Set[int],
+) -> Dict[int, Set[str]]:
+    normalized_link_keys_by_channel_identifier: Dict[int, Set[str]] = {}
+    if not channel_identifier_set:
+        return normalized_link_keys_by_channel_identifier
+
+    link_rows = database_session.execute(
+        select(m.Link.channel_id, m.Link.raw_url).where(
+            m.Link.channel_id.in_(list(channel_identifier_set))
+        )
+    ).all()
+    for channel_identifier, raw_link_value in link_rows:
+        if channel_identifier is None:
+            continue
+        normalized_link_key_set = _build_normalized_link_key_set(raw_link_value)
+        if not normalized_link_key_set:
+            continue
+        normalized_link_keys_by_channel_identifier.setdefault(
+            int(channel_identifier), set()
+        ).update(normalized_link_key_set)
+
+    invite_rows = database_session.execute(
+        select(m.InviteMap.channel_id, m.InviteMap.invite_hash).where(
+            m.InviteMap.channel_id.in_(list(channel_identifier_set))
+        )
+    ).all()
+    for channel_identifier, invite_hash_value in invite_rows:
+        if channel_identifier is None or not invite_hash_value:
+            continue
+        invite_link_value = f"https://t.me/+{invite_hash_value}"
+        normalized_link_key_set = _build_normalized_link_key_set(invite_link_value)
+        if not normalized_link_key_set:
+            continue
+        normalized_link_keys_by_channel_identifier.setdefault(
+            int(channel_identifier), set()
+        ).update(normalized_link_key_set)
+
+    return normalized_link_keys_by_channel_identifier
 
 
 async def _cleanup_removed_channels(admin: m.Admin, chan_ids: Set[int]) -> Dict[str, int]:
@@ -300,6 +361,12 @@ async def refresh_channels_for_admin(
     if net_chan_ids:
         current_cids |= set(net_chan_ids)
     conflict_clear_cids: Set[int] = set()
+    pre_refresh_normalized_link_keys_by_channel_identifier = (
+        _collect_pre_refresh_normalized_link_keys_by_channel_identifier(
+            database_session=db,
+            channel_identifier_set=current_cids,
+        )
+    )
 
     added = link_queue.enqueue(
         urls,
@@ -459,9 +526,14 @@ async def refresh_channels_for_admin(
 
     # --- Формуємо список усіх отриманих каналів зі статусами ---
     status_lines: List[str] = ["📋 Обновление списка каналов"]
+    status_detail_lines: List[str] = []
     dao = MembershipDAO(db)
-    if no_cid_resolution:
-        status_lines.append("⚠️ Не вдалося визначити channel_id за новими посиланнями; відписка пропущена, показуємо статуси за кешем.")
+    resolved_channel_identifier_set: Set[int] = set()
+    resolved_existing_channel_identifier_set: Set[int] = set()
+    resolved_new_channel_identifier_set: Set[int] = set()
+    known_channel_with_new_link_data_by_channel_identifier: Dict[int, tuple[str, str]] = {}
+    unresolved_input_link_value_list: List[str] = []
+    unresolved_input_link_value_set: Set[str] = set()
 
     for idx, url in enumerate(urls, start=1):
         status_raw = None
@@ -580,11 +652,47 @@ async def refresh_channels_for_admin(
                     session_hint = dao.get_any_session_for_channel(int(cid))
                 except Exception:
                     session_hint = None
+        normalized_input_link_key_set = _build_normalized_link_key_set(clean or url)
+        if cid:
+            normalized_channel_identifier = int(cid)
+            resolved_channel_identifier_set.add(normalized_channel_identifier)
+            if normalized_channel_identifier in current_cids:
+                resolved_existing_channel_identifier_set.add(normalized_channel_identifier)
+                existing_normalized_link_key_set = (
+                    pre_refresh_normalized_link_keys_by_channel_identifier.get(
+                        normalized_channel_identifier, set()
+                    )
+                )
+                if (
+                    normalized_input_link_key_set
+                    and normalized_input_link_key_set.isdisjoint(
+                        existing_normalized_link_key_set
+                    )
+                    and normalized_channel_identifier
+                    not in known_channel_with_new_link_data_by_channel_identifier
+                ):
+                    known_channel_with_new_link_data_by_channel_identifier[
+                        normalized_channel_identifier
+                    ] = (
+                        str(title or normalized_channel_identifier),
+                        str(clean or url or normalized_channel_identifier),
+                    )
+            else:
+                resolved_new_channel_identifier_set.add(normalized_channel_identifier)
+        else:
+            unresolved_input_link_value = str(clean or url or "").strip()
+            if (
+                unresolved_input_link_value
+                and unresolved_input_link_value
+                not in unresolved_input_link_value_set
+            ):
+                unresolved_input_link_value_set.add(unresolved_input_link_value)
+                unresolved_input_link_value_list.append(unresolved_input_link_value)
         human = _human_status(status_raw, session_hint)
 
         title_txt = title or clean or url or "невідомо"
         href = clean or url
-        status_lines.append(f"{idx}. <a href=\"{href}\">{title_txt}</a> — {human}")
+        status_detail_lines.append(f"{idx}. <a href=\"{href}\">{title_txt}</a> — {human}")
 
     if conflict_clear_cids:
         try:
@@ -592,6 +700,69 @@ async def refresh_channels_for_admin(
             db.commit()
         except Exception:
             pass
+
+    if unresolved_input_link_value_list:
+        no_cid_resolution = True
+        keep_cids |= set(current_cids)
+
+    status_lines.append(
+        f"Сверка ссылок: {len(urls)}"
+    )
+    status_lines.append(
+        f"• Резолв в channel_id: {len(resolved_channel_identifier_set)}"
+    )
+    status_lines.append(
+        f"• Уже были у админа: {len(resolved_existing_channel_identifier_set)}"
+    )
+    status_lines.append(
+        f"• Новые каналы: {len(resolved_new_channel_identifier_set)}"
+    )
+    status_lines.append(
+        "• Новые ссылки для уже известных каналов: "
+        f"{len(known_channel_with_new_link_data_by_channel_identifier)}"
+    )
+    status_lines.append(
+        f"• Нерезолвленные ссылки: {len(unresolved_input_link_value_list)}"
+    )
+    if no_cid_resolution:
+        status_lines.append(
+            "⚠️ Є нерезолвлені посилання або відсутній повний мапінг channel_id. "
+            "Автовідписка в цьому запуску пропущена."
+        )
+    if known_channel_with_new_link_data_by_channel_identifier:
+        status_lines.append("")
+        status_lines.append("Новые ссылки для уже известных каналов:")
+        known_channel_with_new_link_data_items = list(
+            known_channel_with_new_link_data_by_channel_identifier.items()
+        )
+        for _, (
+            known_channel_title,
+            known_channel_link,
+        ) in known_channel_with_new_link_data_items[:20]:
+            escaped_known_channel_title = html.escape(str(known_channel_title))
+            escaped_known_channel_link = html.escape(str(known_channel_link), quote=True)
+            status_lines.append(
+                f'• <a href="{escaped_known_channel_link}">{escaped_known_channel_title}</a>'
+            )
+        if len(known_channel_with_new_link_data_items) > 20:
+            status_lines.append(
+                f"… ще {len(known_channel_with_new_link_data_items) - 20}"
+            )
+    if unresolved_input_link_value_list:
+        status_lines.append("")
+        status_lines.append("Нерезолвленные ссылки (нужна валидная ссылка):")
+        for unresolved_input_link_value in unresolved_input_link_value_list[:20]:
+            escaped_unresolved_input_link_value = html.escape(
+                unresolved_input_link_value, quote=True
+            )
+            status_lines.append(
+                f'• <a href="{escaped_unresolved_input_link_value}">{escaped_unresolved_input_link_value}</a>'
+            )
+        if len(unresolved_input_link_value_list) > 20:
+            status_lines.append(f"… ще {len(unresolved_input_link_value_list) - 20}")
+    status_lines.append("")
+    status_lines.append("Детализация по входящим ссылкам:")
+    status_lines.extend(status_detail_lines)
 
     to_remove = {cid for cid in current_cids if cid not in keep_cids}
 

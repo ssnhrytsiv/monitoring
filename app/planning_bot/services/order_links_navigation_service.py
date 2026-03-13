@@ -27,6 +27,10 @@ CALLBACK_DATA_BACK = "planning_links_back"
 CALLBACK_DATA_SCHEDULE = "planning_links_schedule"
 CALLBACK_DATA_SCHEDULE_PREFIX = "planning_links_schedule:"
 CALLBACK_DATA_DELETE = "planning_links_delete"
+CALLBACK_DATA_MANAGE_CARD = "planning_links_manage_card"
+CALLBACK_DATA_CHECK_NETWORK = "planning_links_check_network"
+CALLBACK_DATA_CHECK_NETWORK_SELECT_PREFIX = "planning_links_check_network_select:"
+CALLBACK_DATA_CHECK_NETWORK_RUN = "planning_links_check_network_run"
 CALLBACK_DATA_EDIT_SRM = "planning_links_edit_srm"
 CALLBACK_DATA_EDIT_SRM_SELECT_PREFIX = "planning_links_edit_srm_select:"
 CALLBACK_DATA_EDIT_SRM_SET_PREFIX = "planning_links_edit_srm_set:"
@@ -74,6 +78,7 @@ recent_order_message_key_by_receiver_and_administrator: dict[
 ] = {}
 recent_order_message_keys_by_planning_request_id: dict[int, set[tuple[int, int]]] = {}
 pending_order_links_srm_input_by_user_id: dict[int, PendingOrderLinksSrmInputContext] = {}
+selected_network_identifier_by_order_message_key: dict[tuple[int, int], int] = {}
 
 
 def _current_epoch_seconds() -> int:
@@ -85,6 +90,28 @@ def _normalize_administrator_name_for_matching(administrator_name: str | None) -
     if not normalized_administrator_name or normalized_administrator_name == "—":
         return ""
     return normalized_administrator_name.casefold()
+
+
+def _extract_administrator_name_from_order_message_text(
+    order_message_text: str | None,
+) -> str:
+    normalized_order_message_text = str(order_message_text or "").strip()
+    if not normalized_order_message_text:
+        return ""
+
+    for order_message_line in normalized_order_message_text.splitlines():
+        line_value = order_message_line.strip()
+        if not line_value:
+            continue
+        line_value_lowercase = line_value.casefold()
+        if (
+            line_value_lowercase.startswith("админ:")
+            or line_value_lowercase.startswith("адмін:")
+            or line_value_lowercase.startswith("admin:")
+        ):
+            _, _, administrator_name_value = line_value.partition(":")
+            return " ".join(administrator_name_value.split()).strip()
+    return ""
 
 
 def _utf16_length(text_value: str) -> int:
@@ -263,17 +290,14 @@ def _load_order_links_navigation_context_from_database_by_message(
 def build_order_links_original_keyboard(
     order_links_navigation_context: OrderLinksNavigationContext,
 ) -> InlineKeyboardMarkup | None:
-    if not order_links_navigation_context.order_links_button_entries:
-        return None
-
     inline_keyboard_rows: list[list[InlineKeyboardButton]] = []
     for order_links_button_entry in order_links_navigation_context.order_links_button_entries:
         inline_keyboard_rows.append(
             [
                 InlineKeyboardButton(
                     text=(
-                        f"Ссылки №{order_links_button_entry.sequence_number} "
-                        f"срм {order_links_button_entry.srm_text}"
+                        f"{order_links_button_entry.sequence_number}. "
+                        f"Открыть список ссылок | СРМ: {order_links_button_entry.srm_text}"
                     ),
                     callback_data=f"{CALLBACK_DATA_OPEN_PREFIX}{order_links_button_entry.sequence_number}",
                 )
@@ -281,15 +305,20 @@ def build_order_links_original_keyboard(
         )
 
     schedule_button_text = (
-        "Добавлен в график ✅"
+        "Добавлен в график"
         if is_order_added_to_schedule(order_links_navigation_context)
-        else "Записать в график"
+        else "Добавить в график"
+    )
+    schedule_button_style = (
+        "success"
+        if is_order_added_to_schedule(order_links_navigation_context)
+        else "primary"
     )
     inline_keyboard_rows.append(
         [
             InlineKeyboardButton(
-                text="Редагувати СРМ",
-                callback_data=CALLBACK_DATA_EDIT_SRM,
+                text="Управление карткой",
+                callback_data=CALLBACK_DATA_MANAGE_CARD,
             )
         ]
     )
@@ -298,23 +327,58 @@ def build_order_links_original_keyboard(
             InlineKeyboardButton(
                 text=schedule_button_text,
                 callback_data=CALLBACK_DATA_SCHEDULE,
-            )
-        ]
-    )
-    inline_keyboard_rows.append(
-        [
-            InlineKeyboardButton(
-                text="Удалить запись",
-                callback_data=CALLBACK_DATA_DELETE,
+                style=schedule_button_style,
             )
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=inline_keyboard_rows)
 
 
+def build_order_links_initial_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Управление карткой",
+                    callback_data=CALLBACK_DATA_MANAGE_CARD,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Добавить в график",
+                    callback_data=CALLBACK_DATA_SCHEDULE,
+                    style="primary",
+                )
+            ],
+        ]
+    )
+
+
+def build_order_links_manage_card_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Редагувати СРМ",
+                    callback_data=CALLBACK_DATA_EDIT_SRM,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Удалить запись",
+                    callback_data=CALLBACK_DATA_DELETE,
+                    style="danger",
+                )
+            ],
+            [InlineKeyboardButton(text="Назад", callback_data=CALLBACK_DATA_BACK)],
+        ]
+    )
+
+
 def build_order_links_details_keyboard(_order_links_button_entry: OrderLinksButtonEntry) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="Перевірити сітку", callback_data=CALLBACK_DATA_CHECK_NETWORK)],
             [InlineKeyboardButton(text="Назад", callback_data=CALLBACK_DATA_BACK)],
         ]
     )
@@ -390,6 +454,86 @@ def build_order_links_edit_srm_input_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def get_selected_network_identifier_for_order_message(
+    receiver_chat_id: int,
+    order_message_id: int,
+) -> int | None:
+    return selected_network_identifier_by_order_message_key.get(
+        (receiver_chat_id, order_message_id)
+    )
+
+
+def set_selected_network_identifier_for_order_message(
+    receiver_chat_id: int,
+    order_message_id: int,
+    network_identifier: int,
+) -> None:
+    selected_network_identifier_by_order_message_key[
+        (receiver_chat_id, order_message_id)
+    ] = int(network_identifier)
+
+
+def build_order_links_check_network_selection_text(
+    administrator_name: str,
+    network_selection_record_list: list[dict[str, object]],
+    selected_network_identifier: int | None,
+) -> str:
+    selected_network_name = "—"
+    if selected_network_identifier is not None:
+        for network_selection_record in network_selection_record_list:
+            network_identifier = int(network_selection_record.get("network_id") or 0)
+            if network_identifier == int(selected_network_identifier):
+                selected_network_name = str(
+                    network_selection_record.get("network_name") or selected_network_identifier
+                )
+                break
+    return (
+        "Обери сітку для перевірки.\n"
+        f"Адмін: {administrator_name}\n"
+        f"Доступно сіток: {len(network_selection_record_list)}\n"
+        f"Обрана сітка: {selected_network_name}"
+    )
+
+
+def build_order_links_check_network_selection_keyboard(
+    network_selection_record_list: list[dict[str, object]],
+    selected_network_identifier: int | None,
+) -> InlineKeyboardMarkup:
+    inline_keyboard_rows: list[list[InlineKeyboardButton]] = []
+    for network_selection_record in network_selection_record_list:
+        network_identifier = int(network_selection_record.get("network_id") or 0)
+        network_name = str(network_selection_record.get("network_name") or "").strip()
+        button_text = network_name
+        if (
+            selected_network_identifier is not None
+            and int(selected_network_identifier) == network_identifier
+        ):
+            button_text = f"✅ {network_name}"
+        inline_keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    text=button_text,
+                    callback_data=(
+                        f"{CALLBACK_DATA_CHECK_NETWORK_SELECT_PREFIX}{network_identifier}"
+                    ),
+                )
+            ]
+        )
+    if selected_network_identifier is not None:
+        inline_keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Запустити перевірку сітки",
+                    callback_data=CALLBACK_DATA_CHECK_NETWORK_RUN,
+                )
+            ]
+        )
+    inline_keyboard_rows.append(
+        [InlineKeyboardButton(text="Назад", callback_data=CALLBACK_DATA_BACK)]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=inline_keyboard_rows)
+
+
 def register_recent_order_message_for_administrator(
     receiver_chat_id: int,
     order_message_id: int | None,
@@ -454,6 +598,7 @@ def get_order_message_keys_by_planning_request_id(planning_request_id: int) -> l
 
 def remove_order_navigation_contexts_by_message_keys(order_message_keys: list[tuple[int, int]]) -> None:
     for order_message_key in order_message_keys:
+        selected_network_identifier_by_order_message_key.pop(order_message_key, None)
         try:
             delete_planning_request_receiver_context_by_message(
                 receiver_chat_id=order_message_key[0],
@@ -680,7 +825,18 @@ async def attach_links_button_to_recent_order_message(
                     candidate_administrator_name = _normalize_administrator_name_for_matching(
                         receiver_context_candidate.administrator_name
                     )
-                    if candidate_administrator_name == normalized_administrator_name:
+                    candidate_administrator_name_from_message_text = (
+                        _normalize_administrator_name_for_matching(
+                            _extract_administrator_name_from_order_message_text(
+                                receiver_context_candidate.order_message_text
+                            )
+                        )
+                    )
+                    if (
+                        candidate_administrator_name == normalized_administrator_name
+                        or candidate_administrator_name_from_message_text
+                        == normalized_administrator_name
+                    ):
                         latest_receiver_context_view_model = receiver_context_candidate
                         break
         except Exception:

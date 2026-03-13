@@ -5,10 +5,11 @@ import time
 import html
 from typing import List, Optional
 
-from sqlalchemy import select, func, text
+from sqlalchemy import select, func, text, delete
 from sqlalchemy.orm import Session
 
 from app.admin_bot.db import models as m
+from app.services import link_queue
 from app.utils.link_parser import sanitize_link
 
 _NETWORK_SCHEMA_PATCHED = False
@@ -272,6 +273,163 @@ def delete_network(db: Session, network_id: int) -> dict:
     return {"deleted": True, "moved": moved, "admin_id": net.admin_id, "name": net.name}
 
 
+def _build_channel_cleanup_urls(
+    channel_username: Optional[str],
+    invite_hashes: List[str],
+    raw_link_urls: List[str],
+    normalized_link_urls: List[str],
+) -> list[str]:
+    seed_urls = set()
+    for raw_link_url in raw_link_urls:
+        clean_raw_link = str(raw_link_url or "").replace("\u200b", "").replace("\u200e", "").replace("\u200f", "").strip()
+        if clean_raw_link:
+            seed_urls.add(clean_raw_link)
+    for normalized_link_url in normalized_link_urls:
+        clean_normalized_link = str(normalized_link_url or "").replace("\u200b", "").replace("\u200e", "").replace("\u200f", "").strip()
+        if clean_normalized_link:
+            seed_urls.add(clean_normalized_link)
+    if channel_username:
+        seed_urls.add(f"https://t.me/{str(channel_username).lstrip('@')}")
+    for invite_hash in invite_hashes:
+        invite_hash_clean = str(invite_hash or "").strip()
+        if not invite_hash_clean:
+            continue
+        seed_urls.add(f"https://t.me/+{invite_hash_clean}")
+        seed_urls.add(f"https://t.me/joinchat/{invite_hash_clean}")
+
+    expanded_urls = set()
+    for seed_url in seed_urls:
+        clean_seed_url = str(seed_url or "").replace("\u200b", "").replace("\u200e", "").replace("\u200f", "").strip()
+        if not clean_seed_url:
+            continue
+        expanded_urls.add(clean_seed_url)
+        try:
+            sanitized_seed_url = sanitize_link(clean_seed_url) or clean_seed_url
+            expanded_urls.add(sanitized_seed_url)
+        except Exception:
+            pass
+        if "joinchat/" in clean_seed_url:
+            expanded_urls.add(clean_seed_url.replace("joinchat/", "+"))
+        if clean_seed_url.startswith("https://t.me/+"):
+            expanded_urls.add(clean_seed_url.replace("https://t.me/+", "https://t.me/joinchat/"))
+    return [url_value for url_value in expanded_urls if url_value]
+
+
+def delete_channel_and_relations(db: Session, channel_id: int) -> dict:
+    channel_identifier = int(channel_id)
+    channel_record = db.execute(
+        select(m.Channel).where(m.Channel.channel_id == channel_identifier)
+    ).scalar_one_or_none()
+    channel_title = channel_record.title if channel_record else None
+    channel_username = channel_record.username if channel_record else None
+
+    invite_hashes = [
+        invite_hash
+        for invite_hash in db.execute(
+            select(m.InviteMap.invite_hash).where(m.InviteMap.channel_id == channel_identifier)
+        ).scalars().all()
+        if invite_hash
+    ]
+    raw_link_urls = [
+        raw_link_url
+        for raw_link_url in db.execute(
+            select(m.Link.raw_url).where(m.Link.channel_id == channel_identifier, m.Link.raw_url.isnot(None))
+        ).scalars().all()
+        if raw_link_url
+    ]
+    normalized_link_urls = [
+        normalized_link_url
+        for normalized_link_url in db.execute(
+            select(m.ChannelLink.link_url_norm).where(
+                m.ChannelLink.channel_id == channel_identifier,
+                m.ChannelLink.link_url_norm.isnot(None),
+            )
+        ).scalars().all()
+        if normalized_link_url
+    ]
+    channel_cleanup_urls = _build_channel_cleanup_urls(
+        channel_username=channel_username,
+        invite_hashes=invite_hashes,
+        raw_link_urls=raw_link_urls,
+        normalized_link_urls=normalized_link_urls,
+    )
+
+    admin_channels_deleted = db.execute(
+        delete(m.AdminChannel).where(m.AdminChannel.channel_id == channel_identifier)
+    ).rowcount or 0
+    network_channels_deleted = db.execute(
+        delete(m.NetworkChannel).where(m.NetworkChannel.channel_id == channel_identifier)
+    ).rowcount or 0
+    memberships_deleted = m.delete_memberships_by_channels(db, [channel_identifier])
+    membership_status_deleted = m.delete_membership_status_by_channels(db, [channel_identifier])
+    invite_status_deleted = m.delete_invite_status_by_hashes(db, invite_hashes)
+    invite_map_deleted = m.delete_invite_map_by_channels(db, [channel_identifier])
+    owner_conflicts_deleted = m.delete_owner_conflict_by_channels(db, [channel_identifier])
+    links_deleted = m.delete_links_by_channels(db, [channel_identifier])
+    channel_links_deleted = db.execute(
+        delete(m.ChannelLink).where(m.ChannelLink.channel_id == channel_identifier)
+    ).rowcount or 0
+    subscriptions_deleted = db.execute(
+        delete(m.Subscription).where(m.Subscription.channel_id == channel_identifier)
+    ).rowcount or 0
+    watch_posts_deleted = db.execute(
+        delete(m.WatchPost).where(m.WatchPost.channel_id == channel_identifier)
+    ).rowcount or 0
+    watch_candidates_deleted = db.execute(
+        delete(m.WatchCandidate).where(m.WatchCandidate.channel_id == channel_identifier)
+    ).rowcount or 0
+    invite_owners_deleted = 0
+    if invite_hashes:
+        invite_owners_deleted = db.execute(
+            delete(m.InviteOwner).where(m.InviteOwner.invite_hash.in_(invite_hashes))
+        ).rowcount or 0
+    channels_deleted = m.delete_channels_by_ids(db, [channel_identifier])
+
+    url_cache_deleted = 0
+    if channel_cleanup_urls:
+        url_cache_deleted = db.execute(
+            delete(m.UrlCache).where(
+                m.UrlCache.url.in_(channel_cleanup_urls),
+                m.UrlCache.status.in_(["already", "joined"]),
+            )
+        ).rowcount or 0
+        if url_cache_deleted == 0:
+            url_cache_deleted = db.execute(
+                delete(m.UrlCache).where(m.UrlCache.url.in_(channel_cleanup_urls))
+            ).rowcount or 0
+
+    db.commit()
+    link_queue_deleted = 0
+    if channel_cleanup_urls:
+        try:
+            link_queue_deleted = int(link_queue.delete_by_owner(urls=list(set(channel_cleanup_urls))) or 0)
+        except Exception:
+            link_queue_deleted = 0
+
+    return {
+        "channel_found": bool(channel_record),
+        "channel_id": channel_identifier,
+        "channel_title": channel_title,
+        "channel_username": channel_username,
+        "admin_channels_deleted": int(admin_channels_deleted),
+        "network_channels_deleted": int(network_channels_deleted),
+        "memberships_deleted": int(memberships_deleted),
+        "membership_status_deleted": int(membership_status_deleted),
+        "invite_map_deleted": int(invite_map_deleted),
+        "invite_status_deleted": int(invite_status_deleted),
+        "invite_owners_deleted": int(invite_owners_deleted),
+        "owner_conflicts_deleted": int(owner_conflicts_deleted),
+        "links_deleted": int(links_deleted),
+        "channel_links_deleted": int(channel_links_deleted),
+        "subscriptions_deleted": int(subscriptions_deleted),
+        "watch_posts_deleted": int(watch_posts_deleted),
+        "watch_candidates_deleted": int(watch_candidates_deleted),
+        "channels_deleted": int(channels_deleted),
+        "url_cache_deleted": int(url_cache_deleted),
+        "link_queue_deleted": int(link_queue_deleted),
+    }
+
+
 def ensure_primary_network(db: Session, admin_id: int, name: str = "Основные каналы") -> m.Network:
     ensure_network_schema(db)
     net = db.execute(
@@ -345,37 +503,45 @@ def update_network_params(
     return net
 
 
+def channel_display_label_and_url(db: Session, channel_record: m.Channel) -> tuple[str, Optional[str]]:
+    channel_title = channel_record.title or ""
+    if channel_record.username:
+        channel_label = channel_title or f"@{channel_record.username}"
+        channel_url = f"https://t.me/{channel_record.username}"
+        return channel_label, channel_url
+
+    invite_map_row = db.execute(
+        select(m.InviteMap.invite_hash, m.InviteMap.title).where(m.InviteMap.channel_id == channel_record.channel_id)
+    ).first()
+    if invite_map_row:
+        invite_hash, invite_title = invite_map_row
+        channel_label = channel_title or invite_title or invite_hash
+        channel_url = f"https://t.me/+{invite_hash}"
+        return channel_label, channel_url
+
+    raw_link_url = db.execute(
+        select(m.Link.raw_url)
+        .where(m.Link.channel_id == channel_record.channel_id, m.Link.raw_url != None)  # noqa: E711
+        .order_by(m.Link.id.desc())
+    ).scalars().first()
+    if raw_link_url:
+        try:
+            channel_url = sanitize_link(raw_link_url) or raw_link_url
+        except Exception:
+            channel_url = raw_link_url
+        channel_label = channel_title or channel_url or str(channel_record.channel_id)
+        return channel_label, channel_url
+
+    return channel_title or str(channel_record.channel_id), None
+
+
 def channel_hyperlink(db: Session, ch: m.Channel) -> str:
     """
     Повертає HTML-посилання на канал: username -> https://t.me/<username>,
     якщо немає username – шукаємо invite_hash у invite_map і будуємо https://t.me/+<hash> (з назвою з invite_map.title, якщо є),
     якщо немає і цього – повертаємо екрановану назву або останній raw_url.
     """
-    title = ch.title or ""
-    if ch.username:
-        label = title or f"@{ch.username}"
-        return f'<a href="https://t.me/{html.escape(ch.username)}">{html.escape(label)}</a>'
-
-    inv_row = db.execute(
-        select(m.InviteMap.invite_hash, m.InviteMap.title).where(m.InviteMap.channel_id == ch.channel_id)
-    ).first()
-    if inv_row:
-        inv_hash, inv_title = inv_row
-        label = title or inv_title or inv_hash
-        return f'<a href="https://t.me/+{html.escape(inv_hash)}">{html.escape(label)}</a>'
-
-    # Фолбек: використовуємо останній raw_url із links, щоб показати хоч щось клікабельне
-    raw_url = db.execute(
-        select(m.Link.raw_url)
-        .where(m.Link.channel_id == ch.channel_id, m.Link.raw_url != None)  # noqa: E711
-        .order_by(m.Link.id.desc())
-    ).scalars().first()
-    if raw_url:
-        try:
-            href = sanitize_link(raw_url) or raw_url
-        except Exception:
-            href = raw_url
-        label = title or href or str(ch.channel_id)
-        return f'<a href="{html.escape(href)}">{html.escape(label)}</a>'
-
-    return html.escape(title or str(ch.channel_id))
+    channel_label, channel_url = channel_display_label_and_url(db, ch)
+    if channel_url:
+        return f'<a href="{html.escape(channel_url)}">{html.escape(channel_label)}</a>'
+    return html.escape(channel_label)

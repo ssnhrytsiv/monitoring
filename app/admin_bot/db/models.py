@@ -270,6 +270,16 @@ class Subscription(Base):
     join_error = Column(Text)
 
 
+class ChannelSubscriptionAudit(Base):
+    __tablename__ = "channel_subscription_audit"
+
+    channel_id = Column(BigInteger, primary_key=True)
+    audit_status = Column(String, nullable=False, index=True)
+    checked_at = Column(Integer, nullable=False, index=True)
+    missing_detected_at = Column(Integer)
+    status_details = Column(Text)
+
+
 class OwnerAction(Base):
     __tablename__ = "owner_actions"
     __table_args__ = (

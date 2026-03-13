@@ -35,6 +35,7 @@ from app.planning_bot.order_links_navigation_handlers import (
 )
 from app.planning_bot.services.order_links_navigation_service import (
     attach_links_button_to_recent_order_message,
+    build_order_links_initial_keyboard,
     has_pending_order_links_srm_input_for_user,
     register_recent_order_message_for_administrator,
 )
@@ -503,9 +504,16 @@ async def inline_chosen(chosen: ChosenInlineResult, bot: Bot):
     spm = spm or "—"
     comment = comment or "—"
 
-    links, admin_token, spm_token_for_links = _parse_links_admin_spm(query_text)
+    links, admin_token_from_links, spm_token_for_links = _parse_links_admin_spm(query_text)
+    admin_token_explicit, spm_token_explicit = _parse_admin_spm_comment_metadata(query_text)
     links_text = "\n".join(links) if links else "—"
-    admin_token = admin_token or "—"
+    resolved_administrator_name_for_order_message = (
+        admin_token_explicit
+        or (client if client != "—" else admin_token_from_links)
+        or "—"
+    )
+    if spm_token_explicit:
+        spm_token_for_links = spm_token_explicit
     spm_token_for_links = spm_token_for_links or "—"
 
     user = chosen.from_user
@@ -555,7 +563,7 @@ async def inline_chosen(chosen: ChosenInlineResult, bot: Bot):
         telegram_first_name=first_name,
         telegram_last_name=last_name,
         client_name=None if is_links_fix_result else client,
-        administrator_name=admin_token,
+        administrator_name=resolved_administrator_name_for_order_message,
         client_reference_number=None,
         price_amount=None if is_links_fix_result else unit_price_int,
         posts_count=None if is_links_fix_result else count_int,
@@ -567,12 +575,16 @@ async def inline_chosen(chosen: ChosenInlineResult, bot: Bot):
 
     for admin_id in PLANNING_ADMIN_CHAT_IDS:
         try:
-            sent_order_message = await bot.send_message(chat_id=admin_id, text=text)
+            sent_order_message = await bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                reply_markup=build_order_links_initial_keyboard(),
+            )
             register_recent_order_message_for_administrator(
                 receiver_chat_id=admin_id,
                 order_message_id=_extract_message_id_from_send_result(sent_order_message),
                 planning_request_id=planning_request_id,
-                administrator_name=client,
+                administrator_name=resolved_administrator_name_for_order_message,
                 order_message_text=text,
             )
             log.info("Sent planning request to admin chat_id=%s from %s", admin_id, user_repr)

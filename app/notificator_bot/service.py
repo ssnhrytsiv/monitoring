@@ -277,6 +277,63 @@ def _parse_ts(ts: str | None) -> float:
         return 0.0
 
 
+def _parse_datetime(dt_text: str | None) -> datetime | None:
+    if not dt_text:
+        return None
+    try:
+        return datetime.fromisoformat(str(dt_text))
+    except Exception:
+        return None
+
+
+def _format_post_publish_date(dt_value: datetime | None) -> str | None:
+    if dt_value is None:
+        return None
+    return dt_value.strftime("%d.%m.%Y")
+
+
+def _format_views_capture_datetime(dt_value: datetime | None) -> str | None:
+    if dt_value is None:
+        return None
+    return dt_value.strftime("%H:%M, %d.%m.%Y")
+
+
+def _resolve_group_row_line_time_text(ev_type: str, group_row: dict) -> str:
+    if ev_type == "views":
+        views_capture_datetime_text = group_row.get("coverage_check_at")
+        if views_capture_datetime_text:
+            return str(views_capture_datetime_text)
+    updated_at_datetime_text = group_row.get("updated_at")
+    if updated_at_datetime_text:
+        return str(updated_at_datetime_text)
+    created_at_datetime_text = group_row.get("created_at")
+    if created_at_datetime_text:
+        return str(created_at_datetime_text)
+    return ""
+
+
+def _extract_notification_footer_datetime_texts(entries: List[dict]) -> Tuple[str | None, str | None]:
+    matched_datetime_values: List[datetime] = []
+    views_capture_datetime_values: List[datetime] = []
+
+    for entry in entries:
+        matched_datetime_text = entry.get("matched_at_datetime_text")
+        parsed_matched_datetime = _parse_datetime(matched_datetime_text)
+        if parsed_matched_datetime is not None:
+            matched_datetime_values.append(parsed_matched_datetime)
+
+        views_capture_datetime_text = entry.get("views_capture_datetime_text")
+        parsed_views_capture_datetime = _parse_datetime(views_capture_datetime_text)
+        if parsed_views_capture_datetime is not None:
+            views_capture_datetime_values.append(parsed_views_capture_datetime)
+
+    first_post_publish_datetime = min(matched_datetime_values) if matched_datetime_values else None
+    first_views_capture_datetime = min(views_capture_datetime_values) if views_capture_datetime_values else None
+    post_publish_date_text = _format_post_publish_date(first_post_publish_datetime)
+    views_capture_date_time_text = _format_views_capture_datetime(first_views_capture_datetime)
+    return post_publish_date_text, views_capture_date_time_text
+
+
 def _priority_of(ev_type: str) -> int:
     return PRIORITY.get(ev_type, 1)
 
@@ -306,6 +363,8 @@ def _build_single_notification_page_text(
     post_title: str | None,
     group_id: int | None,
     first_item_number: int = 1,
+    post_publish_date_text: str | None = None,
+    views_capture_date_time_text: str | None = None,
 ) -> str:
     return formatter.format_admin_message(
         project,
@@ -315,6 +374,8 @@ def _build_single_notification_page_text(
         post_title,
         group_id,
         first_item_number=first_item_number,
+        post_publish_date_text=post_publish_date_text,
+        views_capture_date_time_text=views_capture_date_time_text,
     )
 
 
@@ -331,6 +392,8 @@ def _build_forced_single_line_page_text(
     group_id: int | None,
     message_max_length: int,
     first_item_number: int,
+    post_publish_date_text: str | None,
+    views_capture_date_time_text: str | None,
 ) -> str:
     notification_line_without_markup = _strip_html_markup_from_notification_line(notification_line) or "..."
     best_page_text: str | None = None
@@ -351,6 +414,8 @@ def _build_forced_single_line_page_text(
             post_title,
             group_id,
             first_item_number=first_item_number,
+            post_publish_date_text=post_publish_date_text,
+            views_capture_date_time_text=views_capture_date_time_text,
         )
         if len(candidate_page_text) <= message_max_length:
             best_page_text = candidate_page_text
@@ -369,6 +434,8 @@ def _build_forced_single_line_page_text(
         None,
         group_id,
         first_item_number=first_item_number,
+        post_publish_date_text=post_publish_date_text,
+        views_capture_date_time_text=views_capture_date_time_text,
     )
     if len(page_without_lines_and_post_title) <= message_max_length:
         return page_without_lines_and_post_title
@@ -385,9 +452,20 @@ def _build_notification_pages_with_length_limit(
     total_views: int | None,
     post_title: str | None,
     group_id: int | None,
+    post_publish_date_text: str | None = None,
+    views_capture_date_time_text: str | None = None,
     message_max_length: int = TELEGRAM_MESSAGE_MAX_LENGTH,
 ) -> List[str]:
-    complete_notification_text = _build_single_notification_page_text(project, admin, lines, total_views, post_title, group_id)
+    complete_notification_text = _build_single_notification_page_text(
+        project,
+        admin,
+        lines,
+        total_views,
+        post_title,
+        group_id,
+        post_publish_date_text=post_publish_date_text,
+        views_capture_date_time_text=views_capture_date_time_text,
+    )
     if len(complete_notification_text) <= message_max_length:
         return [complete_notification_text]
 
@@ -405,6 +483,8 @@ def _build_notification_pages_with_length_limit(
             post_title,
             group_id,
             first_item_number=emitted_line_count + 1,
+            post_publish_date_text=post_publish_date_text,
+            views_capture_date_time_text=views_capture_date_time_text,
         )
         if len(candidate_page_text) <= message_max_length:
             current_page_lines = candidate_page_lines
@@ -420,6 +500,8 @@ def _build_notification_pages_with_length_limit(
                     post_title,
                     group_id,
                     first_item_number=emitted_line_count + 1,
+                    post_publish_date_text=post_publish_date_text,
+                    views_capture_date_time_text=views_capture_date_time_text,
                 )
             )
             emitted_line_count += len(current_page_lines)
@@ -433,6 +515,8 @@ def _build_notification_pages_with_length_limit(
             post_title,
             group_id,
             first_item_number=emitted_line_count + 1,
+            post_publish_date_text=post_publish_date_text,
+            views_capture_date_time_text=views_capture_date_time_text,
         )
         if len(single_line_page_text) <= message_max_length:
             current_page_lines = [notification_line]
@@ -448,6 +532,8 @@ def _build_notification_pages_with_length_limit(
                 group_id,
                 message_max_length,
                 first_item_number=emitted_line_count + 1,
+                post_publish_date_text=post_publish_date_text,
+                views_capture_date_time_text=views_capture_date_time_text,
             )
         )
         emitted_line_count += 1
@@ -462,6 +548,8 @@ def _build_notification_pages_with_length_limit(
                 post_title,
                 group_id,
                 first_item_number=emitted_line_count + 1,
+                post_publish_date_text=post_publish_date_text,
+                views_capture_date_time_text=views_capture_date_time_text,
             )
         )
         emitted_line_count += len(current_page_lines)
@@ -477,6 +565,8 @@ def _build_notification_pages_with_length_limit(
         post_title,
         group_id,
         first_item_number=emitted_line_count + 1,
+        post_publish_date_text=post_publish_date_text,
+        views_capture_date_time_text=views_capture_date_time_text,
     )
     if len(page_without_lines) <= message_max_length:
         return [page_without_lines]
@@ -489,6 +579,8 @@ def _build_notification_pages_with_length_limit(
         None,
         group_id,
         first_item_number=emitted_line_count + 1,
+        post_publish_date_text=post_publish_date_text,
+        views_capture_date_time_text=views_capture_date_time_text,
     )
     if len(page_without_lines_and_post_title) <= message_max_length:
         return [page_without_lines_and_post_title]
@@ -557,6 +649,12 @@ def collect_grouped_events(
                 "watch_id": watch_id,
                 "views": views_val,
                 "post_title": watch_info.get("title"),
+                "matched_at_datetime_text": watch_info.get("matched_at"),
+                "views_capture_datetime_text": (
+                    created_at
+                    if ev_type == "views"
+                    else watch_info.get("coverage_check_at")
+                ),
             },
         )
         processed_ids.append(ev_id)
@@ -601,11 +699,14 @@ def collect_grouped_events(
                         views_val = int(row.get("final_views"))
                     except Exception:
                         views_val = row.get("final_views")
+                line_time_text = _resolve_group_row_line_time_text(ev_type=ev_type, group_row=row)
                 line = _build_line(
                     ev_type,
                     {"views": row.get("final_views")},
                     {
                         "source_url": row.get("source_url"),
+                        "matched_at": row.get("matched_at"),
+                        "coverage_check_at": row.get("coverage_check_at"),
                         "updated_at": row.get("updated_at") or row.get("created_at"),
                         "group_id": gid,
                         "status": status,
@@ -614,7 +715,7 @@ def collect_grouped_events(
                     },
                     title,
                     link,
-                    row.get("updated_at") or row.get("created_at") or "",
+                    line_time_text,
                 )
                 _add_entry(
                     grouped,
@@ -623,10 +724,16 @@ def collect_grouped_events(
                     {
                         "line": line,
                         "ev_type": ev_type,
-                        "ts": _parse_ts(row.get("updated_at") or row.get("created_at")),
+                        "ts": _parse_ts(line_time_text),
                         "watch_id": watch_id,
                         "views": views_val,
                         "post_title": row.get("title"),
+                        "matched_at_datetime_text": row.get("matched_at"),
+                        "views_capture_datetime_text": (
+                            row.get("coverage_check_at")
+                            if ev_type == "views"
+                            else None
+                        ),
                     },
                 )
 
@@ -758,6 +865,9 @@ async def send_notifications(bot: Bot, debounce_sec: int = 60) -> None:
             except Exception:
                 continue
         total_views = sum(views_values) if views_values else None
+
+        post_publish_date_text, views_capture_date_time_text = _extract_notification_footer_datetime_texts(entries)
+
         notification_page_texts = _build_notification_pages_with_length_limit(
             project,
             admin,
@@ -765,6 +875,8 @@ async def send_notifications(bot: Bot, debounce_sec: int = 60) -> None:
             total_views,
             post_title,
             group_id,
+            post_publish_date_text=post_publish_date_text,
+            views_capture_date_time_text=views_capture_date_time_text,
         )
         first_page_text = notification_page_texts[0]
         group_sent_successfully = False

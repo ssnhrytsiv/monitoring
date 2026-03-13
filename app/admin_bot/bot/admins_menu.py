@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import html
+import uuid
 import logging
 from typing import List, Dict, Any, Optional
 from types import SimpleNamespace
@@ -23,6 +25,7 @@ from app.admin_bot.services.networks import channel_hyperlink
 from app.services import account_pool
 from app.DAL import bot_links_operations as blo
 from app.DAL import watch_groups_operations as watch_groups_db
+from app.DAL import channel_subscription_audit_operations
 from app.DAL.membership_operations import MembershipDAO, _extract_invite_hash
 from app.DAL import channels_operations as cho
 from app.admin_bot.services.subscription.subscription_status import render_html_with_statuses
@@ -37,14 +40,29 @@ PARAM_FIELDS = {
     "price": "Базова ціна",
     "subscribers": "Підписники",
 }
+NETWORK_CHANNEL_DELETE_PAGE_SIZE = 20
+MISSING_CHANNEL_PAGE_SIZE = 20
+SERVICE_ORDER_CHANNEL_PAGE_SIZE = 50
 
 router = Router()
 log = logging.getLogger("admin_bot.bot.admins_menu")
+NETWORK_CHANNEL_DELETE_SELECTION_CONTEXTS: Dict[str, Dict[str, Any]] = {}
 
 
-async def _edit_text_safe(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup):
+async def _edit_text_safe(
+    cb: CallbackQuery,
+    text: str,
+    kb: InlineKeyboardMarkup,
+    parse_mode: Optional[str] = None,
+):
     try:
-        await cb.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
+        edit_text_kwargs = {
+            "reply_markup": kb,
+            "disable_web_page_preview": True,
+        }
+        if parse_mode is not None:
+            edit_text_kwargs["parse_mode"] = parse_mode
+        await cb.message.edit_text(text, **edit_text_kwargs)
     except TelegramBadRequest as e:
         if "message is not modified" in str(e).lower():
             return False
@@ -102,10 +120,193 @@ def _admin_label(a) -> str:
     return (f"{disp} {uname}".strip()) or f"id={a.id}"
 
 
+def _format_audit_datetime(timestamp_seconds: Optional[int]) -> str:
+    if timestamp_seconds is None:
+        return "—"
+    try:
+        return datetime.fromtimestamp(int(timestamp_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "—"
+
+
+def _build_missing_channels_view(admin_id: int, page_number: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    safe_page_number = max(0, int(page_number))
+    missing_channel_record_list, total_missing_channel_count = (
+        channel_subscription_audit_operations.list_missing_channels_for_admin(
+            admin_identifier=admin_id,
+            page_number=safe_page_number,
+            page_size=MISSING_CHANNEL_PAGE_SIZE,
+        )
+    )
+    total_page_count = max(
+        1,
+        math.ceil(total_missing_channel_count / MISSING_CHANNEL_PAGE_SIZE)
+        if total_missing_channel_count
+        else 1,
+    )
+    safe_page_number = max(0, min(safe_page_number, total_page_count - 1))
+    if total_missing_channel_count > 0:
+        missing_channel_record_list, _ = (
+            channel_subscription_audit_operations.list_missing_channels_for_admin(
+                admin_identifier=admin_id,
+                page_number=safe_page_number,
+                page_size=MISSING_CHANNEL_PAGE_SIZE,
+            )
+        )
+
+    lines = [f"Missing-канали: {total_missing_channel_count}"]
+    if not missing_channel_record_list:
+        lines.append("Канали зі статусом missing не знайдені.")
+    else:
+        lines.append("Деталі:")
+        for missing_channel_record in missing_channel_record_list:
+            channel_label = html.escape(
+                str(missing_channel_record.get("channel_label") or missing_channel_record.get("channel_id") or "—")
+            )
+            channel_url = str(missing_channel_record.get("channel_url") or "").strip()
+            channel_label_with_hyperlink = channel_label
+            if channel_url:
+                channel_label_with_hyperlink = (
+                    f'<a href="{html.escape(channel_url)}">{channel_label}</a>'
+                )
+            audit_status_value = html.escape(str(missing_channel_record.get("audit_status") or "unknown"))
+            checked_at_value = _format_audit_datetime(missing_channel_record.get("checked_at"))
+            missing_detected_at_value = _format_audit_datetime(
+                missing_channel_record.get("missing_detected_at")
+            )
+            lines.append(
+                f"• {channel_label_with_hyperlink}\n"
+                f"  Статус: <b>{audit_status_value}</b>\n"
+                f"  Missing з: <code>{missing_detected_at_value}</code>\n"
+                f"  Перевірено: <code>{checked_at_value}</code>"
+            )
+
+    keyboard_rows = []
+    if total_page_count > 1:
+        previous_page_number = (safe_page_number - 1) % total_page_count
+        next_page_number = (safe_page_number + 1) % total_page_count
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    text="⬅️",
+                    callback_data=f"admin_missing_channels:{admin_id}:{previous_page_number}",
+                ),
+                InlineKeyboardButton(
+                    text=f"{safe_page_number + 1}/{total_page_count}",
+                    callback_data="noop",
+                ),
+                InlineKeyboardButton(
+                    text="➡️",
+                    callback_data=f"admin_missing_channels:{admin_id}:{next_page_number}",
+                ),
+            ]
+        )
+    keyboard_rows.append(
+        [
+            InlineKeyboardButton(
+                text="📋 Список у порядку додавання",
+                callback_data=f"admin_service_order_channels:{admin_id}:0",
+            )
+        ]
+    )
+    keyboard_rows.append(
+        [
+            InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin_id}"),
+            InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu"),
+        ]
+    )
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+
+
+def _build_admin_channel_service_order_view(
+    admin_id: int,
+    page_number: int = 0,
+) -> tuple[str, InlineKeyboardMarkup]:
+    safe_page_number = max(0, int(page_number))
+    ordered_channel_record_list, total_channel_count = (
+        channel_subscription_audit_operations.list_admin_channels_in_service_add_order(
+            admin_identifier=admin_id,
+            page_number=safe_page_number,
+            page_size=SERVICE_ORDER_CHANNEL_PAGE_SIZE,
+        )
+    )
+    total_page_count = max(
+        1,
+        math.ceil(total_channel_count / SERVICE_ORDER_CHANNEL_PAGE_SIZE)
+        if total_channel_count
+        else 1,
+    )
+    safe_page_number = max(0, min(safe_page_number, total_page_count - 1))
+    if total_channel_count > 0:
+        ordered_channel_record_list, _ = (
+            channel_subscription_audit_operations.list_admin_channels_in_service_add_order(
+                admin_identifier=admin_id,
+                page_number=safe_page_number,
+                page_size=SERVICE_ORDER_CHANNEL_PAGE_SIZE,
+            )
+        )
+
+    lines = [f"Список каналов, сумарное количество: {total_channel_count}"]
+    if not ordered_channel_record_list:
+        lines.append("Список каналів порожній.")
+    else:
+        for ordered_channel_record in ordered_channel_record_list:
+            channel_label = html.escape(
+                str(ordered_channel_record.get("channel_label") or ordered_channel_record.get("channel_id") or "—")
+            )
+            channel_url = str(ordered_channel_record.get("channel_url") or "").strip()
+            channel_label_with_hyperlink = channel_label
+            if channel_url:
+                channel_label_with_hyperlink = (
+                    f'<a href="{html.escape(channel_url)}">{channel_label}</a>'
+                )
+            line = f"• {channel_label_with_hyperlink}"
+            if str(ordered_channel_record.get("audit_status") or "").lower() == "missing":
+                line = f"{line} — <b>Нужна ссылка на этот канал ❗</b>"
+            lines.append(line)
+
+    keyboard_rows = []
+    if total_page_count > 1:
+        previous_page_number = (safe_page_number - 1) % total_page_count
+        next_page_number = (safe_page_number + 1) % total_page_count
+        keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    text="⬅️",
+                    callback_data=f"admin_service_order_channels:{admin_id}:{previous_page_number}",
+                ),
+                InlineKeyboardButton(
+                    text=f"{safe_page_number + 1}/{total_page_count}",
+                    callback_data="noop",
+                ),
+                InlineKeyboardButton(
+                    text="➡️",
+                    callback_data=f"admin_service_order_channels:{admin_id}:{next_page_number}",
+                ),
+            ]
+        )
+    keyboard_rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ До missing",
+                callback_data=f"admin_missing_channels:{admin_id}:0",
+            ),
+            InlineKeyboardButton(text="⬅️ До адміна", callback_data=f"admin_back:{admin_id}"),
+        ]
+    )
+    keyboard_rows.append(
+        [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")]
+    )
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+
+
 async def _render_admin_view(msg, admin, nets, stats):
     label_new = "<code>[NEW]</code>" if getattr(admin, "is_new", 0) else ""
     bots = _list_bot_links(owner_display=admin.display, owner_username=admin.username)
     bots_count = len(bots)
+    missing_channel_count = channel_subscription_audit_operations.count_missing_channels_for_admin(
+        admin_identifier=int(admin.id)
+    )
     # підрахунок каналів по сітках
     net_lines = []
     total_channels = 0
@@ -173,6 +374,12 @@ async def _render_admin_view(msg, admin, nets, stats):
             ],
             [InlineKeyboardButton(text="Результати", callback_data=f"admin_results:{admin.id}")],
             [InlineKeyboardButton(text="Оновити список каналів", callback_data=f"refresh_channels:{admin.id}")],
+            [
+                InlineKeyboardButton(
+                    text=f"Missing канали ({missing_channel_count})",
+                    callback_data=f"admin_missing_channels:{admin.id}:0",
+                )
+            ],
             [InlineKeyboardButton(text="Задати параметри", callback_data=f"admin_set_params:{admin.id}")],
             [InlineKeyboardButton(text=toggle_text, callback_data=f"admin_toggle_new:{admin.id}")],
             [InlineKeyboardButton(text="🗑 Видалити адміна", callback_data=f"admin_delete_confirm:{admin.id}")],
@@ -229,6 +436,94 @@ def _build_admins_kb(admins, page: int = 0, per_page: int = 10):
     return InlineKeyboardMarkup(inline_keyboard=buttons + nav.inline_keyboard)
 
 
+def _load_admins_with_missing_channel_counts() -> list[tuple[m.Admin, int]]:
+    administrator_list = _load_admins()
+    administrator_with_missing_channels_list: list[tuple[m.Admin, int]] = []
+    for administrator in administrator_list:
+        missing_channel_count = channel_subscription_audit_operations.count_missing_channels_for_admin(
+            admin_identifier=int(administrator.id)
+        )
+        if missing_channel_count <= 0:
+            continue
+        administrator_with_missing_channels_list.append(
+            (administrator, int(missing_channel_count))
+        )
+    return administrator_with_missing_channels_list
+
+
+def _build_admins_with_missing_channels_keyboard(
+    administrator_with_missing_channels_list: list[tuple[m.Admin, int]],
+    page: int = 0,
+    per_page: int = 10,
+) -> InlineKeyboardMarkup:
+    total_pages = max(
+        1, math.ceil(len(administrator_with_missing_channels_list) / per_page)
+    )
+    safe_page = max(0, min(page, total_pages - 1))
+    page_start_index = safe_page * per_page
+    page_end_index = page_start_index + per_page
+    page_administrator_with_missing_channels_list = (
+        administrator_with_missing_channels_list[page_start_index:page_end_index]
+    )
+
+    keyboard_rows = []
+    current_row: list[InlineKeyboardButton] = []
+    for administrator, missing_channel_count in page_administrator_with_missing_channels_list:
+        current_row.append(
+            InlineKeyboardButton(
+                text=f"{_admin_label(administrator)} ({missing_channel_count})",
+                callback_data=f"admins_item_{administrator.id}",
+            )
+        )
+        if len(current_row) == ADMINS_PER_ROW:
+            keyboard_rows.append(current_row)
+            current_row = []
+    if current_row:
+        keyboard_rows.append(current_row)
+
+    pagination_keyboard = page_kb(
+        safe_page,
+        total_pages,
+        prefix="admins_missing_page",
+        menu_cb="admins_back_to_menu",
+    )
+    return InlineKeyboardMarkup(
+        inline_keyboard=keyboard_rows + pagination_keyboard.inline_keyboard
+    )
+
+
+def _build_admins_with_missing_channels_view(
+    page: int = 0,
+) -> tuple[str, InlineKeyboardMarkup]:
+    administrator_with_missing_channels_list = (
+        _load_admins_with_missing_channel_counts()
+    )
+    total_missing_channel_count = sum(
+        missing_channel_count
+        for _, missing_channel_count in administrator_with_missing_channels_list
+    )
+
+    if not administrator_with_missing_channels_list:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Адміни", callback_data="show_admins")],
+                [InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu")],
+            ]
+        )
+        return "Адміни з missing-каналами не знайдені.", keyboard
+
+    keyboard = _build_admins_with_missing_channels_keyboard(
+        administrator_with_missing_channels_list,
+        page=page,
+        per_page=ADMINS_PER_PAGE,
+    )
+    text = (
+        f"Адміни з missing-каналами: {len(administrator_with_missing_channels_list)}\n"
+        f"Сумарна кількість missing-каналів: {total_missing_channel_count}"
+    )
+    return text, keyboard
+
+
 @router.callback_query(F.data == "show_admins")
 async def cb_show_admins(cb: CallbackQuery, state: FSMContext):
     admins = _load_admins()
@@ -263,6 +558,16 @@ async def cb_admins_back_to_menu(cb: CallbackQuery):
             "• /admins — список адмінів",
             reply_markup=main_menu_kb(),
         )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "admins_missing_total")
+async def cb_admins_missing_total(cb: CallbackQuery):
+    text, keyboard = _build_admins_with_missing_channels_view(page=0)
+    try:
+        await cb.message.edit_text(text, reply_markup=keyboard)
+    except TelegramBadRequest:
+        await cb.message.answer(text, reply_markup=keyboard)
     await cb.answer()
 
 
@@ -310,6 +615,154 @@ def _net_channel_pages(db, net_id: int, net_name: str, per_page: int = 25) -> tu
     return pages, total
 
 
+def _list_network_channels_for_delete(db, network_id: int) -> list[m.Channel]:
+    return db.execute(
+        select(m.Channel)
+        .join(m.NetworkChannel, m.NetworkChannel.channel_id == m.Channel.channel_id)
+        .where(m.NetworkChannel.network_id == network_id)
+        .order_by(
+            m.NetworkChannel.sort_order.is_(None),
+            m.NetworkChannel.sort_order,
+            m.NetworkChannel.id,
+        )
+    ).scalars().all()
+
+
+def _generate_network_channel_delete_selection_token() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def _format_channel_name_button_text(channel_record: m.Channel, max_len: int = 18) -> str:
+    channel_title = (channel_record.title or "").strip()
+    if channel_title:
+        base_text = channel_title
+    elif channel_record.username:
+        base_text = f"@{str(channel_record.username).lstrip('@')}"
+    else:
+        base_text = str(channel_record.channel_id)
+    sanitized_text = " ".join(base_text.split())
+    if len(sanitized_text) > max_len:
+        return sanitized_text[: max_len - 3] + "..."
+    return sanitized_text
+
+
+def _render_network_channels_delete_page(
+    db,
+    network_record: m.Network,
+    channel_records: list[m.Channel],
+    selection_token: str,
+    selected_channel_ids: set[int],
+    page_index: int,
+    is_delete_confirmation_armed: bool = False,
+):
+    all_channel_ids = {int(channel_record.channel_id) for channel_record in channel_records}
+    selected_channel_ids = set(selected_channel_ids) & all_channel_ids
+    available_channel_records = [
+        channel_record
+        for channel_record in channel_records
+        if int(channel_record.channel_id) not in selected_channel_ids
+    ]
+    selected_channel_records = [
+        channel_record
+        for channel_record in channel_records
+        if int(channel_record.channel_id) in selected_channel_ids
+    ]
+    total_channels = len(channel_records)
+    total_available_channels = len(available_channel_records)
+    total_selected_channels = len(selected_channel_records)
+    total_pages = max(1, math.ceil(total_available_channels / NETWORK_CHANNEL_DELETE_PAGE_SIZE))
+    safe_page_index = max(0, min(page_index, total_pages - 1))
+    page_start = safe_page_index * NETWORK_CHANNEL_DELETE_PAGE_SIZE
+    page_end = page_start + NETWORK_CHANNEL_DELETE_PAGE_SIZE
+    page_channel_records = available_channel_records[page_start:page_end]
+
+    lines = [f"Сітка: {network_record.name} ({total_channels})", "Натисни на назву каналу в кнопках нижче, щоб додати до видалення:"]
+    if not page_channel_records:
+        lines.append("(доступних каналів на цій сторінці немає)")
+    lines.append("")
+
+    keyboard_rows = []
+    channel_name_button_row: list[InlineKeyboardButton] = []
+    for channel_record in page_channel_records:
+        channel_id = int(channel_record.channel_id)
+        select_toggle_callback = (
+            f"admin_net_delete_toggle:{selection_token}:{channel_id}:{safe_page_index}"
+        )
+        channel_name_button_row.append(
+            InlineKeyboardButton(
+                text=_format_channel_name_button_text(channel_record),
+                callback_data=select_toggle_callback,
+            )
+        )
+        if len(channel_name_button_row) == 2:
+            keyboard_rows.append(channel_name_button_row)
+            channel_name_button_row = []
+
+    if channel_name_button_row:
+        keyboard_rows.append(channel_name_button_row)
+
+    if total_selected_channels > 0:
+        lines.append("")
+        lines.append(f"Плануються до видалення ({total_selected_channels}):")
+        for selected_channel_record in selected_channel_records:
+            selected_channel_label, selected_channel_url = svc_networks.channel_display_label_and_url(
+                db, selected_channel_record
+            )
+            escaped_selected_channel_label = html.escape(selected_channel_label)
+            escaped_selected_channel_url = html.escape(selected_channel_url) if selected_channel_url else None
+            if escaped_selected_channel_url:
+                lines.append(
+                    f'• <s><a href="{escaped_selected_channel_url}">{escaped_selected_channel_label}</a></s> — <b>(видалено)</b>'
+                )
+            else:
+                lines.append(f"• <s>{escaped_selected_channel_label}</s> — <b>(видалено)</b>")
+
+    if is_delete_confirmation_armed:
+        keyboard_rows.append([
+            InlineKeyboardButton(
+                text="Так",
+                callback_data=f"admin_net_delete_confirm:{selection_token}:{safe_page_index}",
+                style="danger",
+            ),
+            InlineKeyboardButton(
+                text="Ні",
+                callback_data=f"admin_net_delete_disarm:{selection_token}:{safe_page_index}",
+                style="primary",
+            ),
+        ])
+    else:
+        keyboard_rows.append([
+            InlineKeyboardButton(
+                text=f"Видалити ({total_selected_channels})",
+                callback_data=f"admin_net_delete_apply:{selection_token}:{safe_page_index}",
+                style="danger",
+            ),
+            InlineKeyboardButton(
+                text="Відмінити",
+                callback_data=f"admin_net_delete_cancel:{selection_token}:{safe_page_index}",
+                style="primary",
+            ),
+        ])
+    if total_pages > 1:
+        prev_callback = (
+            f"admin_net_delete_page:{selection_token}:{(safe_page_index - 1) % total_pages}"
+        )
+        next_callback = (
+            f"admin_net_delete_page:{selection_token}:{(safe_page_index + 1) % total_pages}"
+        )
+        keyboard_rows.append([
+            InlineKeyboardButton(text="⬅️", callback_data=prev_callback),
+            InlineKeyboardButton(text=f"{safe_page_index + 1}/{total_pages}", callback_data="noop"),
+            InlineKeyboardButton(text="➡️", callback_data=next_callback),
+        ])
+    keyboard_rows.append([
+        InlineKeyboardButton(text="⬅️ До сіток", callback_data=f"admin_net_edit:{network_record.admin_id}"),
+        InlineKeyboardButton(text="В меню", callback_data="admins_back_to_menu"),
+    ])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    return "\n".join(lines), keyboard
+
+
 @router.callback_query(F.data.startswith("admin_net_sort:"))
 async def cb_admin_net_sort(cb: CallbackQuery, state: FSMContext):
     if not _is_allowed(cb.from_user.id):
@@ -352,6 +805,7 @@ def _render_net_page(net: m.Network, pages: list[str], page_idx: int):
     buttons = []
     buttons.append([InlineKeyboardButton(text="🔄 Оновити сітку", callback_data=f"admin_net_refresh:{net.id}")])
     buttons.append([InlineKeyboardButton(text="📋 Впорядкувати", callback_data=f"admin_net_sort:{net.id}")])
+    buttons.append([InlineKeyboardButton(text="🗑 Видалити канали", callback_data=f"admin_net_delete_channels:{net.id}")])
     if net.name != "Основные каналы":
         buttons.append([InlineKeyboardButton(text="🗑 Видалити сітку", callback_data=f"admin_net_delete:{net.id}")])
     if nav:
@@ -408,6 +862,342 @@ async def cb_admin_net_delete(cb: CallbackQuery):
         reply_markup=kb,
     )
     await cb.answer()
+
+
+@router.callback_query(F.data.startswith("admin_net_delete_channels:"))
+async def cb_admin_net_delete_channels(cb: CallbackQuery):
+    try:
+        network_id = int(cb.data.split(":", 1)[1])
+    except Exception:
+        await cb.answer()
+        return
+    db = next(_db())
+    network_record = db.execute(select(m.Network).where(m.Network.id == network_id)).scalar_one_or_none()
+    if not network_record:
+        await cb.answer("Сітку не знайдено", show_alert=True)
+        return
+    selection_token = _generate_network_channel_delete_selection_token()
+    NETWORK_CHANNEL_DELETE_SELECTION_CONTEXTS[selection_token] = {
+        "network_id": network_id,
+        "selected_channel_ids": set(),
+        "is_delete_confirmation_armed": False,
+    }
+    channel_records = _list_network_channels_for_delete(db, network_id)
+    text, keyboard = _render_network_channels_delete_page(
+        db=db,
+        network_record=network_record,
+        channel_records=channel_records,
+        selection_token=selection_token,
+        selected_channel_ids=set(),
+        page_index=0,
+        is_delete_confirmation_armed=False,
+    )
+    await _edit_text_safe(cb, text, keyboard)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("admin_net_delete_page:"))
+async def cb_admin_net_delete_page(cb: CallbackQuery):
+    try:
+        _, selection_token, page_index_text = cb.data.split(":", 2)
+        page_index = int(page_index_text)
+    except Exception:
+        await cb.answer()
+        return
+    selection_context = NETWORK_CHANNEL_DELETE_SELECTION_CONTEXTS.get(selection_token)
+    if not selection_context:
+        await cb.answer("Сесія видалення застаріла. Відкрий список заново.", show_alert=True)
+        return
+    network_id = int(selection_context.get("network_id") or 0)
+    db = next(_db())
+    network_record = db.execute(select(m.Network).where(m.Network.id == network_id)).scalar_one_or_none()
+    if not network_record:
+        await cb.answer("Сітку не знайдено", show_alert=True)
+        return
+    channel_records = _list_network_channels_for_delete(db, network_id)
+    selected_channel_ids = {
+        int(channel_id)
+        for channel_id in selection_context.get("selected_channel_ids", set())
+        if channel_id is not None
+    }
+    is_delete_confirmation_armed = bool(selection_context.get("is_delete_confirmation_armed", False))
+    text, keyboard = _render_network_channels_delete_page(
+        db=db,
+        network_record=network_record,
+        channel_records=channel_records,
+        selection_token=selection_token,
+        selected_channel_ids=selected_channel_ids,
+        page_index=page_index,
+        is_delete_confirmation_armed=is_delete_confirmation_armed,
+    )
+    await _edit_text_safe(cb, text, keyboard)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("admin_net_delete_toggle:"))
+async def cb_admin_net_delete_toggle(cb: CallbackQuery):
+    try:
+        _, selection_token, channel_id_text, page_index_text = cb.data.split(":", 3)
+        channel_id = int(channel_id_text)
+        page_index = int(page_index_text)
+    except Exception:
+        await cb.answer()
+        return
+    selection_context = NETWORK_CHANNEL_DELETE_SELECTION_CONTEXTS.get(selection_token)
+    if not selection_context:
+        await cb.answer("Сесія видалення застаріла. Відкрий список заново.", show_alert=True)
+        return
+    network_id = int(selection_context.get("network_id") or 0)
+    selected_channel_ids = {
+        int(selected_channel_id)
+        for selected_channel_id in selection_context.get("selected_channel_ids", set())
+        if selected_channel_id is not None
+    }
+    if channel_id in selected_channel_ids:
+        selected_channel_ids.remove(channel_id)
+    else:
+        selected_channel_ids.add(channel_id)
+    selection_context["selected_channel_ids"] = selected_channel_ids
+    selection_context["is_delete_confirmation_armed"] = False
+
+    db = next(_db())
+    network_record = db.execute(select(m.Network).where(m.Network.id == network_id)).scalar_one_or_none()
+    if not network_record:
+        await cb.answer("Сітку не знайдено", show_alert=True)
+        return
+    channel_records = _list_network_channels_for_delete(db, network_id)
+    active_channel_ids = {int(channel_record.channel_id) for channel_record in channel_records}
+    selected_channel_ids = selected_channel_ids & active_channel_ids
+    selection_context["selected_channel_ids"] = selected_channel_ids
+    text, keyboard = _render_network_channels_delete_page(
+        db=db,
+        network_record=network_record,
+        channel_records=channel_records,
+        selection_token=selection_token,
+        selected_channel_ids=selected_channel_ids,
+        page_index=page_index,
+        is_delete_confirmation_armed=False,
+    )
+    await _edit_text_safe(cb, text, keyboard)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("admin_net_delete_cancel:"))
+async def cb_admin_net_delete_cancel(cb: CallbackQuery):
+    try:
+        _, selection_token, page_index_text = cb.data.split(":", 2)
+        page_index = int(page_index_text)
+    except Exception:
+        await cb.answer()
+        return
+    selection_context = NETWORK_CHANNEL_DELETE_SELECTION_CONTEXTS.get(selection_token)
+    if not selection_context:
+        await cb.answer("Сесія видалення застаріла. Відкрий список заново.", show_alert=True)
+        return
+    selection_context["selected_channel_ids"] = set()
+    selection_context["is_delete_confirmation_armed"] = False
+    network_id = int(selection_context.get("network_id") or 0)
+    db = next(_db())
+    network_record = db.execute(select(m.Network).where(m.Network.id == network_id)).scalar_one_or_none()
+    if not network_record:
+        await cb.answer("Сітку не знайдено", show_alert=True)
+        return
+    channel_records = _list_network_channels_for_delete(db, network_id)
+    text, keyboard = _render_network_channels_delete_page(
+        db=db,
+        network_record=network_record,
+        channel_records=channel_records,
+        selection_token=selection_token,
+        selected_channel_ids=set(),
+        page_index=page_index,
+        is_delete_confirmation_armed=False,
+    )
+    await _edit_text_safe(cb, text, keyboard)
+    await cb.answer("Вибір скасовано", show_alert=False)
+
+
+@router.callback_query(F.data.startswith("admin_net_delete_apply:"))
+async def cb_admin_net_delete_apply(cb: CallbackQuery):
+    try:
+        _, selection_token, page_index_text = cb.data.split(":", 2)
+        page_index = int(page_index_text)
+    except Exception:
+        await cb.answer()
+        return
+    selection_context = NETWORK_CHANNEL_DELETE_SELECTION_CONTEXTS.get(selection_token)
+    if not selection_context:
+        await cb.answer("Сесія видалення застаріла. Відкрий список заново.", show_alert=True)
+        return
+    network_id = int(selection_context.get("network_id") or 0)
+    selected_channel_ids = {
+        int(selected_channel_id)
+        for selected_channel_id in selection_context.get("selected_channel_ids", set())
+        if selected_channel_id is not None
+    }
+    if not selected_channel_ids:
+        await cb.answer("Спочатку обери канали для видалення", show_alert=True)
+        return
+
+    db = next(_db())
+    network_record = db.execute(select(m.Network).where(m.Network.id == network_id)).scalar_one_or_none()
+    if not network_record:
+        await cb.answer("Сітку не знайдено", show_alert=True)
+        return
+
+    selection_context["is_delete_confirmation_armed"] = True
+    channel_records = _list_network_channels_for_delete(db, network_id)
+    text, keyboard = _render_network_channels_delete_page(
+        db=db,
+        network_record=network_record,
+        channel_records=channel_records,
+        selection_token=selection_token,
+        selected_channel_ids=selected_channel_ids,
+        page_index=page_index,
+        is_delete_confirmation_armed=True,
+    )
+    await _edit_text_safe(cb, text, keyboard)
+    await cb.answer("Підтверди видалення", show_alert=False)
+
+
+@router.callback_query(F.data.startswith("admin_net_delete_disarm:"))
+async def cb_admin_net_delete_disarm(cb: CallbackQuery):
+    try:
+        _, selection_token, page_index_text = cb.data.split(":", 2)
+        page_index = int(page_index_text)
+    except Exception:
+        await cb.answer()
+        return
+    selection_context = NETWORK_CHANNEL_DELETE_SELECTION_CONTEXTS.get(selection_token)
+    if not selection_context:
+        await cb.answer("Сесія видалення застаріла. Відкрий список заново.", show_alert=True)
+        return
+    selection_context["is_delete_confirmation_armed"] = False
+    network_id = int(selection_context.get("network_id") or 0)
+    selected_channel_ids = {
+        int(selected_channel_id)
+        for selected_channel_id in selection_context.get("selected_channel_ids", set())
+        if selected_channel_id is not None
+    }
+    db = next(_db())
+    network_record = db.execute(select(m.Network).where(m.Network.id == network_id)).scalar_one_or_none()
+    if not network_record:
+        await cb.answer("Сітку не знайдено", show_alert=True)
+        return
+    channel_records = _list_network_channels_for_delete(db, network_id)
+    text, keyboard = _render_network_channels_delete_page(
+        db=db,
+        network_record=network_record,
+        channel_records=channel_records,
+        selection_token=selection_token,
+        selected_channel_ids=selected_channel_ids,
+        page_index=page_index,
+        is_delete_confirmation_armed=False,
+    )
+    await _edit_text_safe(cb, text, keyboard)
+    await cb.answer("Підтвердження скасовано", show_alert=False)
+
+
+@router.callback_query(F.data.startswith("admin_net_delete_confirm:"))
+async def cb_admin_net_delete_confirm(cb: CallbackQuery):
+    try:
+        _, selection_token, page_index_text = cb.data.split(":", 2)
+        page_index = int(page_index_text)
+    except Exception:
+        await cb.answer()
+        return
+    selection_context = NETWORK_CHANNEL_DELETE_SELECTION_CONTEXTS.get(selection_token)
+    if not selection_context:
+        await cb.answer("Сесія видалення застаріла. Відкрий список заново.", show_alert=True)
+        return
+    if not bool(selection_context.get("is_delete_confirmation_armed", False)):
+        await cb.answer("Натисни «Видалити» для підтвердження", show_alert=True)
+        return
+    network_id = int(selection_context.get("network_id") or 0)
+    selected_channel_ids = {
+        int(selected_channel_id)
+        for selected_channel_id in selection_context.get("selected_channel_ids", set())
+        if selected_channel_id is not None
+    }
+    if not selected_channel_ids:
+        selection_context["is_delete_confirmation_armed"] = False
+        await cb.answer("Спочатку обери канали для видалення", show_alert=True)
+        return
+
+    db = next(_db())
+    network_record = db.execute(select(m.Network).where(m.Network.id == network_id)).scalar_one_or_none()
+    if not network_record:
+        await cb.answer("Сітку не знайдено", show_alert=True)
+        return
+
+    channel_ids_in_network = {
+        int(channel_id)
+        for channel_id in db.execute(
+            select(m.NetworkChannel.channel_id).where(
+                m.NetworkChannel.network_id == network_id,
+                m.NetworkChannel.channel_id.in_(selected_channel_ids),
+            )
+        ).scalars().all()
+        if channel_id is not None
+    }
+    if not channel_ids_in_network:
+        selection_context["selected_channel_ids"] = set()
+        selection_context["is_delete_confirmation_armed"] = False
+        channel_records = _list_network_channels_for_delete(db, network_id)
+        text, keyboard = _render_network_channels_delete_page(
+            db=db,
+            network_record=network_record,
+            channel_records=channel_records,
+            selection_token=selection_token,
+            selected_channel_ids=set(),
+            page_index=page_index,
+            is_delete_confirmation_armed=False,
+        )
+        await _edit_text_safe(cb, text, keyboard)
+        await cb.answer("Обрані канали вже відсутні в сітці", show_alert=True)
+        return
+
+    left_total = 0
+    leave_skipped_total = 0
+    leave_errors_total = 0
+    deleted_channels_count = 0
+    for channel_id in sorted(channel_ids_in_network):
+        membership_session_names = sorted(
+            {
+                str(session_name).strip()
+                for session_name in db.execute(
+                    select(m.Membership.account).where(
+                        m.Membership.channel_id == channel_id,
+                        m.Membership.account != "",
+                    )
+                ).scalars().all()
+                if session_name
+            }
+        )
+        for membership_session_name in membership_session_names:
+            leave_result = await account_pool.leave_channels(membership_session_name, [channel_id])
+            left_total += int(leave_result.get("left", 0) or 0)
+            leave_skipped_total += int(leave_result.get("skipped", 0) or 0)
+            leave_errors_total += int(leave_result.get("errors", 0) or 0)
+        svc_networks.delete_channel_and_relations(db, channel_id)
+        deleted_channels_count += 1
+
+    selection_context["selected_channel_ids"] = set()
+    selection_context["is_delete_confirmation_armed"] = False
+    channel_records = _list_network_channels_for_delete(db, network_id)
+    text, keyboard = _render_network_channels_delete_page(
+        db=db,
+        network_record=network_record,
+        channel_records=channel_records,
+        selection_token=selection_token,
+        selected_channel_ids=set(),
+        page_index=page_index,
+        is_delete_confirmation_armed=False,
+    )
+    await _edit_text_safe(cb, text, keyboard)
+    await cb.answer(
+        f"Видалено каналів: {deleted_channels_count}. Відписка left={left_total}, skipped={leave_skipped_total}, errors={leave_errors_total}",
+        show_alert=True,
+    )
 
 
 @router.callback_query(F.data.startswith("admin_net_refresh:"))
@@ -471,6 +1261,40 @@ async def cb_admins_page_nav(cb: CallbackQuery):
         return
     kb = _build_admins_kb(admins, page=cur_page, per_page=ADMINS_PER_PAGE)
     await cb.message.edit_text("Адміни:", reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(
+    F.data.in_(["admins_missing_page_prev", "admins_missing_page_next"])
+)
+async def cb_admins_missing_page_nav(cb: CallbackQuery):
+    administrator_with_missing_channels_list = (
+        _load_admins_with_missing_channel_counts()
+    )
+    if not administrator_with_missing_channels_list:
+        text, keyboard = _build_admins_with_missing_channels_view(page=0)
+        try:
+            await cb.message.edit_text(text, reply_markup=keyboard)
+        except TelegramBadRequest:
+            await cb.message.answer(text, reply_markup=keyboard)
+        await cb.answer()
+        return
+
+    total_pages = max(
+        1, math.ceil(len(administrator_with_missing_channels_list) / ADMINS_PER_PAGE)
+    )
+    current_page = _current_page_from_markup(cb.message)
+    previous_page = current_page
+    if cb.data == "admins_missing_page_prev":
+        current_page = (current_page - 1) % total_pages
+    else:
+        current_page = (current_page + 1) % total_pages
+    if current_page == previous_page:
+        await cb.answer()
+        return
+
+    text, keyboard = _build_admins_with_missing_channels_view(page=current_page)
+    await cb.message.edit_text(text, reply_markup=keyboard)
     await cb.answer()
 
 
@@ -977,6 +1801,47 @@ async def cb_admin_statuses(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("Надішли список URL (t.me/...), кожен з нового рядка. Я поверну статуси в тій самій послідовності.")
     await state.set_state(NetworkFlow.waiting_status_urls)
     await state.update_data(admin_id=admin_id)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("admin_missing_channels:"))
+async def cb_admin_missing_channels(cb: CallbackQuery):
+    callback_data_parts = (cb.data or "").split(":")
+    try:
+        admin_id = int(callback_data_parts[1])
+        page_number = int(callback_data_parts[2]) if len(callback_data_parts) > 2 else 0
+    except Exception:
+        await cb.answer()
+        return
+    database_session = next(_db())
+    admin = svc_admins.get_admin_by_id(database_session, admin_id)
+    if not admin:
+        await cb.answer("Адміна не знайдено", show_alert=True)
+        return
+    text, keyboard = _build_missing_channels_view(admin_id=admin_id, page_number=page_number)
+    await _edit_text_safe(cb, text, keyboard, parse_mode="HTML")
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("admin_service_order_channels:"))
+async def cb_admin_service_order_channels(cb: CallbackQuery):
+    callback_data_parts = (cb.data or "").split(":")
+    try:
+        admin_id = int(callback_data_parts[1])
+        page_number = int(callback_data_parts[2]) if len(callback_data_parts) > 2 else 0
+    except Exception:
+        await cb.answer()
+        return
+    database_session = next(_db())
+    admin = svc_admins.get_admin_by_id(database_session, admin_id)
+    if not admin:
+        await cb.answer("Адміна не знайдено", show_alert=True)
+        return
+    text, keyboard = _build_admin_channel_service_order_view(
+        admin_id=admin_id,
+        page_number=page_number,
+    )
+    await _edit_text_safe(cb, text, keyboard, parse_mode="HTML")
     await cb.answer()
 
 

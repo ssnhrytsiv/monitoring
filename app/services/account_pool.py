@@ -7,12 +7,14 @@ import logging
 import sqlite3
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Optional, List, Union
+from typing import Dict, Optional, List, Union
 
 from telethon import TelegramClient, errors
 from telethon.tl import types, functions
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.network.connection import ConnectionTcpAbridged
+
+from app.DAL import channel_subscription_audit_operations
 
 log = logging.getLogger("services.account_pool")
 
@@ -49,6 +51,10 @@ def _parse_accounts_env() -> List[str]:
     return out
 
 POOL_SESSIONS = _parse_accounts_env()
+SUBSCRIPTION_AUDIT_REFRESH_MIN_INTERVAL_SECONDS = max(
+    0,
+    int(_env("SUBSCRIPTION_AUDIT_REFRESH_MIN_INTERVAL_SECONDS", "90") or "90"),
+)
 
 # ---------- structures ----------
 @dataclass
@@ -65,6 +71,8 @@ _POOL_LOCK = asyncio.Lock()
 _rr = 0  # round-robin індекс
 _limits_checker_task: Optional[asyncio.Task] = None
 _health_checker_task: Optional[asyncio.Task] = None
+_subscription_audit_refresh_lock = asyncio.Lock()
+_subscription_audit_last_started_at_epoch_seconds: float = 0.0
 
 # ---------- utils ----------
 def _normalize_session_name(name: str) -> str:
@@ -127,6 +135,23 @@ def list_session_names() -> List[str]:
     """
     return [s.name for s in _POOL]
 
+
+def is_subscription_audit_refresh_running() -> bool:
+    return _subscription_audit_refresh_lock.locked()
+
+
+def get_subscription_audit_refresh_seconds_until_next_allowed() -> int:
+    if SUBSCRIPTION_AUDIT_REFRESH_MIN_INTERVAL_SECONDS <= 0:
+        return 0
+    seconds_since_last_refresh_start = int(
+        time.time() - _subscription_audit_last_started_at_epoch_seconds
+    )
+    remaining_seconds = (
+        SUBSCRIPTION_AUDIT_REFRESH_MIN_INTERVAL_SECONDS
+        - seconds_since_last_refresh_start
+    )
+    return max(0, int(remaining_seconds))
+
 def _set_ready_after(slot: ClientSlot, seconds: int) -> None:
     now = time.time()
     until = now + max(0, int(seconds))
@@ -162,19 +187,28 @@ def mark_limit(client_or_slot: Union[TelegramClient, ClientSlot], days: int = 2)
     log.warning("mark_limit: %s sleeps until %.0f (+%ss, ~%d days)", slot.name, slot.next_ready, seconds, days)
 
 
-async def _count_memberships(slot: ClientSlot) -> int:
+async def _collect_subscribed_channel_identifier_set(slot: ClientSlot) -> set[int]:
     """
-    Рахує кількість каналів/супергруп для сесії.
+    Збирає channel_id каналів/супергруп, на які підписана сесія.
     """
-    total = 0
+    subscribed_channel_identifier_set: set[int] = set()
     try:
         async for dlg in slot.client.iter_dialogs():
             ent = dlg.entity
             if isinstance(ent, types.Channel):
-                total += 1
+                subscribed_channel_identifier_set.add(int(ent.id))
     except Exception as e:
-        log.warning("count_memberships failed for %s: %s", slot.name, e)
-    return total
+        log.warning("collect_subscribed_channel_identifier_set failed for %s: %s", slot.name, e)
+        raise
+    return subscribed_channel_identifier_set
+
+
+async def _count_memberships(slot: ClientSlot) -> int:
+    """
+    Рахує кількість каналів/супергруп для сесії.
+    """
+    subscribed_channel_identifier_set = await _collect_subscribed_channel_identifier_set(slot)
+    return len(subscribed_channel_identifier_set)
 
 
 async def _check_pool_limits(reason: str = "periodic") -> None:
@@ -182,10 +216,22 @@ async def _check_pool_limits(reason: str = "periodic") -> None:
     Якщо total > 498 — ставимо слот у sleep на добу.
     """
     if not _POOL:
+        try:
+            channel_subscription_audit_operations.refresh_channel_subscription_audit_snapshot(
+                subscribed_channel_identifier_list=[],
+                failed_session_name_list=["pool_empty"],
+                audit_reason=reason,
+            )
+        except Exception as e:
+            log.warning("subscription_audit refresh failed with empty pool: %s", e)
         return
+    all_subscribed_channel_identifier_set: set[int] = set()
+    failed_session_name_list: list[str] = []
     for slot in _POOL:
         try:
-            total = await _count_memberships(slot)
+            subscribed_channel_identifier_set = await _collect_subscribed_channel_identifier_set(slot)
+            all_subscribed_channel_identifier_set.update(subscribed_channel_identifier_set)
+            total = len(subscribed_channel_identifier_set)
             if total > 498:
                 mark_limit(slot, days=1)
                 log.warning(
@@ -197,7 +243,97 @@ async def _check_pool_limits(reason: str = "periodic") -> None:
             else:
                 log.debug("limit_check: %s ok (channels=%d) reason=%s", slot.name, total, reason)
         except Exception as e:
+            failed_session_name_list.append(slot.name)
             log.warning("limit_check failed for %s: %s", slot.name, e)
+    try:
+        channel_subscription_audit_operations.refresh_channel_subscription_audit_snapshot(
+            subscribed_channel_identifier_list=list(all_subscribed_channel_identifier_set),
+            failed_session_name_list=failed_session_name_list,
+            audit_reason=reason,
+        )
+    except Exception as e:
+        log.warning("subscription_audit refresh failed reason=%s: %s", reason, e)
+
+
+async def refresh_channel_subscription_audit_snapshot_now(
+    audit_reason: str = "manual",
+) -> Dict[str, object]:
+    if _subscription_audit_refresh_lock.locked():
+        return {
+            "session_count": len(_POOL),
+            "failed_session_name_list": [],
+            "subscribed_channel_count": 0,
+            "is_skipped_due_to_running_refresh": True,
+            "is_skipped_due_to_cooldown": False,
+            "seconds_until_next_allowed": get_subscription_audit_refresh_seconds_until_next_allowed(),
+        }
+
+    seconds_until_next_allowed = get_subscription_audit_refresh_seconds_until_next_allowed()
+    if seconds_until_next_allowed > 0:
+        return {
+            "session_count": len(_POOL),
+            "failed_session_name_list": [],
+            "subscribed_channel_count": 0,
+            "is_skipped_due_to_running_refresh": False,
+            "is_skipped_due_to_cooldown": True,
+            "seconds_until_next_allowed": seconds_until_next_allowed,
+        }
+
+    async with _subscription_audit_refresh_lock:
+        global _subscription_audit_last_started_at_epoch_seconds
+        _subscription_audit_last_started_at_epoch_seconds = time.time()
+
+        all_subscribed_channel_identifier_set: set[int] = set()
+        failed_session_name_list: list[str] = []
+
+        if not _POOL:
+            channel_subscription_audit_operations.refresh_channel_subscription_audit_snapshot(
+                subscribed_channel_identifier_list=[],
+                failed_session_name_list=["pool_empty"],
+                audit_reason=audit_reason,
+            )
+            return {
+                "session_count": 0,
+                "failed_session_name_list": ["pool_empty"],
+                "subscribed_channel_count": 0,
+                "is_skipped_due_to_running_refresh": False,
+                "is_skipped_due_to_cooldown": False,
+                "seconds_until_next_allowed": get_subscription_audit_refresh_seconds_until_next_allowed(),
+            }
+
+        for client_slot in _POOL:
+            if client_slot.busy or client_slot.lock.locked():
+                failed_session_name_list.append(client_slot.name)
+                continue
+            try:
+                async with client_slot.lock:
+                    subscribed_channel_identifier_set = (
+                        await _collect_subscribed_channel_identifier_set(client_slot)
+                    )
+                all_subscribed_channel_identifier_set.update(
+                    subscribed_channel_identifier_set
+                )
+            except Exception as error:
+                failed_session_name_list.append(client_slot.name)
+                log.warning(
+                    "manual subscription audit scan failed for session=%s reason=%s",
+                    client_slot.name,
+                    error,
+                )
+
+        channel_subscription_audit_operations.refresh_channel_subscription_audit_snapshot(
+            subscribed_channel_identifier_list=list(all_subscribed_channel_identifier_set),
+            failed_session_name_list=failed_session_name_list,
+            audit_reason=audit_reason,
+        )
+        return {
+            "session_count": len(_POOL),
+            "failed_session_name_list": failed_session_name_list,
+            "subscribed_channel_count": len(all_subscribed_channel_identifier_set),
+            "is_skipped_due_to_running_refresh": False,
+            "is_skipped_due_to_cooldown": False,
+            "seconds_until_next_allowed": get_subscription_audit_refresh_seconds_until_next_allowed(),
+        }
 
 
 async def _limits_checker_loop() -> None:
@@ -408,14 +544,20 @@ async def is_already_subscribed(url: str) -> Optional[str]:
 async def leave_channels(session_name: str, channel_ids: List[int]) -> dict:
     """
     Відписує пуловий клієнт від переданих channel_ids.
-    Повертає лічильники успішних/помилкових виходів.
+    Повертає лічильники успішних/пропущених/помилкових виходів.
     """
     slot = find_slot_by_session_name(session_name)
     if not slot:
-        return {"session": session_name, "left": 0, "errors": len(channel_ids), "reason": "session_not_in_pool"}
+        return {
+            "session": session_name,
+            "left": 0,
+            "skipped": len(channel_ids),
+            "errors": 0,
+            "reason": "session_not_in_pool",
+        }
 
     client = slot.client
-    left, errors_cnt = 0, 0
+    left, skipped_cnt, errors_cnt = 0, 0, 0
     for cid in channel_ids:
         try:
             ent = await client.get_entity(cid)
@@ -423,8 +565,8 @@ async def leave_channels(session_name: str, channel_ids: List[int]) -> dict:
             left += 1
             bump_cooldown(client, 2)
         except (errors.UserNotParticipantError, errors.ChannelPrivateError):
-            errors_cnt += 1
+            skipped_cnt += 1
         except Exception as e:
             errors_cnt += 1
             log.warning("leave_channels: %s failed for cid=%s: %s", slot.name, cid, e)
-    return {"session": session_name, "left": left, "errors": errors_cnt}
+    return {"session": session_name, "left": left, "skipped": skipped_cnt, "errors": errors_cnt}

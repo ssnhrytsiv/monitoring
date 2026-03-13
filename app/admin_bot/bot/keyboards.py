@@ -1,12 +1,37 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+from app.DAL import channel_subscription_audit_operations
+
+
+def _get_total_missing_channels_count() -> int:
+    try:
+        return max(
+            0,
+            int(
+                channel_subscription_audit_operations.count_missing_channels_for_all_admins()
+            ),
+        )
+    except Exception:
+        return 0
+
 
 def main_menu_kb() -> InlineKeyboardMarkup:
+    total_missing_channel_count = _get_total_missing_channels_count()
+    inline_keyboard_rows = [
+        [InlineKeyboardButton(text="Адміни", callback_data="show_admins")],
+        [InlineKeyboardButton(text="🔁 Дедуп підписок", callback_data="dedup_sessions")],
+    ]
+    if total_missing_channel_count > 0:
+        inline_keyboard_rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🔴 Missing к-сть каналів ({total_missing_channel_count})",
+                    callback_data="admins_missing_total",
+                )
+            ]
+        )
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Адміни", callback_data="show_admins")],
-            [InlineKeyboardButton(text="🔁 Дедуп підписок", callback_data="dedup_sessions")],
-        ]
+        inline_keyboard=inline_keyboard_rows
     )
 
 
