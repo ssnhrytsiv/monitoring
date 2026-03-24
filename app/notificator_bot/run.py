@@ -10,9 +10,15 @@ from app.notificator_bot.config import NOTIFIER_BOT_TOKEN, NOTIFIER_POLL_INTERVA
 from app.notificator_bot.service import send_notifications
 from app.notificator_bot.models import ensure_tables
 from app.notificator_bot.handlers import (
+    NOTIFICATION_MANAGE_CALLBACK_PREFIX,
     NOTIFICATION_PAGE_CALLBACK_PREFIX,
+    NOTIFICATION_PAGE_NOOP_CALLBACK_DATA,
+    NOTIFICATION_PREVIEW_CALLBACK_PREFIX,
     inline_handler,
+    notification_manage_handler,
+    notification_page_noop_handler,
     notification_page_navigation_handler,
+    notification_preview_handler,
 )
 
 
@@ -45,6 +51,18 @@ async def start_notificator_bot():
     dp.callback_query.register(
         notification_page_navigation_handler,
         F.data.startswith(f"{NOTIFICATION_PAGE_CALLBACK_PREFIX}:"),
+    )
+    dp.callback_query.register(
+        notification_page_noop_handler,
+        F.data == NOTIFICATION_PAGE_NOOP_CALLBACK_DATA,
+    )
+    dp.callback_query.register(
+        notification_manage_handler,
+        F.data.startswith(f"{NOTIFICATION_MANAGE_CALLBACK_PREFIX}:"),
+    )
+    dp.callback_query.register(
+        notification_preview_handler,
+        F.data.startswith(f"{NOTIFICATION_PREVIEW_CALLBACK_PREFIX}:"),
     )
 
     worker_task = asyncio.create_task(_worker(bot), name="notifier_worker")

@@ -29,6 +29,7 @@ def load_templates_map() -> Dict[int, Dict[str, Any]]:
                 _created_at,
                 title,
                 links_json,
+                _photo_id,
             ) = row
             templates[int(template_id)] = {
                 "title": title,

@@ -5,9 +5,10 @@ import time
 import asyncio
 import logging
 import sqlite3
+from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Dict, Optional, List, Union
+from typing import Dict, Optional, List, Set, Tuple, Union
 
 from telethon import TelegramClient, errors
 from telethon.tl import types, functions
@@ -15,6 +16,7 @@ from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.network.connection import ConnectionTcpAbridged
 
 from app.DAL import channel_subscription_audit_operations
+from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now
 
 log = logging.getLogger("services.account_pool")
 
@@ -54,6 +56,18 @@ POOL_SESSIONS = _parse_accounts_env()
 SUBSCRIPTION_AUDIT_REFRESH_MIN_INTERVAL_SECONDS = max(
     0,
     int(_env("SUBSCRIPTION_AUDIT_REFRESH_MIN_INTERVAL_SECONDS", "90") or "90"),
+)
+SUBSCRIPTION_AUDIT_REFRESH_ON_STARTUP = _env(
+    "SUBSCRIPTION_AUDIT_REFRESH_ON_STARTUP",
+    "0",
+).strip().lower() not in ("0", "false", "no", "off", "")
+SUBSCRIPTION_AUDIT_DAILY_HOUR_MSK = min(
+    23,
+    max(0, int(_env("SUBSCRIPTION_AUDIT_DAILY_HOUR_MSK", "4") or "4")),
+)
+SUBSCRIPTION_AUDIT_DAILY_MINUTE_MSK = min(
+    59,
+    max(0, int(_env("SUBSCRIPTION_AUDIT_DAILY_MINUTE_MSK", "0") or "0")),
 )
 
 # ---------- structures ----------
@@ -211,43 +225,86 @@ async def _count_memberships(slot: ClientSlot) -> int:
     return len(subscribed_channel_identifier_set)
 
 
+def _build_union_channel_identifier_set(
+    session_channel_identifier_map: Dict[str, Set[int]],
+) -> Set[int]:
+    union_channel_identifier_set: Set[int] = set()
+    for channel_identifier_set in session_channel_identifier_map.values():
+        union_channel_identifier_set.update(channel_identifier_set)
+    return union_channel_identifier_set
+
+
+async def _collect_pool_session_channel_identifier_map(
+    *,
+    skip_busy_or_locked_slot: bool,
+) -> Tuple[Dict[str, Set[int]], List[str]]:
+    session_channel_identifier_map: Dict[str, Set[int]] = {}
+    failed_session_name_list: List[str] = []
+    for slot in _POOL:
+        if skip_busy_or_locked_slot and (slot.busy or slot.lock.locked()):
+            failed_session_name_list.append(slot.name)
+            continue
+        try:
+            if skip_busy_or_locked_slot:
+                async with slot.lock:
+                    subscribed_channel_identifier_set = (
+                        await _collect_subscribed_channel_identifier_set(slot)
+                    )
+            else:
+                subscribed_channel_identifier_set = (
+                    await _collect_subscribed_channel_identifier_set(slot)
+                )
+            session_channel_identifier_map[slot.name] = subscribed_channel_identifier_set
+        except Exception as error:
+            failed_session_name_list.append(slot.name)
+            log.warning(
+                "subscription audit scan failed for session=%s reason=%s",
+                slot.name,
+                error,
+            )
+    return session_channel_identifier_map, failed_session_name_list
+
+
 async def _check_pool_limits(reason: str = "periodic") -> None:
     """
     Якщо total > 498 — ставимо слот у sleep на добу.
     """
     if not _POOL:
         try:
-            channel_subscription_audit_operations.refresh_channel_subscription_audit_snapshot(
-                subscribed_channel_identifier_list=[],
+            channel_subscription_audit_operations.refresh_channel_subscription_audit_snapshot_from_session_map(
+                session_channel_identifier_map={},
                 failed_session_name_list=["pool_empty"],
                 audit_reason=reason,
             )
         except Exception as e:
             log.warning("subscription_audit refresh failed with empty pool: %s", e)
         return
-    all_subscribed_channel_identifier_set: set[int] = set()
-    failed_session_name_list: list[str] = []
+    (
+        session_channel_identifier_map,
+        failed_session_name_list,
+    ) = await _collect_pool_session_channel_identifier_map(
+        skip_busy_or_locked_slot=False,
+    )
     for slot in _POOL:
-        try:
-            subscribed_channel_identifier_set = await _collect_subscribed_channel_identifier_set(slot)
-            all_subscribed_channel_identifier_set.update(subscribed_channel_identifier_set)
-            total = len(subscribed_channel_identifier_set)
-            if total > 498:
-                mark_limit(slot, days=1)
-                log.warning(
-                    "limit_check: %s marked sleep (channels=%d) reason=%s",
-                    slot.name,
-                    total,
-                    reason,
-                )
-            else:
-                log.debug("limit_check: %s ok (channels=%d) reason=%s", slot.name, total, reason)
-        except Exception as e:
-            failed_session_name_list.append(slot.name)
-            log.warning("limit_check failed for %s: %s", slot.name, e)
+        if slot.name in failed_session_name_list:
+            continue
+        subscribed_channel_identifier_set = session_channel_identifier_map.get(
+            slot.name, set()
+        )
+        total = len(subscribed_channel_identifier_set)
+        if total > 498:
+            mark_limit(slot, days=1)
+            log.warning(
+                "limit_check: %s marked sleep (channels=%d) reason=%s",
+                slot.name,
+                total,
+                reason,
+            )
+        else:
+            log.debug("limit_check: %s ok (channels=%d) reason=%s", slot.name, total, reason)
     try:
-        channel_subscription_audit_operations.refresh_channel_subscription_audit_snapshot(
-            subscribed_channel_identifier_list=list(all_subscribed_channel_identifier_set),
+        channel_subscription_audit_operations.refresh_channel_subscription_audit_snapshot_from_session_map(
+            session_channel_identifier_map=session_channel_identifier_map,
             failed_session_name_list=failed_session_name_list,
             audit_reason=reason,
         )
@@ -283,12 +340,9 @@ async def refresh_channel_subscription_audit_snapshot_now(
         global _subscription_audit_last_started_at_epoch_seconds
         _subscription_audit_last_started_at_epoch_seconds = time.time()
 
-        all_subscribed_channel_identifier_set: set[int] = set()
-        failed_session_name_list: list[str] = []
-
         if not _POOL:
-            channel_subscription_audit_operations.refresh_channel_subscription_audit_snapshot(
-                subscribed_channel_identifier_list=[],
+            channel_subscription_audit_operations.refresh_channel_subscription_audit_snapshot_from_session_map(
+                session_channel_identifier_map={},
                 failed_session_name_list=["pool_empty"],
                 audit_reason=audit_reason,
             )
@@ -301,28 +355,18 @@ async def refresh_channel_subscription_audit_snapshot_now(
                 "seconds_until_next_allowed": get_subscription_audit_refresh_seconds_until_next_allowed(),
             }
 
-        for client_slot in _POOL:
-            if client_slot.busy or client_slot.lock.locked():
-                failed_session_name_list.append(client_slot.name)
-                continue
-            try:
-                async with client_slot.lock:
-                    subscribed_channel_identifier_set = (
-                        await _collect_subscribed_channel_identifier_set(client_slot)
-                    )
-                all_subscribed_channel_identifier_set.update(
-                    subscribed_channel_identifier_set
-                )
-            except Exception as error:
-                failed_session_name_list.append(client_slot.name)
-                log.warning(
-                    "manual subscription audit scan failed for session=%s reason=%s",
-                    client_slot.name,
-                    error,
-                )
+        (
+            session_channel_identifier_map,
+            failed_session_name_list,
+        ) = await _collect_pool_session_channel_identifier_map(
+            skip_busy_or_locked_slot=True,
+        )
+        all_subscribed_channel_identifier_set = _build_union_channel_identifier_set(
+            session_channel_identifier_map
+        )
 
-        channel_subscription_audit_operations.refresh_channel_subscription_audit_snapshot(
-            subscribed_channel_identifier_list=list(all_subscribed_channel_identifier_set),
+        channel_subscription_audit_operations.refresh_channel_subscription_audit_snapshot_from_session_map(
+            session_channel_identifier_map=session_channel_identifier_map,
             failed_session_name_list=failed_session_name_list,
             audit_reason=audit_reason,
         )
@@ -336,10 +380,43 @@ async def refresh_channel_subscription_audit_snapshot_now(
         }
 
 
+def _get_next_subscription_audit_run_at_msk(
+    now_value: datetime | None = None,
+) -> datetime:
+    current_moscow_datetime = now_value or moscow_now()
+    next_run_datetime = current_moscow_datetime.replace(
+        hour=SUBSCRIPTION_AUDIT_DAILY_HOUR_MSK,
+        minute=SUBSCRIPTION_AUDIT_DAILY_MINUTE_MSK,
+        second=0,
+        microsecond=0,
+    )
+    if next_run_datetime <= current_moscow_datetime:
+        next_run_datetime += timedelta(days=1)
+    return next_run_datetime
+
+
+def _get_seconds_until_next_subscription_audit_run(
+    now_value: datetime | None = None,
+) -> float:
+    current_moscow_datetime = now_value or moscow_now()
+    next_run_datetime = _get_next_subscription_audit_run_at_msk(current_moscow_datetime)
+    seconds_until_next_run = (
+        next_run_datetime - current_moscow_datetime
+    ).total_seconds()
+    return max(0.0, float(seconds_until_next_run))
+
+
 async def _limits_checker_loop() -> None:
     while True:
-        await _check_pool_limits(reason="daily")
-        await asyncio.sleep(86400)
+        next_run_datetime = _get_next_subscription_audit_run_at_msk()
+        seconds_until_next_run = _get_seconds_until_next_subscription_audit_run()
+        log.info(
+            "subscription audit scheduled next run at %s (in %.0fs)",
+            next_run_datetime.strftime(MOSCOW_TIME_FORMAT),
+            seconds_until_next_run,
+        )
+        await asyncio.sleep(seconds_until_next_run)
+        await _check_pool_limits(reason="daily_0400_msk")
 
 
 async def _health_checker_loop() -> None:
@@ -449,8 +526,10 @@ async def start_pool() -> None:
         log.info("pool client ready: %s (%s)", sess, slot.human_display or sess)
     _POOL = pool
     log.info("account_pool started: %d clients", len(_POOL))
-    # Перевірка лімітів на старті
-    await _check_pool_limits(reason="startup")
+    if SUBSCRIPTION_AUDIT_REFRESH_ON_STARTUP:
+        await _check_pool_limits(reason="startup")
+    else:
+        log.info("subscription audit on startup is disabled")
     # Плановий щоденний чекер
     if _limits_checker_task is None:
         _limits_checker_task = asyncio.create_task(_limits_checker_loop())

@@ -129,3 +129,4 @@ wcwidth==0.2.13
 yarl==1.20.1
 zipp==3.23.0
 pytz>=2023.3
+tzdata>=2024.1

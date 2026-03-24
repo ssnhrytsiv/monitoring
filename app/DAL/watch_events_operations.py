@@ -37,6 +37,37 @@ def insert_watch_event(
         db.close()
 
 
+def insert_watch_events_batch(
+    events: List[Tuple[int, str, str, Optional[str]]],
+) -> None:
+    """
+    Пакетно додає watch_events за один commit.
+    Елемент events: (watch_id, event_type, payload_json, created_at|None)
+    """
+    if not events:
+        return
+
+    db = SessionLocal()
+    try:
+        rows: List[m.WatchEvent] = []
+        for watch_id, event_type, payload_json, created_at in events:
+            rows.append(
+                m.WatchEvent(
+                    watch_id=int(watch_id),
+                    event_type=str(event_type),
+                    payload_json=str(payload_json or ""),
+                    created_at=created_at or _now_str(),
+                )
+            )
+        db.add_all(rows)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 def fetch_unsent_events(limit: int = 100) -> List[Tuple[int, int, str, str, str]]:
     db = SessionLocal()
     try:

@@ -6,6 +6,7 @@ import os
 from telethon.tl.types import Message as TgMessage  # тип пересланого поста
 from app.DAL.watch_posts_operations import (
     get_watch_channel_id,
+    get_watch_is_reply,
     get_watch_source_url,
     manual_mark_matched,
     set_watch_status_pending,
@@ -30,7 +31,7 @@ except Exception:
 def _read_default_coverage_hours() -> float:
     """
     Читаємо ті ж налаштування, що й posts_watch_listener._read_default_coverage_hours.
-    Якщо щось піде не так – fallback 24 години.
+    Якщо env не заданий — fallback 23 години 59 хвилин.
     """
     m = os.getenv("WATCH_COVERAGE_MINUTES")
     if m:
@@ -38,11 +39,13 @@ def _read_default_coverage_hours() -> float:
             return float(m) / 60.0
         except Exception:
             pass
-    h = os.getenv("WATCH_COVERAGE_HOURS", "24")
-    try:
-        return float(h)
-    except Exception:
-        return 24.0
+    h = os.getenv("WATCH_COVERAGE_HOURS")
+    if h:
+        try:
+            return float(h)
+        except Exception:
+            pass
+    return (23.0 * 60.0 + 59.0) / 60.0
 
 
 DEFAULT_COVERAGE_HOURS: float = _read_default_coverage_hours()
@@ -83,7 +86,7 @@ async def manual_match_watch_from_message(wid: int, msg: AiogramMessage) -> bool
         return False
 
     # 3) coverage_at
-    coverage_at = _calc_coverage_at()
+    coverage_at = None if get_watch_is_reply(wid) else _calc_coverage_at()
 
     # 4) session/source_url → DAO виконає force_mark_matched + подію
     source_url = get_watch_source_url(wid)

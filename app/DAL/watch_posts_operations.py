@@ -3,8 +3,9 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 import logging
+import os
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import or_, select, update, text
 
 import json
 from app.notificator_bot.db.posts_watch_result_models import (
@@ -23,13 +24,101 @@ ALLOWED_STATUSES: Dict[str, str] = {
     "pending": "pending",
     "matched": "matched",
     "expired": "expired",
+    "views_access_lost": "views_access_lost",
 }
 
 log = logging.getLogger(__name__)
+_ACTIVE_WATCH_INDEX_CHECKED: bool = False
 
 
 def _now_msk_str() -> str:
     return moscow_now().strftime(MOSCOW_TIME_FORMAT)
+
+
+def _ensure_active_watch_unique_index() -> None:
+    """
+    Ensure uq_active_watch matches business rule:
+    unique per (channel_id, template_id, expected_text_hash, time_window_end)
+    for active statuses pending|matched.
+    """
+    global _ACTIVE_WATCH_INDEX_CHECKED
+    if _ACTIVE_WATCH_INDEX_CHECKED:
+        return
+
+    db = WatchSessionLocal()
+    try:
+        bind = db.get_bind()
+        if bind is None or bind.dialect.name != "sqlite":
+            _ACTIVE_WATCH_INDEX_CHECKED = True
+            return
+
+        row = db.execute(
+            text("SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_active_watch'")
+        ).first()
+        current_sql = str(row[0] or "") if row else ""
+        normalized_sql = " ".join(current_sql.lower().split())
+        expected_fragment = "on watch_posts(channel_id, template_id, expected_text_hash, time_window_end)"
+        if expected_fragment in normalized_sql:
+            _ACTIVE_WATCH_INDEX_CHECKED = True
+            return
+
+        db.execute(text("DROP INDEX IF EXISTS uq_active_watch"))
+        db.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX uq_active_watch
+                ON watch_posts(channel_id, template_id, expected_text_hash, time_window_end)
+                WHERE status IN ('pending','matched')
+                """
+            )
+        )
+        db.commit()
+        log.info("watch_posts: migrated uq_active_watch to include time_window_end")
+        _ACTIVE_WATCH_INDEX_CHECKED = True
+    except Exception:
+        db.rollback()
+        log.warning("watch_posts: failed to ensure uq_active_watch index", exc_info=True)
+    finally:
+        db.close()
+
+
+def _parse_int_ids_csv(raw_value: str | None) -> List[int]:
+    result: List[int] = []
+    seen: set[int] = set()
+    if not raw_value:
+        return result
+    for raw_part in str(raw_value).split(","):
+        token = raw_part.strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except Exception:
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def _shared_watch_viewer_ids() -> List[int]:
+    env_ids = _parse_int_ids_csv(os.getenv("WATCH_SHARED_VIEWER_IDS"))
+    if env_ids:
+        return env_ids
+    # Default shared visibility for two operator accounts.
+    return [300851736, 7384359075]
+
+
+def _resolve_visible_creator_ids(viewer_user_id: int) -> List[int]:
+    try:
+        normalized_viewer_id = int(viewer_user_id)
+    except Exception:
+        return []
+    shared_ids = _shared_watch_viewer_ids()
+    if normalized_viewer_id in shared_ids:
+        return shared_ids
+    return [normalized_viewer_id]
 
 
 def _time_window_key(value: Any) -> Optional[str]:
@@ -44,7 +133,11 @@ def list_active_watches(
     statuses: Optional[List[str]] = None,
 ) -> List[Tuple[int, Optional[int], str, Optional[str], Optional[int], Optional[int], Optional[int]]]:
     """
-    Повертає активні вотчі користувача (або всі, якщо created_by NULL) з фільтром статусів.
+    Повертає активні вотчі для видимої зони користувача:
+    - власні created_by
+    - або shared created_by (для WATCH_SHARED_VIEWER_IDS)
+    - плюс created_by IS NULL
+    з фільтром статусів.
     Результат відсортований за id DESC.
     """
     if not statuses:
@@ -53,6 +146,11 @@ def list_active_watches(
     filtered_statuses = [ALLOWED_STATUSES[s] for s in statuses if s in ALLOWED_STATUSES]
     if not filtered_statuses:
         filtered_statuses = ["pending", "matched"]
+    visible_creator_ids = _resolve_visible_creator_ids(user_id)
+    if visible_creator_ids:
+        created_by_filter = WatchPost.created_by.in_(visible_creator_ids)
+    else:
+        created_by_filter = WatchPost.created_by == user_id
 
     db = WatchSessionLocal()
     try:
@@ -67,7 +165,7 @@ def list_active_watches(
                 WatchPost.group_id,
             )
             .where(
-                or_(WatchPost.created_by == user_id, WatchPost.created_by.is_(None)),
+                or_(created_by_filter, WatchPost.created_by.is_(None)),
                 WatchPost.status.in_(filtered_statuses),
             )
             .order_by(WatchPost.id.desc())
@@ -513,6 +611,19 @@ def manual_mark_matched(
     return True
 
 
+def get_watch_is_reply(watch_id: int) -> bool:
+    db = WatchSessionLocal()
+    try:
+        row = db.execute(
+            select(WatchPost.is_reply).where(WatchPost.id == int(watch_id)).limit(1)
+        ).first()
+    finally:
+        db.close()
+    if not row:
+        return False
+    return bool(row[0])
+
+
 def create_watch_group(
     project: Optional[str] = None,
     title: Optional[str] = None,
@@ -576,7 +687,9 @@ def create_watch(
     cpm_at_post: Optional[float] = None,
     price_at_post: Optional[float] = None,
     title: Optional[str] = None,
+    is_reply: bool = False,
 ) -> int:
+    _ensure_active_watch_unique_index()
     db = WatchSessionLocal()
     try:
         now_str = _now_msk_str()
@@ -605,6 +718,7 @@ def create_watch(
             cpm_at_post=cpm_at_post,
             price_at_post=price_at_post,
             title=title,
+            is_reply=bool(is_reply),
         )
         db.add(wp)
         db.commit()
@@ -621,6 +735,62 @@ def create_watch(
             wp.network_id,
         )
         return int(wp.id)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def bulk_create_watches(items: List[Dict[str, Any]]) -> List[int]:
+    """
+    Пакетно створює watch_posts (status=pending) за один commit.
+    Очікує список словників з ключами, сумісними з create_watch (окрім status/timestamps).
+    Повертає список створених id у тому ж порядку, що і items.
+    """
+    if not items:
+        return []
+
+    _ensure_active_watch_unique_index()
+    db = WatchSessionLocal()
+    try:
+        now_str = _now_msk_str()
+        objects: List[WatchPost] = []
+        for item in items:
+            obj = WatchPost(
+                channel_id=item.get("channel_id"),
+                group_id=item.get("group_id"),
+                template_id=item.get("template_id"),
+                expected_text_hash=item.get("expected_text_hash"),
+                expected_text_norm_len=item.get("expected_text_norm_len"),
+                expected_links_json=item.get("expected_links_json"),
+                expected_media_fingerprint=item.get("expected_media_fingerprint"),
+                time_window_start=item.get("time_window_start"),
+                time_window_end=item.get("time_window_end"),
+                status="pending",
+                created_at=now_str,
+                updated_at=now_str,
+                source_url=item.get("source_url"),
+                created_by=item.get("created_by"),
+                created_via=item.get("created_via"),
+                project=item.get("project"),
+                admin_id=item.get("admin_id"),
+                network_id=item.get("network_id"),
+                posted_at=item.get("posted_at"),
+                views_at_post=item.get("views_at_post"),
+                subs_at_post=item.get("subs_at_post"),
+                cpm_at_post=item.get("cpm_at_post"),
+                price_at_post=item.get("price_at_post"),
+                title=item.get("title"),
+                is_reply=bool(item.get("is_reply")),
+            )
+            objects.append(obj)
+
+        db.add_all(objects)
+        db.flush()
+        created_ids = [int(obj.id) for obj in objects]
+        db.commit()
+        return created_ids
     except Exception:
         db.rollback()
         raise
@@ -694,11 +864,17 @@ def find_active_duplicate(
     channel_id: int,
     template_id: Optional[int],
     expected_text_hash: Optional[str],
+    time_window_end: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Перевіряє, чи існує активний (pending|matched) watch із тим самим ключем.
     Повертає словник з короткою інформацією або None.
     """
+    _ensure_active_watch_unique_index()
+    normalized_time_window_end = str(time_window_end).strip() if time_window_end is not None else None
+    if normalized_time_window_end == "":
+        normalized_time_window_end = None
+
     db = WatchSessionLocal()
     try:
         row = db.execute(
@@ -716,6 +892,13 @@ def find_active_duplicate(
                 (
                     (WatchPost.expected_text_hash.is_(None) if expected_text_hash is None else WatchPost.expected_text_hash == expected_text_hash)
                 ),
+                (
+                    (
+                        WatchPost.time_window_end.is_(None)
+                        if normalized_time_window_end is None
+                        else WatchPost.time_window_end == normalized_time_window_end
+                    )
+                ),
                 WatchPost.status.in_(["pending", "matched"]),
             )
             .order_by(WatchPost.id.desc())
@@ -732,6 +915,84 @@ def find_active_duplicate(
         "time_window_end": row.time_window_end,
         "matched_message_id": row.matched_message_id,
     }
+
+
+def find_active_duplicates_bulk(
+    channel_ids: List[int],
+    template_id: Optional[int],
+    expected_text_hash: Optional[str],
+    time_window_end: Optional[str] = None,
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Пакетно повертає активні дублікати (pending|matched) для channel_ids.
+    Ключ словника — channel_id, значення — найновіший duplicate-рядок для каналу.
+    """
+    clean_channel_ids = []
+    seen_channel_ids: set[int] = set()
+    for raw_channel_id in channel_ids or []:
+        try:
+            channel_id = int(raw_channel_id)
+        except Exception:
+            continue
+        if channel_id <= 0 or channel_id in seen_channel_ids:
+            continue
+        seen_channel_ids.add(channel_id)
+        clean_channel_ids.append(channel_id)
+
+    if not clean_channel_ids:
+        return {}
+
+    _ensure_active_watch_unique_index()
+    normalized_time_window_end = str(time_window_end).strip() if time_window_end is not None else None
+    if normalized_time_window_end == "":
+        normalized_time_window_end = None
+
+    db = WatchSessionLocal()
+    try:
+        rows = db.execute(
+            select(
+                WatchPost.id,
+                WatchPost.channel_id,
+                WatchPost.status,
+                WatchPost.created_at,
+                WatchPost.time_window_end,
+                WatchPost.matched_message_id,
+            ).where(
+                WatchPost.channel_id.in_(clean_channel_ids),
+                (
+                    (WatchPost.template_id.is_(None) if template_id is None else WatchPost.template_id == int(template_id))
+                ),
+                (
+                    (WatchPost.expected_text_hash.is_(None) if expected_text_hash is None else WatchPost.expected_text_hash == expected_text_hash)
+                ),
+                (
+                    (
+                        WatchPost.time_window_end.is_(None)
+                        if normalized_time_window_end is None
+                        else WatchPost.time_window_end == normalized_time_window_end
+                    )
+                ),
+                WatchPost.status.in_(["pending", "matched"]),
+            )
+            .order_by(WatchPost.channel_id.asc(), WatchPost.id.desc())
+        ).all()
+    finally:
+        db.close()
+
+    result: Dict[int, Dict[str, Any]] = {}
+    for row in rows:
+        channel_id = int(row.channel_id)
+        if channel_id in result:
+            continue
+        result[channel_id] = {
+            "id": int(row.id),
+            "channel_id": channel_id,
+            "status": str(row.status or ""),
+            "created_at": row.created_at,
+            "time_window_end": row.time_window_end,
+            "matched_message_id": row.matched_message_id,
+        }
+    return result
 
 
 def get_watch_info(watch_id: int) -> Dict[str, Any]:
@@ -761,6 +1022,7 @@ def get_watch_info(watch_id: int) -> Dict[str, Any]:
                 WatchPost.time_window_start,
                 WatchPost.admin_id,
                 WatchPost.title,
+                WatchPost.is_reply,
             ).where(WatchPost.id == int(watch_id)).limit(1)
         ).first()
     finally:
@@ -787,6 +1049,7 @@ def get_watch_info(watch_id: int) -> Dict[str, Any]:
         "time_window_start": row.time_window_start,
         "admin_id": row.admin_id,
         "title": row.title,
+        "is_reply": bool(row.is_reply),
     }
 
 
@@ -810,6 +1073,9 @@ def fetch_watches_by_group(group_id: int) -> List[Dict[str, Any]]:
                 WatchPost.deleted_at,
                 WatchPost.final_views,
                 WatchPost.title,
+                WatchPost.is_reply,
+                WatchPost.matched_session,
+                WatchPost.template_id,
             )
             .where(WatchPost.group_id == int(group_id))
             .order_by(WatchPost.id.asc())
@@ -832,6 +1098,9 @@ def fetch_watches_by_group(group_id: int) -> List[Dict[str, Any]]:
                 "deleted_at": str(r.deleted_at or ""),
                 "final_views": r.final_views,
                 "title": r.title,
+                "is_reply": bool(r.is_reply),
+                "matched_session": str(r.matched_session or ""),
+                "template_id": r.template_id,
             }
         )
     return result

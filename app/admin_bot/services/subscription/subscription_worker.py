@@ -27,10 +27,13 @@ from app.admin_bot.services import admins as svc_admins
 from app.admin_bot.services import networks as svc_networks
 from app.admin_bot.db.session import SessionLocal
 from app.admin_bot.db import models as m
+from app.DAL import channel_session_assignment_operations as assignment_ops
+from app.DAL import channel_subscription_audit_operations as audit_ops
 from app.admin_bot.services.subscription.subscription_slots_pool import get_ready_slot
 from app.admin_bot.services.subscription.subscription_status import normalize_url, render_html_with_statuses
 from app.admin_bot.services.subscription.subscription_report import answer_with_retry
 from app.admin_bot.services.subscription.subscription_utils import norm_keys as collect_norm_keys
+from app.services.channel_session_cleanup import enforce_single_session_per_channel
 from app.logging_json import get_logger, configure_logging
 from app.DAL import channels_operations as cho
 from app.DAL import requested_operations as requested_checks_db
@@ -75,6 +78,230 @@ def _add_link(channel_id, raw_url, kind, batch_msg_id, owner_display, owner_user
         db.close()
 
 
+def _resolve_assignment_admin_identifier(
+    *,
+    admin_id: Optional[int],
+    other_owner_id: Optional[int],
+) -> Optional[int]:
+    if other_owner_id is not None:
+        return int(other_owner_id)
+    if admin_id is not None:
+        return int(admin_id)
+    return None
+
+
+def _maybe_upsert_channel_session_assignment(
+    *,
+    channel_id: Optional[int],
+    session_name_value: Optional[str],
+    base_status: str,
+    admin_id: Optional[int],
+    other_owner_id: Optional[int],
+    assignment_source: str,
+    skip_assignment: bool,
+) -> None:
+    if skip_assignment:
+        return
+    if base_status not in ("joined", "already"):
+        return
+    if channel_id is None or not session_name_value:
+        return
+
+    assignment_admin_id = _resolve_assignment_admin_identifier(
+        admin_id=admin_id,
+        other_owner_id=other_owner_id,
+    )
+    try:
+        assignment_ops.upsert_channel_session_assignment(
+            channel_id=int(channel_id),
+            session_name=session_name_value,
+            admin_id=assignment_admin_id,
+            assignment_source=assignment_source,
+        )
+    except Exception:
+        log.exception(
+            "queue_worker.assignment_upsert_failed cid=%s sess=%s status=%s source=%s",
+            channel_id,
+            session_name_value,
+            base_status,
+            assignment_source,
+        )
+
+
+def _should_bypass_positive_cache(channel_id: Optional[int]) -> bool:
+    if channel_id is None:
+        return False
+    try:
+        return audit_ops.should_bypass_positive_channel_cache(int(channel_id))
+    except Exception:
+        log.debug(
+            "queue_worker.audit_positive_cache_check_failed cid=%s",
+            channel_id,
+            exc_info=True,
+        )
+        return False
+
+
+def _get_effective_session_hint(
+    channel_id: Optional[int],
+    membership_db: MembershipDAO,
+) -> Optional[str]:
+    if channel_id is None:
+        return None
+    try:
+        assigned_session_name = assignment_ops.get_assigned_session_for_channel(
+            int(channel_id)
+        )
+        if assigned_session_name:
+            return assigned_session_name
+    except Exception:
+        log.debug(
+            "queue_worker.assignment_session_hint_failed cid=%s",
+            channel_id,
+            exc_info=True,
+        )
+    if _should_bypass_positive_cache(channel_id):
+        return None
+    try:
+        return membership_db.get_session_by_channel(int(channel_id))
+    except Exception:
+        log.debug(
+            "queue_worker.membership_session_hint_failed cid=%s",
+            channel_id,
+            exc_info=True,
+        )
+        return None
+
+
+def _resolve_repair_preferred_session(
+    channel_id: Optional[int],
+    preferred_session_name: Optional[str],
+) -> Optional[str]:
+    if channel_id is None or not _should_bypass_positive_cache(channel_id):
+        return preferred_session_name
+    try:
+        assigned_session_name = assignment_ops.get_assigned_session_for_channel(
+            int(channel_id)
+        )
+        if assigned_session_name:
+            return assigned_session_name
+    except Exception:
+        log.debug(
+            "queue_worker.repair_preferred_session_lookup_failed cid=%s",
+            channel_id,
+            exc_info=True,
+        )
+    return preferred_session_name
+
+
+def _should_use_url_cache_status(
+    *,
+    status_norm: Optional[str],
+    channel_id: Optional[int],
+) -> bool:
+    if not status_norm:
+        return False
+    # duplicate — це локальний дедуп-артефакт, а не стабільний кеш каналу.
+    # Його не можна використовувати між батчами, інакше той самий лінк
+    # блокує repair для missing-каналу.
+    if status_norm == "duplicate":
+        return False
+    if status_norm not in FINAL_GLOBAL or status_norm == "requested":
+        return False
+    if status_norm == "already" and _should_bypass_positive_cache(channel_id):
+        return False
+    return True
+
+
+def _refresh_audit_after_success(
+    *,
+    channel_id: Optional[int],
+    base_status: str,
+    present_session_name: Optional[str],
+    audit_reason: str,
+) -> None:
+    if base_status not in ("joined", "already"):
+        return
+    if channel_id is None or not present_session_name:
+        return
+    try:
+        audit_ops.refresh_channel_subscription_audit_for_channel(
+            int(channel_id),
+            present_session_name_list=[present_session_name],
+            audit_reason=audit_reason,
+        )
+    except Exception:
+        log.exception(
+            "queue_worker.audit_refresh_after_success_failed cid=%s status=%s sess=%s reason=%s",
+            channel_id,
+            base_status,
+            present_session_name,
+            audit_reason,
+        )
+
+
+def _repair_missing_channel_session_binding(
+    *,
+    channel_id: Optional[int],
+    current_session_name: Optional[str],
+    membership_db: MembershipDAO,
+) -> bool:
+    if channel_id is None or not current_session_name:
+        return False
+    try:
+        is_missing_channel = audit_ops.should_bypass_positive_channel_cache(int(channel_id))
+    except Exception:
+        log.debug(
+            "queue_worker.audit_missing_check_failed cid=%s",
+            channel_id,
+            exc_info=True,
+        )
+        return False
+    if not is_missing_channel:
+        return False
+
+    return True
+
+
+def _resolve_success_session_binding(
+    *,
+    channel_id: Optional[int],
+    base_status: str,
+    current_session_name: Optional[str],
+    membership_db: MembershipDAO,
+) -> Tuple[bool, Optional[str]]:
+    if base_status not in ("joined", "already"):
+        return False, current_session_name
+    if channel_id is None or not current_session_name:
+        return False, current_session_name
+
+    repaired_missing_channel = _repair_missing_channel_session_binding(
+        channel_id=channel_id,
+        current_session_name=current_session_name,
+        membership_db=membership_db,
+    )
+    if repaired_missing_channel:
+        return False, current_session_name
+
+    skip_membership = False
+    audit_present_session_name = current_session_name
+    if base_status == "already":
+        try:
+            sess_known = _get_effective_session_hint(channel_id, membership_db)
+            if sess_known and sess_known != current_session_name:
+                skip_membership = True
+                audit_present_session_name = sess_known
+                log.debug(
+                    "queue_worker.skip_membership_other_session cid=%s sess=%s other=%s",
+                    channel_id,
+                    current_session_name,
+                    sess_known,
+                )
+        except Exception:
+            pass
+    return skip_membership, audit_present_session_name
+
+
 async def process_batch(
     *,
     batch_id: str,
@@ -87,6 +314,7 @@ async def process_batch(
     raw_html: Optional[str] = None,
     entities=None,
     original_urls: Optional[List[str]] = None,
+    forced_session_name: Optional[str] = None,
 ):
     """
     Обробляє записані в link_queue URL для batch_id. Використовує один lease, якщо доступний.
@@ -150,6 +378,7 @@ async def process_batch(
         except Exception:
             cleaned = url
         cleaned_urls_log.append(cleaned)
+        resolved_channel_identifier_for_cache: Optional[int] = None
 
         # Визначаємо тип
         inv_hash = _extract_invite_hash(url)
@@ -169,8 +398,8 @@ async def process_batch(
                 # Якщо парсинг упав, продовжуємо поточну логіку
                 pass
 
-        preferred_session: Optional[str] = None
-        if inv_hash:
+        preferred_session: Optional[str] = forced_session_name
+        if inv_hash and not preferred_session:
             try:
                 preferred_session = membership_db.invite_check_last_session(inv_hash)
             except Exception:
@@ -180,45 +409,82 @@ async def process_batch(
             link_row = _find_channel_by_link(url, cleaned)
             if link_row:
                 cid_link, title_link = link_row
+                if cid_link is not None:
+                    resolved_channel_identifier_for_cache = int(cid_link)
                 final = membership_db.any_final_for_channel(cid_link)
                 if final:
                     final_norm = "already" if final == "joined" else final
                     if final_norm in FINAL_GLOBAL and final_norm != "requested":
-                        sess_known = membership_db.get_any_session_for_channel(cid_link)
-                        data = (final_norm, title_link, cid_link, "link_cache", sess_known)
-                        _register_preknown(url, data)
-                        if cleaned != url:
-                            _register_preknown(cleaned, data)
-                        continue
+                        if final_norm == "already" and _should_bypass_positive_cache(
+                            resolved_channel_identifier_for_cache
+                        ):
+                            log.info(
+                                "queue_worker.skip_stale_positive_cache batch_id=%s url=%s cid=%s source=link_cache status=%s",
+                                batch_id,
+                                url,
+                                resolved_channel_identifier_for_cache,
+                                final_norm,
+                            )
+                        else:
+                            sess_known = membership_db.get_any_session_for_channel(cid_link)
+                            data = (final_norm, title_link, cid_link, "link_cache", sess_known)
+                            _register_preknown(url, data)
+                            if cleaned != url:
+                                _register_preknown(cleaned, data)
+                            continue
 
             # 1b) get_channel_id_by_url
             cid_raw = _get_channel_id_by_url(url, cleaned)
             if cid_raw:
+                resolved_channel_identifier_for_cache = int(cid_raw)
                 final = membership_db.any_final_for_channel(cid_raw)
                 if final:
                     final_norm = "already" if final == "joined" else final
                     if final_norm in FINAL_GLOBAL and final_norm != "requested":
-                        sess_known = membership_db.get_any_session_for_channel(cid_raw)
-                        data = (final_norm, None, cid_raw, "link_raw", sess_known)
-                        _register_preknown(url, data)
-                        if cleaned != url:
-                            _register_preknown(cleaned, data)
-                        continue
+                        if final_norm == "already" and _should_bypass_positive_cache(
+                            resolved_channel_identifier_for_cache
+                        ):
+                            log.info(
+                                "queue_worker.skip_stale_positive_cache batch_id=%s url=%s cid=%s source=link_raw status=%s",
+                                batch_id,
+                                url,
+                                resolved_channel_identifier_for_cache,
+                                final_norm,
+                            )
+                        else:
+                            sess_known = membership_db.get_any_session_for_channel(cid_raw)
+                            data = (final_norm, None, cid_raw, "link_raw", sess_known)
+                            _register_preknown(url, data)
+                            if cleaned != url:
+                                _register_preknown(cleaned, data)
+                            continue
 
             # 2) Інвайт: якщо знаємо invite_hash -> channel_id і фінальний статус
             if inv_hash:
                 cid_cached, title_cached = membership_db.map_invite_get(inv_hash)
                 if cid_cached:
+                    resolved_channel_identifier_for_cache = int(cid_cached)
                     final = membership_db.any_final_for_channel(int(cid_cached))
                     if final:
                         final_norm = "already" if final == "joined" else final
                         if final_norm in FINAL_GLOBAL and final_norm != "requested":
-                            sess_known = membership_db.get_any_session_for_channel(int(cid_cached))
-                            data = (final_norm, title_cached, int(cid_cached), "invite_cache", sess_known)
-                            _register_preknown(url, data)
-                            if cleaned != url:
-                                _register_preknown(cleaned, data)
-                            continue
+                            if final_norm == "already" and _should_bypass_positive_cache(
+                                resolved_channel_identifier_for_cache
+                            ):
+                                log.info(
+                                    "queue_worker.skip_stale_positive_cache batch_id=%s url=%s cid=%s source=invite_cache status=%s",
+                                    batch_id,
+                                    url,
+                                    resolved_channel_identifier_for_cache,
+                                    final_norm,
+                                )
+                            else:
+                                sess_known = membership_db.get_any_session_for_channel(int(cid_cached))
+                                data = (final_norm, title_cached, int(cid_cached), "invite_cache", sess_known)
+                                _register_preknown(url, data)
+                                if cleaned != url:
+                                    _register_preknown(cleaned, data)
+                                continue
         except Exception:
             pass
 
@@ -229,12 +495,33 @@ async def process_batch(
             ust = None
         if ust:
             status_norm = "already" if ust == "joined" else ust
-            if (status_norm in FINAL_GLOBAL and status_norm != "requested") or status_norm == "duplicate":
+            if _should_use_url_cache_status(
+                status_norm=status_norm,
+                channel_id=resolved_channel_identifier_for_cache,
+            ):
                 data = (status_norm, None, None, "url_cache", None)
                 _register_preknown(url, data)
                 if cleaned != url:
                     _register_preknown(cleaned, data)
                 continue
+            if (
+                status_norm == "already"
+                and _should_bypass_positive_cache(resolved_channel_identifier_for_cache)
+            ):
+                log.info(
+                    "queue_worker.skip_stale_positive_cache batch_id=%s url=%s cid=%s source=url_cache status=%s",
+                    batch_id,
+                    url,
+                    resolved_channel_identifier_for_cache,
+                    status_norm,
+                )
+            elif status_norm == "duplicate":
+                log.debug(
+                    "queue_worker.ignore_duplicate_url_cache batch_id=%s url=%s cid=%s",
+                    batch_id,
+                    url,
+                    resolved_channel_identifier_for_cache,
+                )
 
         # Якщо сюди дійшли — мережа потрібна
         if inv_hash:
@@ -245,11 +532,23 @@ async def process_batch(
                 st_inv = None
             if st_inv and st_inv not in ("requested", "requested_fast", "private"):
                 final_norm = "already" if st_inv == "joined" else st_inv
-                data = (final_norm, None, None, "invite_status", None)
-                _register_preknown(url, data)
-                if cleaned != url:
-                    _register_preknown(cleaned, data)
-                continue
+                if (
+                    final_norm == "already"
+                    and _should_bypass_positive_cache(resolved_channel_identifier_for_cache)
+                ):
+                    log.info(
+                        "queue_worker.skip_stale_positive_cache batch_id=%s url=%s cid=%s source=invite_status status=%s",
+                        batch_id,
+                        url,
+                        resolved_channel_identifier_for_cache,
+                        final_norm,
+                    )
+                else:
+                    data = (final_norm, None, None, "invite_status", None)
+                    _register_preknown(url, data)
+                    if cleaned != url:
+                        _register_preknown(cleaned, data)
+                    continue
             cnt_invite_need += 1
         else:
             cnt_public_need += 1
@@ -326,11 +625,6 @@ async def process_batch(
                 "channel_id": cid_dup,
             })
             await progress.update(status_display, title_dup or url, sess_dup)
-            try:
-                for k in keys_norm:
-                    membership_db.url_put(k, status_dup)
-            except Exception:
-                pass
             continue
         _remember_seen(keys_norm)
 
@@ -409,12 +703,6 @@ async def process_batch(
                     "channel_id": cid,
                 })
                 await progress.update(status_display, title or url, sess)
-                try:
-                    membership_db.url_put(url, status_for_report)
-                    for k in collect_norm_keys(url):
-                        membership_db.url_put(k, status_for_report)
-                except Exception:
-                    pass
                 _remember_seen(collect_norm_keys(url), title=title, channel_id=cid, session=sess)
                 continue
 
@@ -509,23 +797,29 @@ async def process_batch(
                         other_name,
                     )
 
-            # Не записуємо membership, якщо інша сесія вже закріплена за каналом
-            skip_membership = False
-            if base_status == "already" and cid and sess:
-                try:
-                    sess_known = membership_db.get_session_by_channel(cid)
-                    if sess_known and sess_known != sess:
-                        skip_membership = True
-                        log.debug(
-                            "queue_worker.skip_membership_other_session fast cid=%s sess=%s other=%s",
-                            cid,
-                            sess,
-                            sess_known,
-                        )
-                except Exception:
-                    pass
+            skip_membership, audit_present_session_name = _resolve_success_session_binding(
+                channel_id=cid,
+                base_status=base_status,
+                current_session_name=sess,
+                membership_db=membership_db,
+            )
             if not skip_membership:
                 upsert_membership(db, channel_id=cid, account=(sess or ""), status=base_status)
+            _maybe_upsert_channel_session_assignment(
+                channel_id=cid,
+                session_name_value=sess,
+                base_status=base_status,
+                admin_id=admin_id,
+                other_owner_id=other_owner_id,
+                assignment_source=f"subscription_worker:fast_path:{kind}",
+                skip_assignment=skip_membership,
+            )
+            _refresh_audit_after_success(
+                channel_id=cid,
+                base_status=base_status,
+                present_session_name=audit_present_session_name,
+                audit_reason=f"subscription_worker:fast_path:{kind}",
+            )
             link_queue.mark_done(item_id)
             try:
                 membership_db.url_put(url, status_for_report)
@@ -557,7 +851,13 @@ async def process_batch(
             await progress.update(status_display, title or url, sess)
             _remember_seen(keys_norm, title=title, channel_id=cid, session=sess)
             continue
-        slot = await get_ready_slot(preferred_session=preferred_session)
+        slot = await get_ready_slot(
+            preferred_session=_resolve_repair_preferred_session(
+                resolved_channel_identifier_for_cache,
+                preferred_session,
+            ),
+            fallback_to_round_robin=not bool(forced_session_name),
+        )
         if slot is None:
             # немає готових акаунтів навіть після очікування — позначаємо тільки цей елемент
             log.warning("queue_worker.no_client batch_id=%s idx=%s url=%s", batch_id, idx, url)
@@ -731,23 +1031,36 @@ async def process_batch(
                         other_name,
                     )
 
-            # Не записуємо membership, якщо інша сесія вже закріплена за каналом
-            skip_membership = False
-            if base_status == "already" and cid and sess:
-                try:
-                    sess_known = membership_db.get_session_by_channel(cid)
-                    if sess_known and sess_known != sess:
-                        skip_membership = True
-                        log.debug(
-                            "queue_worker.skip_membership_other_session slow cid=%s sess=%s other=%s",
-                            cid,
-                            sess,
-                            sess_known,
-                        )
-                except Exception:
-                    pass
+            skip_membership, audit_present_session_name = _resolve_success_session_binding(
+                channel_id=cid,
+                base_status=base_status,
+                current_session_name=sess,
+                membership_db=membership_db,
+            )
             if not skip_membership:
                 upsert_membership(db, channel_id=cid, account=sess or "", status=base_status)
+            _maybe_upsert_channel_session_assignment(
+                channel_id=cid,
+                session_name_value=sess,
+                base_status=base_status,
+                admin_id=admin_id,
+                other_owner_id=other_owner_id,
+                assignment_source=f"subscription_worker:ensure_join:{kind}",
+                skip_assignment=skip_membership,
+            )
+            cleanup_keep_session_name = audit_present_session_name or sess
+            if cleanup_keep_session_name and base_status in ("joined", "already"):
+                await enforce_single_session_per_channel(
+                    channel_id=cid,
+                    keep_session_name=cleanup_keep_session_name,
+                    reason=f"subscription_worker:ensure_join:{kind}",
+                )
+            _refresh_audit_after_success(
+                channel_id=cid,
+                base_status=base_status,
+                present_session_name=audit_present_session_name,
+                audit_reason=f"subscription_worker:ensure_join:{kind}",
+            )
             link_queue.mark_done(item_id)
             try:
                 membership_db.url_put(url, status_for_report)
@@ -866,7 +1179,7 @@ async def process_batch(
             # 3) Підтягуємо сесію для already/joined, не перетираючи існуючий статус із сесією
             status_raw = (it.get("status") or "").strip()
             if "[" not in status_raw and cid:
-                sess_known = mem_dao.get_session_by_channel(cid)
+                sess_known = _get_effective_session_hint(cid, mem_dao)
                 log.debug(
                     "queue_worker.report: hydrate session cid=%s status=%s session=%s url=%s",
                     cid,

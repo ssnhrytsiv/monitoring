@@ -1,10 +1,13 @@
 import os
 import logging
+
 from dotenv import load_dotenv
 
+from app.utils.project_paths import PROJECT_ROOT, resolve_project_path
+
 # Базовий .env + локальні override (.env.local) для зручності розробки
-load_dotenv()
-load_dotenv(".env.local", override=True)
+load_dotenv(PROJECT_ROOT / ".env")
+load_dotenv(PROJECT_ROOT / ".env.local", override=True)
 
 log = logging.getLogger("config")
 log.info("CONFIG env SESSION_NAME=%r", os.getenv("SESSION_NAME"))
@@ -40,7 +43,7 @@ DEFAULT_FUZZ = int(os.getenv("DEFAULT_FUZZ", "85"))
 CASE_SENSITIVE = os.getenv("CASE_SENSITIVE", "false").lower() in ("1", "true", "yes")
 WHOLE_WORD     = os.getenv("WHOLE_WORD", "false").lower() in ("1", "true", "yes")
 
-DB_PATH = os.getenv("DB_PATH", "post_watchdog.sqlite3")
+DB_PATH = str(resolve_project_path(os.getenv("DB_PATH", "post_watchdog.sqlite3")))
 
 GSHEET_SPREADSHEET_ID = os.getenv("GSHEET_SPREADSHEET_ID", "")
 GSHEET_CREDS_FILE     = os.getenv("GSHEET_CREDS_FILE", "service_account.json")
@@ -57,6 +60,7 @@ PLUGINS_PACKAGE = "app.plugins"
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 WATCH_VIEWS_ENABLED = os.getenv("WATCH_VIEWS_ENABLED", "1").strip().lower() not in {"0","false","no","off"}
+TEMPLATE_MEDIA_VAULT_CHAT_ID = int(os.getenv("TEMPLATE_MEDIA_VAULT_CHAT_ID", "0") or "0")
 
 # helpers
 def _as_bool(val: str | None, default: bool = False) -> bool:
@@ -68,6 +72,19 @@ def _as_bool(val: str | None, default: bool = False) -> bool:
     if s in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+WATCH_VIEWS_SOURCE_FALLBACK_ENABLED = _as_bool(
+    os.getenv("WATCH_VIEWS_SOURCE_FALLBACK_ENABLED", "0"),
+    default=False,
+)
+try:
+    WATCH_VIEWS_MAX_MATCH_AGE_HOURS = max(
+        0,
+        int(os.getenv("WATCH_VIEWS_MAX_MATCH_AGE_HOURS", "0") or "0"),
+    )
+except Exception:
+    WATCH_VIEWS_MAX_MATCH_AGE_HOURS = 0
 
 # Коли true – контрольний чат обробляє Aiogram‑бот, а головна Telethon‑сесія не запускається
 CONTROL_VIA_BOT = _as_bool(_pick_env("CONTROL_VIA_BOT", "1"), default=True)

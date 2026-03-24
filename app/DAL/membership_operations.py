@@ -118,6 +118,23 @@ class MembershipDAO:
         """Аліас для get_any_session_for_channel — для читабельності викликів."""
         return self.get_any_session_for_channel(channel_id)
 
+    def list_membership_accounts_for_channel(self, channel_id: int) -> list[str]:
+        rows = (
+            self.db.query(m.Membership.account)
+            .filter(m.Membership.channel_id == int(channel_id))
+            .order_by(m.Membership.ts.desc())
+            .all()
+        )
+        result: list[str] = []
+        seen_accounts: set[str] = set()
+        for row in rows:
+            account_value = str((row[0] if row else "") or "").strip()
+            if not account_value or account_value in seen_accounts:
+                continue
+            seen_accounts.add(account_value)
+            result.append(account_value)
+        return result
+
     def delete_membership(self, account: str, channel_id: int) -> int:
         """
         Видаляє запис membership для конкретної сесії в каналі.
@@ -365,6 +382,10 @@ def url_delete(db: Session, urls: list[str], statuses: Optional[list[str]] = Non
 
 def get_session_by_channel(db: Session, channel_id: int) -> Optional[str]:
     return MembershipDAO(db).get_session_by_channel(channel_id)
+
+
+def list_membership_accounts_for_channel(db: Session, channel_id: int) -> list[str]:
+    return MembershipDAO(db).list_membership_accounts_for_channel(channel_id)
 
 
 def delete_membership(db: Session, account: str, channel_id: int) -> int:

@@ -20,6 +20,8 @@ from app.admin_bot.services.subscription.subscription_menu import split_text_for
 from app.services import link_queue
 from app.services import account_pool
 from app.DAL import channels_operations as cho
+from app.DAL import channel_session_assignment_operations as assignment_ops
+from app.DAL import channel_subscription_audit_operations as audit_ops
 from app.DAL.membership_operations import MembershipDAO
 from app.utils.link_parser import sanitize_link
 from app.admin_bot.services.subscription.subscription_utils import norm_keys as collect_norm_keys
@@ -94,6 +96,50 @@ def _build_normalized_link_key_set(link_value: Optional[str]) -> Set[str]:
             if normalized_link_key:
                 normalized_link_key_set.add(normalized_link_key)
     return normalized_link_key_set
+
+
+def _should_bypass_positive_membership_cache(
+    channel_id: Optional[int],
+    *,
+    database_session,
+) -> bool:
+    if channel_id is None:
+        return False
+    try:
+        return audit_ops.should_bypass_positive_channel_cache(
+            int(channel_id),
+            database_session=database_session,
+        )
+    except Exception:
+        return False
+
+
+def _get_effective_session_hint(
+    channel_id: Optional[int],
+    *,
+    membership_dao: MembershipDAO,
+    database_session,
+) -> Optional[str]:
+    if channel_id is None:
+        return None
+    try:
+        assigned_session_name = assignment_ops.get_assigned_session_for_channel(
+            int(channel_id),
+            database_session=database_session,
+        )
+        if assigned_session_name:
+            return assigned_session_name
+    except Exception:
+        pass
+    if _should_bypass_positive_membership_cache(
+        channel_id,
+        database_session=database_session,
+    ):
+        return None
+    try:
+        return membership_dao.get_any_session_for_channel(int(channel_id))
+    except Exception:
+        return None
 
 
 def _collect_pre_refresh_normalized_link_keys_by_channel_identifier(
@@ -189,6 +235,7 @@ async def _cleanup_removed_channels(admin: m.Admin, chan_ids: Set[int]) -> Dict[
         pre_count = svc_admins._count_url_cache(urls_for_cleanup, db) if urls_for_cleanup else 0  # type: ignore[attr-defined]
 
         stats["membership_deleted"] = m.delete_memberships_by_channels(db, delete_ids)
+        m.delete_channel_session_assignments_by_channels(db, delete_ids)
         stats["membership_status_deleted"] = m.delete_membership_status_by_channels(db, delete_ids)
         hashes = [h for h in db.execute(select(m.InviteMap.invite_hash).where(m.InviteMap.channel_id.in_(delete_ids))).scalars().all()]
         stats["invite_status_deleted"] = m.delete_invite_status_by_hashes(db, hashes)
@@ -622,7 +669,17 @@ async def refresh_channels_for_admin(
             membership_account = db.execute(
                 select(m.Membership.account).where(m.Membership.channel_id == cid).limit(1)
             ).scalar_one_or_none()
-            if membership_account and not session_hint:
+            bypass_positive_membership_cache = _should_bypass_positive_membership_cache(
+                cid,
+                database_session=db,
+            )
+            if not session_hint:
+                session_hint = _get_effective_session_hint(
+                    cid,
+                    membership_dao=dao,
+                    database_session=db,
+                )
+            if membership_account and not session_hint and not bypass_positive_membership_cache:
                 session_hint = str(membership_account)
 
             normalized_membership_status = None
@@ -631,6 +688,8 @@ async def refresh_channels_for_admin(
                 if membership_status:
                     normalized_membership_status = "already" if membership_status == "joined" else membership_status
             except Exception:
+                normalized_membership_status = None
+            if normalized_membership_status and bypass_positive_membership_cache:
                 normalized_membership_status = None
 
             if normalized_membership_status:
@@ -642,16 +701,11 @@ async def refresh_channels_for_admin(
                         or ("joined" in status_raw_lower and "already" not in status_raw_lower)
                     ):
                         status_raw = normalized_membership_status
-            elif membership_account:
+            elif membership_account and not bypass_positive_membership_cache:
                 if not status_raw:
                     status_raw = "already"
                 elif "joined" in (status_raw or "").lower() and "already" not in (status_raw or "").lower():
                     status_raw = "already"
-            if not session_hint:
-                try:
-                    session_hint = dao.get_any_session_for_channel(int(cid))
-                except Exception:
-                    session_hint = None
         normalized_input_link_key_set = _build_normalized_link_key_set(clean or url)
         if cid:
             normalized_channel_identifier = int(cid)

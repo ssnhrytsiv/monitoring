@@ -71,6 +71,12 @@ STATUS_PRESETS = {
     "expired": ["expired"],
 }
 
+_TG_EMOJI_TAG_RE = re.compile(r"<tg-emoji\b(?P<attrs>[^>]*)>(?P<body>.*?)</tg-emoji>", re.DOTALL | re.IGNORECASE)
+_TG_EMOJI_TOKEN_RE = re.compile(r"(<tg-emoji\b[^>]*>.*?</tg-emoji>)", re.DOTALL | re.IGNORECASE)
+_SPAN_TAG_RE = re.compile(r"<span\b(?P<attrs>[^>]*)>(?P<body>.*?)</span>", re.DOTALL | re.IGNORECASE)
+_PRE_TAG_RE = re.compile(r"<pre\b(?P<attrs>[^>]*)>(?P<body>.*?)</pre>", re.DOTALL | re.IGNORECASE)
+_TG_SPOILER_TAG_RE = re.compile(r"<tg-spoiler>(?P<body>.*?)</tg-spoiler>", re.DOTALL | re.IGNORECASE)
+
 
 
 def _edit_back_kb(wid: int) -> InlineKeyboardBuilder:
@@ -121,6 +127,200 @@ def _collect_links(text: str) -> List[str]:
         pass
 
     return links
+
+
+def _extract_html_attr_value(attrs_text: str, attr_name: str) -> str:
+    if not attrs_text:
+        return ""
+    attr_pattern = re.compile(
+        rf"\b{re.escape(attr_name)}\s*=\s*(?:\"(?P<dq>[^\"]+)\"|'(?P<sq>[^']+)')",
+        flags=re.IGNORECASE,
+    )
+    match = attr_pattern.search(attrs_text)
+    if not match:
+        return ""
+    value = match.group("dq") or match.group("sq") or ""
+    return str(value).strip()
+
+
+def _sanitize_bot_api_html_fragment(text: str) -> str:
+    """
+    Приводить HTML-фрагмент до формату, який стабільно приймає Bot API.
+    Зокрема:
+      - <span data-custom-emoji-id="...">..</span> -> <tg-emoji emoji-id="...">..</tg-emoji>
+      - <span class="tg-spoiler">..</span> лишається canonical
+      - інші span розгортаються в plain body
+      - <br> перетворюється на звичайні переводи рядків
+    """
+    if not text:
+        return ""
+
+    sanitized = text.replace("\r\n", "\n").replace("\r", "\n")
+    sanitized = re.sub(r"<\s*br\s*/?>", "\n", sanitized, flags=re.IGNORECASE)
+
+    def _replace_tg_emoji(match: re.Match) -> str:
+        attrs_text = str(match.group("attrs") or "")
+        body_text = str(match.group("body") or "")
+        emoji_id = _extract_html_attr_value(attrs_text, "emoji-id")
+        if not emoji_id:
+            return body_text
+        emoji_id_safe = html.escape(emoji_id, quote=True)
+        return f'<tg-emoji emoji-id="{emoji_id_safe}">{body_text}</tg-emoji>'
+
+    def _replace_span(match: re.Match) -> str:
+        attrs_text = str(match.group("attrs") or "")
+        body_text = str(match.group("body") or "")
+        emoji_id = _extract_html_attr_value(attrs_text, "data-custom-emoji-id")
+        if emoji_id:
+            emoji_id_safe = html.escape(emoji_id, quote=True)
+            return f'<tg-emoji emoji-id="{emoji_id_safe}">{body_text}</tg-emoji>'
+
+        span_class = _extract_html_attr_value(attrs_text, "class")
+        classes = {part.strip().lower() for part in span_class.split() if part.strip()}
+        if "tg-spoiler" in classes:
+            return f"<tg-spoiler>{body_text}</tg-spoiler>"
+
+        return body_text
+
+    def _replace_pre(match: re.Match) -> str:
+        body_text = str(match.group("body") or "")
+        return f"<pre>{body_text}</pre>"
+
+    sanitized = _TG_EMOJI_TAG_RE.sub(_replace_tg_emoji, sanitized)
+    sanitized = _SPAN_TAG_RE.sub(_replace_span, sanitized)
+    sanitized = _PRE_TAG_RE.sub(_replace_pre, sanitized)
+    return sanitized
+
+
+_A_TAG_RE = re.compile(
+    r'<a\s+href=(?P<q1>"|\')(?P<href>.+?)(?P=q1)>(?P<body>.*?)</a>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _candidate_html_to_display_text(text: str) -> str:
+    """
+    Готує читабельний preview-текст для UI.
+    Це не matcher-логіка і не exact-render оригіналу, а саме clean preview:
+      - лінки показує їх видимим текстом;
+      - block tags перетворює на нормальні переводи рядків;
+      - custom emoji / spoiler розкриває до тексту;
+      - прибирає технічний HTML, який добре підходить для матчингу, але погано для картки.
+    """
+    if not text:
+        return ""
+
+    normalized = _sanitize_bot_api_html_fragment(text)
+
+    def _replace_a(match: re.Match) -> str:
+        body_text = str(match.group("body") or "")
+        href_text = html.unescape(str(match.group("href") or "")).strip()
+        body_plain_text = _candidate_html_to_display_text(body_text).strip()
+        if body_plain_text:
+            return body_plain_text
+        return href_text
+
+    normalized = _A_TAG_RE.sub(_replace_a, normalized)
+    normalized = re.sub(r"</\s*(?:blockquote|pre|code|p|div)\s*>", "\n", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"<\s*(?:blockquote|pre|code|p|div)\b[^>]*>", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"<\s*br\s*/?>", "\n", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"[\u200b\u200c\u200d\uFEFF\uFE0F]", "", normalized)
+    normalized = re.sub(r"<[^>]+>", "", normalized)
+    normalized = html.unescape(normalized).replace("\xa0", " ")
+    normalized = re.sub(r"[ \t]+\n", "\n", normalized)
+    normalized = re.sub(r"\n[ \t]+", "\n", normalized)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+
+    cleaned_lines = [line.rstrip() for line in normalized.splitlines()]
+    cleaned_text = "\n".join(cleaned_lines).strip()
+    return cleaned_text
+
+
+def _truncate_preview_html_preserving_custom_emoji(text: str, max_visible_chars: int = 80) -> str:
+    if not text:
+        return ""
+    if max_visible_chars <= 0:
+        return ""
+
+    parts = _TG_EMOJI_TOKEN_RE.split(text)
+    out: List[str] = []
+    visible_chars = 0
+    truncated = False
+
+    for part in parts:
+        if not part:
+            continue
+
+        if _TG_EMOJI_TOKEN_RE.fullmatch(part):
+            emoji_body_match = _TG_EMOJI_TAG_RE.fullmatch(part)
+            emoji_body = str(emoji_body_match.group("body") or "") if emoji_body_match else ""
+            emoji_visible_len = max(1, len(html.unescape(re.sub(r"<[^>]+>", "", emoji_body))) or 1)
+            if visible_chars + emoji_visible_len > max_visible_chars and out:
+                truncated = True
+                break
+            out.append(part)
+            visible_chars += emoji_visible_len
+            continue
+
+        plain_part = html.unescape(part)
+        remaining_chars = max_visible_chars - visible_chars
+        if remaining_chars <= 0:
+            truncated = True
+            break
+        if len(plain_part) <= remaining_chars:
+            out.append(html.escape(plain_part, quote=False))
+            visible_chars += len(plain_part)
+            continue
+
+        out.append(html.escape(plain_part[:remaining_chars].rstrip(), quote=False))
+        visible_chars += remaining_chars
+        truncated = True
+        break
+
+    result = "".join(out).strip()
+    if truncated and result:
+        result = result.rstrip() + "…"
+    return result
+
+
+def _candidate_html_to_preview_html(text: str, max_visible_chars: int = 80) -> str:
+    """
+    Короткий preview для списку кандидатів.
+    Тут важливо зберегти premium emoji, але не тягнути весь технічний HTML у список.
+    """
+    if not text:
+        return ""
+
+    preview_html = _sanitize_bot_api_html_fragment(text)
+
+    def _replace_a(match: re.Match) -> str:
+        body_text = str(match.group("body") or "")
+        href_text = html.unescape(str(match.group("href") or "")).strip()
+        return body_text if body_text.strip() else html.escape(href_text, quote=False)
+
+    preview_html = _A_TAG_RE.sub(_replace_a, preview_html)
+    preview_html = _TG_SPOILER_TAG_RE.sub(lambda m: str(m.group("body") or ""), preview_html)
+    preview_html = re.sub(r"</\s*(?:blockquote|pre|code|p|div)\s*>", "\n", preview_html, flags=re.IGNORECASE)
+    preview_html = re.sub(r"<\s*(?:blockquote|pre|code|p|div)\b[^>]*>", "", preview_html, flags=re.IGNORECASE)
+    preview_html = re.sub(r"<\s*br\s*/?>", "\n", preview_html, flags=re.IGNORECASE)
+    preview_html = re.sub(r"</?(?:b|strong|i|em|u|ins|s|strike|del|code)\b[^>]*>", "", preview_html, flags=re.IGNORECASE)
+    preview_html = re.sub(
+        r"</?[^>]+>",
+        lambda m: (
+            m.group(0)
+            if m.group(0).lower().startswith("<tg-emoji") or m.group(0).lower().startswith("</tg-emoji")
+            else ""
+        ),
+        preview_html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    preview_html = re.sub(r"[\u200b\u200c\u200d\uFEFF\uFE0F]", "", preview_html)
+    preview_html = preview_html.replace("\xa0", " ")
+    preview_html = re.sub(r"[ \t]+\n", "\n", preview_html)
+    preview_html = re.sub(r"\n[ \t]+", "\n", preview_html)
+    preview_html = re.sub(r"\n{3,}", "\n\n", preview_html).strip()
+
+    return _truncate_preview_html_preserving_custom_emoji(preview_html, max_visible_chars=max_visible_chars)
 
 
 @router.callback_query(F.data == "watch:noop")
@@ -414,8 +614,7 @@ async def watch_group_similar(cb: CallbackQuery):
     for key, group in grouped.items():
         cand = group["repr"]
         cid = cand.get("id")
-        preview = (cand.get("message_text") or "").strip()
-        preview_short = (preview[:80] + "…") if len(preview) > 80 else preview
+        preview_html = _candidate_html_to_preview_html(cand.get("message_text") or "", max_visible_chars=80)
 
         # Канали/вотчі для цього тексту
         titles = []
@@ -431,6 +630,8 @@ async def watch_group_similar(cb: CallbackQuery):
             wids.append(str(item.get("watch_id")))
 
         lines.append(f"Пост #{idx}")
+        if preview_html:
+            lines.append(f"   Прев'ю: {preview_html}")
         lines.append("   Канали:")
         for j, t in enumerate(titles, start=1):
             lines.append(f"      {j}. {t}")
@@ -569,7 +770,7 @@ async def watch_similar_accept(cb: CallbackQuery):
                 return float(hrs)
             except Exception:
                 pass
-        return None
+        return (23.0 * 60.0 + 59.0) / 60.0
 
     ok = accept_watch_candidate(cid, coverage_hours=_read_coverage_hours())
     if not ok:
@@ -678,7 +879,9 @@ async def watch_similar_view(cb: CallbackQuery):
             titles_map = {}
             links_map = {}
 
-    msg_text = cand.get("message_text") or "—"
+    raw_msg_text = cand.get("message_text") or ""
+    msg_text = _sanitize_bot_api_html_fragment(raw_msg_text) or "—"
+    msg_text_plain = _candidate_html_to_display_text(raw_msg_text) or "—"
     # Лінки: очікувані (з watch) та фактичні (з поста)
     expected_links = []
     try:
@@ -689,7 +892,7 @@ async def watch_similar_view(cb: CallbackQuery):
             expected_links = get_watch_expected_links(wid) if wid else []
     except Exception:
         expected_links = []
-    cand_links = _collect_links(msg_text)
+    cand_links = _collect_links(raw_msg_text)
 
     lines = [
         f"<b>Кандидат #{cid}</b>",
@@ -740,7 +943,19 @@ async def watch_similar_view(cb: CallbackQuery):
     back_cb = _back_to_group_cb(wid)
     if back_cb:
         kb.button(text="⬅️ Back", callback_data=back_cb)
-    await cb.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    try:
+        await cb.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+    except TelegramBadRequest as exc:
+        if "can't parse entities" not in str(exc):
+            raise
+        log.warning("watch_similar_view: html fallback cid=%s wid=%s err=%s", cid, wid, exc)
+        fallback_lines = list(lines)
+        fallback_lines[6] = html.escape(msg_text_plain)
+        await cb.message.edit_text(
+            "\n".join(fallback_lines),
+            reply_markup=kb.as_markup(),
+            parse_mode="HTML",
+        )
 
 
 @router.callback_query(F.data.startswith("watch:similar:"))

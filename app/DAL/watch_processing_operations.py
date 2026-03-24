@@ -9,6 +9,7 @@ from sqlalchemy import func, select, update, distinct, and_
 from app.admin_bot.db import models as m
 from app.admin_bot.db.session import SessionLocal
 from app.DAL import channels_operations as cho
+from app.DAL import channel_session_assignment_operations as assignment_ops
 from app.DAL.membership_operations import MembershipDAO
 from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now, moscow_now_str
 
@@ -59,6 +60,7 @@ def get_pending_by_channel(channel_id: int) -> List[Dict[str, Any]]:
                 m.WatchPost.time_window_start,
                 m.WatchPost.time_window_end,
                 m.WatchPost.group_id,
+                m.WatchPost.is_reply,
             ).where(m.WatchPost.channel_id == channel_id, m.WatchPost.status == "pending")
         ).all()
         return [
@@ -72,6 +74,7 @@ def get_pending_by_channel(channel_id: int) -> List[Dict[str, Any]]:
                 "time_window_start": r.time_window_start,
                 "time_window_end": r.time_window_end,
                 "group_id": r.group_id,
+                "is_reply": bool(r.is_reply),
             }
             for r in rows
         ]
@@ -233,6 +236,42 @@ def mark_done_views(watch_id: int, final_views: Optional[int]) -> None:
         db.close()
 
 
+def mark_views_access_lost(watch_id: int) -> bool:
+    now_val = _now_str()
+    db = SessionLocal()
+    try:
+        result = db.execute(
+            update(m.WatchPost)
+            .where(m.WatchPost.id == watch_id, m.WatchPost.status == "matched")
+            .values(status="views_access_lost", updated_at=now_val)
+        )
+        db.commit()
+        return bool(result.rowcount)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def reschedule_coverage_check(watch_id: int, next_check_at: str) -> bool:
+    now_val = _now_str()
+    db = SessionLocal()
+    try:
+        result = db.execute(
+            update(m.WatchPost)
+            .where(m.WatchPost.id == watch_id, m.WatchPost.status == "matched")
+            .values(coverage_check_at=next_check_at, updated_at=now_val)
+        )
+        db.commit()
+        return bool(result.rowcount)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 def mark_done_deleted(watch_id: int) -> Optional[str]:
     now_val = _now_str()
     db = SessionLocal()
@@ -253,7 +292,7 @@ def mark_done_deleted(watch_id: int) -> Optional[str]:
             return status
         db.execute(
             update(m.WatchPost)
-            .where(m.WatchPost.id == watch_id, m.WatchPost.status.in_(["matched", "deleted", "edited"]))
+            .where(m.WatchPost.id == watch_id, m.WatchPost.status.in_(["matched", "deleted", "edited", "views_access_lost"]))
             .values(deleted_at=func.coalesce(m.WatchPost.deleted_at, now_val), status="deleted", updated_at=now_val)
         )
         db.commit()
@@ -378,7 +417,7 @@ def insert_watch_candidate(
 def get_session_for_source_url(source_url: str) -> Optional[str]:
     """
     Знаходить сесію, яка вже працювала з каналом для цього source_url:
-      source_url -> channel_id -> account (membership.account).
+      source_url -> channel_id -> assigned session -> membership.account fallback.
     """
     if not source_url:
         return None
@@ -391,6 +430,12 @@ def get_session_for_source_url(source_url: str) -> Optional[str]:
         db.close()
     if not cid:
         return None
+    try:
+        assigned_session_name = assignment_ops.get_assigned_session_for_channel(int(cid))
+        if assigned_session_name:
+            return assigned_session_name
+    except Exception:
+        pass
     try:
         db = SessionLocal()
         membership_db = MembershipDAO(db)

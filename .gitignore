@@ -16,6 +16,7 @@ ENV/
 
 # ---- Логи ----
 *.log
+logs/*.out
 
 # ---- Конфіг/секрети ----
 .env
@@ -30,6 +31,9 @@ service_account.json
 *.session-journal
 *.sqlite3
 *.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite3.bak*
 
 # ---- IDE ----
 .idea/
@@ -73,3 +77,5 @@ Thumbs.db
 /app/flows/batch_links/process_links.py.orig
 /tg_monitor_release_clean_fixed_makefile.zip
 /post_watchdog.sqlite3.bak
+/recovery/*.csv
+/my_project.db

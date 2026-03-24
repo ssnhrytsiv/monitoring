@@ -1,9 +1,12 @@
 import os
+
 from dotenv import load_dotenv
 
+from app.utils.project_paths import PROJECT_ROOT, normalize_sqlite_url, resolve_project_path
+
 # Load environment from root .env/.env.local similar to main app
-load_dotenv()
-load_dotenv(".env.local", override=True)
+load_dotenv(PROJECT_ROOT / ".env")
+load_dotenv(PROJECT_ROOT / ".env.local", override=True)
 
 
 ADMIN_BOT_TOKEN = os.getenv("ADMIN_BOT_TOKEN", "")
@@ -12,12 +15,12 @@ ADMIN_BOT_TOKEN = os.getenv("ADMIN_BOT_TOKEN", "")
 API_ID = int(os.getenv("API_ID", "0") or "0")
 API_HASH = os.getenv("API_HASH", "")
 SESSION_NAME = os.getenv("SESSION_NAME", "tg_session")
-DB_PATH = os.getenv("DB_PATH", "post_watchdog.sqlite3")
+DB_PATH = str(resolve_project_path(os.getenv("DB_PATH", "post_watchdog.sqlite3")))
 
 # SQLAlchemy database URL (SQLite file by default)
-SQLALCHEMY_DATABASE_URL = os.getenv(
-    "SQLALCHEMY_DATABASE_URL",
-    f"sqlite:///{DB_PATH}",
+SQLALCHEMY_DATABASE_URL = normalize_sqlite_url(
+    os.getenv("SQLALCHEMY_DATABASE_URL"),
+    default_path=DB_PATH,
 )
 
 

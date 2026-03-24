@@ -15,6 +15,8 @@ from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest,CheckChatInviteRequest
 
 from app.DAL import SessionLocal
+from app.DAL import channel_session_assignment_operations as assignment_ops
+from app.DAL import channel_subscription_audit_operations as audit_ops
 from app.DAL.membership_operations import MembershipDAO, FINAL_GLOBAL
 from app.DAL import membership_operations as mem_db
 from app.utils.link_parser import sanitize_link
@@ -35,6 +37,14 @@ def _trace_joiner(event: str, data: dict) -> None:
         log.debug("joiner.trace %s %s", event, data)
     except Exception:
         pass
+
+
+def _normalize_final_cached_status(status_value: str | None) -> str | None:
+    if not status_value:
+        return status_value
+    if status_value == "joined":
+        return "already"
+    return status_value
 
 
 def _extract_invite_hash(url: str) -> str | None:
@@ -161,6 +171,67 @@ def _find_channel_by_link(raw_url: str):
         db.close()
 
 
+def _should_bypass_positive_channel_cache(channel_id: int | None) -> bool:
+    if not channel_id:
+        return False
+    try:
+        return audit_ops.should_bypass_positive_channel_cache(int(channel_id))
+    except Exception:
+        _log_exc("_should_bypass_positive_channel_cache")
+        return False
+
+
+def _cached_membership_final_for_channel(channel_id: int | None) -> str | None:
+    if not channel_id:
+        return None
+    try:
+        with _membership() as mem_dao:
+            final_norm = _normalize_final_cached_status(
+                mem_dao.any_final_for_channel(int(channel_id))
+            )
+    except Exception:
+        _log_exc("_cached_membership_final_for_channel")
+        return None
+
+    if final_norm in ("already", "requested") and _should_bypass_positive_channel_cache(
+        int(channel_id)
+    ):
+        log.info(
+            "ensure_join: skip stale positive channel cache cid=%s status=%s",
+            channel_id,
+            final_norm,
+        )
+        return None
+    return final_norm
+
+
+def _resolve_other_session_for_channel(
+    channel_id: int | None,
+    *,
+    database_session,
+) -> str | None:
+    if not channel_id:
+        return None
+    try:
+        assigned_session_name = assignment_ops.get_assigned_session_for_channel(
+            int(channel_id),
+            database_session=database_session,
+        )
+        if assigned_session_name:
+            return assigned_session_name
+    except Exception:
+        _log_exc("_resolve_other_session_for_channel.assignment")
+
+    if _should_bypass_positive_channel_cache(int(channel_id)):
+        return None
+
+    try:
+        return mem_db.get_any_session_for_channel(database_session, int(channel_id))
+    except Exception:
+        _log_exc("_resolve_other_session_for_channel.membership")
+        return None
+
+
 def _upsert_channel_basic(cid: int, ent, status: str) -> None:
     """
     Легкий апдейт channels: зберігаємо username/title для публічних каналів (не ботів).
@@ -258,25 +329,15 @@ async def ensure_join(client, url: str):
         _log_exc("ensure_join: sanitize_link")
         cleaned_url = url
 
-    def _final_from_cache(st: str | None) -> str | None:
-        if not st:
-            return st
-        if st == "joined":
-            return "already"
-        return st
-
     def _known_status_by_cid(cid: int | None) -> str | None:
         """Повертає already/known, якщо канал уже є в базі/мембершипі."""
         if not cid:
             return None
-        try:
-            with _membership() as mem_dao:
-                final = _final_from_cache(mem_dao.any_final_for_channel(int(cid)))
-        except Exception:
-            _log_exc("ensure_join: any_final_for_channel known")
-            final = None
+        final = _cached_membership_final_for_channel(int(cid))
         if final:
             return final
+        if _should_bypass_positive_channel_cache(int(cid)):
+            return None
         try:
             if _find_channel(int(cid)):
                 return "already"
@@ -323,8 +384,8 @@ async def ensure_join(client, url: str):
             link_row = _find_channel_by_link(cleaned_url)
             if link_row:
                 cid_link, title_link = link_row
-                final = any_final_for_channel(cid_link)
-                final_norm = _final_from_cache(final)
+                final = _cached_membership_final_for_channel(cid_link)
+                final_norm = _normalize_final_cached_status(final)
                 if final_norm in FINAL_GLOBAL:
                     if invite_hash:
                         log.debug(
@@ -377,7 +438,7 @@ async def ensure_join(client, url: str):
                 # не робимо мережеву спробу, одразу повертаємо його.
                 try:
                     with _membership() as mem_dao:
-                        final = _final_from_cache(mem_dao.any_final_for_channel(int(cid_cached)))
+                        final = _cached_membership_final_for_channel(int(cid_cached))
                         if final:
                             if final not in ("joined", "already"):
                                 mem_dao.invite_status_put(invite_hash, final)
@@ -409,7 +470,7 @@ async def ensure_join(client, url: str):
                 pass
             elif st in ("invalid", "blocked"):
                 cid_known, title_known = map_invite_get(invite_hash)
-                st_norm = _final_from_cache(st)
+                st_norm = _normalize_final_cached_status(st)
                 log.debug("ensure_join(invite): cached status=%s(invite=%s cid=%s) -> %s", st, invite_hash, cid_known, st_norm)
                 if invite_hash:
                     log.debug(
@@ -421,7 +482,7 @@ async def ensure_join(client, url: str):
                 return st_norm, (title_known or None), "invite", (int(cid_known) if cid_known else None), invite_hash
             elif st in ("requested", "requested_fast", "private"):
                 cid_known, title_known = map_invite_get(invite_hash)
-                st_norm = _final_from_cache(st)
+                st_norm = _normalize_final_cached_status(st)
                 if st == "requested":
                     st_norm = _requested_status()
                 log.debug("ensure_join(invite): cached status=%s(invite=%s cid=%s) -> %s", st, invite_hash, cid_known, st_norm)
@@ -500,7 +561,7 @@ async def ensure_join(client, url: str):
                         except Exception:
                             _log_exc("ensure_join: map_invite_set peek")
                         try:
-                            final_peek = _final_from_cache(any_final_for_channel(cid_peek))
+                            final_peek = _cached_membership_final_for_channel(cid_peek)
                         except Exception:
                             final_peek = None
                         if not final_peek:
@@ -561,30 +622,33 @@ async def ensure_join(client, url: str):
             if cid:
                 try:
                     with _db() as db_chk:
-                        sess_other = mem_db.get_any_session_for_channel(db_chk, cid)
-                    if sess_other and sess_other != (sess_current or ""):
-                        _trace_joiner(
-                            "leave_due_to_other_session",
-                            {
-                                "cid": cid,
-                                "title": title,
-                                "sess_current": sess_current,
-                                "sess_other": sess_other,
-                                "url": url,
-                                "phase": "after_import_invite",
-                            },
+                        sess_other = _resolve_other_session_for_channel(
+                            cid,
+                            database_session=db_chk,
                         )
-                        try:
-                            from telethon.tl.functions.channels import LeaveChannelRequest
+                        if sess_other and sess_other != (sess_current or ""):
+                            _trace_joiner(
+                                "leave_due_to_other_session",
+                                {
+                                    "cid": cid,
+                                    "title": title,
+                                    "sess_current": sess_current,
+                                    "sess_other": sess_other,
+                                    "url": url,
+                                    "phase": "after_import_invite",
+                                },
+                            )
+                            try:
+                                from telethon.tl.functions.channels import LeaveChannelRequest
 
-                            await client(LeaveChannelRequest(ch))
-                        except Exception:
-                            _log_exc("ensure_join: leave other session (invite)")
-                        try:
-                            mem_db.delete_membership(db_chk, sess_current or "", cid)
-                        except Exception:
-                            _log_exc("ensure_join: delete_membership after leave (invite)")
-                        return "already", title, "invite", cid, invite_hash
+                                await client(LeaveChannelRequest(ch))
+                            except Exception:
+                                _log_exc("ensure_join: leave other session (invite)")
+                            try:
+                                mem_db.delete_membership(db_chk, sess_current or "", cid)
+                            except Exception:
+                                _log_exc("ensure_join: delete_membership after leave (invite)")
+                            return "already", title, "invite", cid, invite_hash
                 except Exception:
                     _log_exc("ensure_join: check other session after invite import")
 
@@ -646,30 +710,33 @@ async def ensure_join(client, url: str):
             if cid:
                 try:
                     with _db() as db_chk:
-                        sess_other = mem_db.get_any_session_for_channel(db_chk, cid)
-                    if sess_other and sess_other != (sess_current or ""):
-                        _trace_joiner(
-                            "leave_due_to_other_session",
-                            {
-                                "cid": cid,
-                                "title": title,
-                                "sess_current": sess_current,
-                                "sess_other": sess_other,
-                                "url": url,
-                                "phase": "after_join_public",
-                            },
+                        sess_other = _resolve_other_session_for_channel(
+                            cid,
+                            database_session=db_chk,
                         )
-                        try:
-                            from telethon.tl.functions.channels import LeaveChannelRequest
+                        if sess_other and sess_other != (sess_current or ""):
+                            _trace_joiner(
+                                "leave_due_to_other_session",
+                                {
+                                    "cid": cid,
+                                    "title": title,
+                                    "sess_current": sess_current,
+                                    "sess_other": sess_other,
+                                    "url": url,
+                                    "phase": "after_join_public",
+                                },
+                            )
+                            try:
+                                from telethon.tl.functions.channels import LeaveChannelRequest
 
-                            await client(LeaveChannelRequest(ent))
-                        except Exception:
-                            _log_exc("ensure_join: leave other session (public)")
-                        try:
-                            mem_db.delete_membership(db_chk, sess_current or "", cid)
-                        except Exception:
-                            _log_exc("ensure_join: delete_membership after leave (public)")
-                        return "already", title, "public", cid, invite_hash
+                                await client(LeaveChannelRequest(ent))
+                            except Exception:
+                                _log_exc("ensure_join: leave other session (public)")
+                            try:
+                                mem_db.delete_membership(db_chk, sess_current or "", cid)
+                            except Exception:
+                                _log_exc("ensure_join: delete_membership after leave (public)")
+                            return "already", title, "public", cid, invite_hash
                 except Exception:
                     _log_exc("ensure_join: check other session after public join")
             # якщо це був інвайт-URL, збережемо мапу/статус навіть у public-гілці

@@ -8,6 +8,8 @@ from sqlalchemy import func, select, update
 
 from app.admin_bot.db.session import SessionLocal
 from app.admin_bot.db import models as m
+from app.DAL import channel_session_assignment_operations as assignment_ops
+from app.DAL import channel_subscription_audit_operations as audit_ops
 from app.DAL import membership_operations as mem_db
 from app.DAL.watch_processing_operations import mark_matched as process_mark_matched
 from app.DAL.watch_events_operations import insert_watch_event
@@ -348,7 +350,21 @@ def accept_watch_candidate(
         if effective_session is None and channel_id:
             try:
                 with SessionLocal() as db_sess:
-                    effective_session = mem_db.get_any_session_for_channel(db_sess, int(channel_id))
+                    effective_session = assignment_ops.get_assigned_session_for_channel(
+                        int(channel_id),
+                        database_session=db_sess,
+                    )
+                    if (
+                        not effective_session
+                        and not audit_ops.should_bypass_positive_channel_cache(
+                            int(channel_id),
+                            database_session=db_sess,
+                        )
+                    ):
+                        effective_session = mem_db.get_any_session_for_channel(
+                            db_sess,
+                            int(channel_id),
+                        )
             except Exception:
                 effective_session = None
         try:

@@ -61,7 +61,12 @@ class _RoundRobin:
 _RR = _RoundRobin()
 
 
-async def get_ready_slot(max_wait_sec: int = 30, step: float = 2.0, preferred_session: Optional[str] = None):
+async def get_ready_slot(
+    max_wait_sec: int = 30,
+    step: float = 2.0,
+    preferred_session: Optional[str] = None,
+    fallback_to_round_robin: bool = True,
+):
     """
     Чекає появи готового клієнта з пулу (не busy, без кулдауна).
     Повертає slot або None після таймауту.
@@ -75,6 +80,10 @@ async def get_ready_slot(max_wait_sec: int = 30, step: float = 2.0, preferred_se
                 s_norm = s.name[:-8] if s.name.endswith(".session") else s.name
                 if s_norm == pref_norm:
                     return s
+            if not fallback_to_round_robin:
+                await asyncio.sleep(step)
+                waited += step
+                continue
             # якщо preferred не знайдений або не готовий, падаємо в RR
             slots = iter_ready_pool_clients()
         slot = _RR.pick(slots)

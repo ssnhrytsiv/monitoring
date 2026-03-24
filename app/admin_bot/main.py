@@ -7,7 +7,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from app.admin_bot.config import ADMIN_BOT_TOKEN
-from app.admin_bot.db.session import Base, engine
+from app.admin_bot.db.session import Base, engine, migrate_post_template_media, migrate_reply_flags
 from app.admin_bot.bot import router
 import logging
 
@@ -21,6 +21,8 @@ async def main() -> None:
 
     # Створюємо нові таблиці admin-бота, не чіпаючи існуючі
     Base.metadata.create_all(bind=engine)
+    migrate_reply_flags()
+    migrate_post_template_media()
 
     bot = Bot(token=ADMIN_BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())

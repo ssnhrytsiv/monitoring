@@ -23,6 +23,8 @@ class PostTemplatesDAO:
         threshold: float = 1.0,
         title: Optional[str] = None,
         links: Optional[str] = None,
+        photo_id: Optional[str] = None,
+        is_reply: bool = False,
     ) -> int:
         if not text:
             raise ValueError("text is empty")
@@ -44,6 +46,8 @@ class PostTemplatesDAO:
             created_at=int(time.time()),
             title=title,
             links=links,
+            photo_id=photo_id,
+            is_reply=bool(is_reply),
         )
         self.db.add(tpl)
         self.db.commit()
@@ -64,7 +68,7 @@ class PostTemplatesDAO:
 
     def list_templates_full(
         self, limit: int = 50
-    ) -> List[Tuple[int, str, str, float, int, Optional[str], Optional[str]]]:
+    ) -> List[Tuple[int, str, str, float, int, Optional[str], Optional[str], Optional[str]]]:
         rows = (
             self.db.query(m.PostTemplate)
             .order_by(m.PostTemplate.id.desc())
@@ -80,13 +84,14 @@ class PostTemplatesDAO:
                 int(r.created_at),
                 r.title,
                 r.links,
+                r.photo_id,
             )
             for r in rows
         ]
 
     def get_template_by_id(
         self, template_id: int
-    ) -> Optional[Tuple[int, str, str, float, int, Optional[str], Optional[str]]]:
+    ) -> Optional[Tuple[int, str, str, float, int, Optional[str], Optional[str], Optional[str]]]:
         r = (
             self.db.query(m.PostTemplate)
             .filter(m.PostTemplate.id == int(template_id))
@@ -103,7 +108,59 @@ class PostTemplatesDAO:
             int(r.created_at),
             r.title,
             r.links,
+            r.photo_id,
         )
+
+    def find_template_exact(
+        self,
+        text: str,
+        links: Optional[str] = None,
+    ) -> Optional[Tuple[int, str, str, float, int, Optional[str], Optional[str], Optional[str]]]:
+        if not text:
+            return None
+        query = self.db.query(m.PostTemplate).filter(m.PostTemplate.text == str(text))
+        if links is None:
+            query = query.filter(m.PostTemplate.links.is_(None))
+        else:
+            query = query.filter(m.PostTemplate.links == str(links))
+        r = query.order_by(m.PostTemplate.id.desc()).limit(1).one_or_none()
+        if not r:
+            return None
+        return (
+            int(r.id),
+            r.text,
+            r.mode,
+            float(r.threshold),
+            int(r.created_at),
+            r.title,
+            r.links,
+            r.photo_id,
+        )
+
+    def is_template_reply(self, template_id: int) -> bool:
+        r = (
+            self.db.query(m.PostTemplate.is_reply)
+            .filter(m.PostTemplate.id == int(template_id))
+            .limit(1)
+            .one_or_none()
+        )
+        if not r:
+            return False
+        return bool(r[0])
+
+    def set_template_reply(self, template_id: int, enabled: bool):
+        template = (
+            self.db.query(m.PostTemplate)
+            .filter(m.PostTemplate.id == int(template_id))
+            .limit(1)
+            .one_or_none()
+        )
+        if not template:
+            return None
+        template.is_reply = bool(enabled)
+        self.db.commit()
+        self.db.refresh(template)
+        return template
 
 
 # Функціональні обгортки для сумісності (db опційна)
@@ -114,12 +171,14 @@ def add_template(
     threshold: float = 1.0,
     title: Optional[str] = None,
     links: Optional[str] = None,
+    photo_id: Optional[str] = None,
+    is_reply: bool = False,
     db: Optional[Session] = None,
 ) -> int:
     if db is None:
         with SessionLocal() as session:
-            return PostTemplatesDAO(session).add_template(text, mode, threshold, title, links)
-    return PostTemplatesDAO(db).add_template(text, mode, threshold, title, links)
+            return PostTemplatesDAO(session).add_template(text, mode, threshold, title, links, photo_id, is_reply)
+    return PostTemplatesDAO(db).add_template(text, mode, threshold, title, links, photo_id, is_reply)
 
 
 def list_templates(limit: int = 50, db: Optional[Session] = None):
@@ -141,3 +200,24 @@ def get_template_by_id(template_id: int, db: Optional[Session] = None):
         with SessionLocal() as session:
             return PostTemplatesDAO(session).get_template_by_id(template_id)
     return PostTemplatesDAO(db).get_template_by_id(template_id)
+
+
+def find_template_exact(text: str, links: Optional[str] = None, db: Optional[Session] = None):
+    if db is None:
+        with SessionLocal() as session:
+            return PostTemplatesDAO(session).find_template_exact(text=text, links=links)
+    return PostTemplatesDAO(db).find_template_exact(text=text, links=links)
+
+
+def is_template_reply(template_id: int, db: Optional[Session] = None) -> bool:
+    if db is None:
+        with SessionLocal() as session:
+            return PostTemplatesDAO(session).is_template_reply(template_id)
+    return PostTemplatesDAO(db).is_template_reply(template_id)
+
+
+def set_template_reply(template_id: int, enabled: bool, db: Optional[Session] = None):
+    if db is None:
+        with SessionLocal() as session:
+            return PostTemplatesDAO(session).set_template_reply(template_id, enabled)
+    return PostTemplatesDAO(db).set_template_reply(template_id, enabled)

@@ -13,6 +13,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.exceptions import TelegramBadRequest
 
+from app.config import TEMPLATE_MEDIA_VAULT_CHAT_ID
 from app.watch_bot.states import CreateWatch, TemplateCreate
 from app.DAL import SessionLocal
 from app.DAL import sheet_projects_operations as spo
@@ -33,6 +34,7 @@ from app.watch_bot.services.channels_repo import (
     get_titles_by_channel_ids,
 )
 from app.utils.link_parser import sanitize_link
+from app.utils.watch_link_extractor import normalize_links_for_watch
 from app.admin_bot.services import admins as svc_admins
 from app.admin_bot.services import networks as svc_networks
 from app.admin_bot.services.networks import channel_hyperlink
@@ -46,6 +48,7 @@ log = logging.getLogger("bot_create_watch")
 _LINK_RE = re.compile(r'(?i)\b((?:https?://|tg://|t\.me/)[^\s<>"\'\]\)]+)')
 _ADMINS_PER_ROW = 2
 _ADMINS_PER_PAGE = 36
+_V2_MEDIA_PREFIX = "v2media:"
 
 
 def _try_int(s: str) -> Optional[int]:
@@ -81,7 +84,7 @@ def _load_template(template_id: int) -> Optional[dict]:
         tpl = post_watch_db.get_template_by_id(int(template_id))
         if not tpl:
             return None
-        _, tpl_html, tpl_mode, tpl_thr, created_at, tpl_title, tpl_links_json = tpl
+        _, tpl_html, tpl_mode, tpl_thr, created_at, tpl_title, tpl_links_json, tpl_photo_id = tpl
         return {
             "html": tpl_html,
             "links_json": tpl_links_json,
@@ -89,10 +92,38 @@ def _load_template(template_id: int) -> Optional[dict]:
             "threshold": tpl_thr,
             "title": tpl_title,
             "created_at": created_at,
+            "photo_id": tpl_photo_id,
+            "is_reply": bool(post_watch_db.is_template_reply(int(template_id))),
         }
     except Exception:
         log.warning("watch_net: failed to load template id=%s", template_id, exc_info=True)
         return None
+
+
+def _template_preview_kb(template_id: int, is_reply: bool) -> InlineKeyboardMarkup:
+    toggle_text = "💬 Ответка: Вкл" if is_reply else "💬 Ответка: Выкл"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=toggle_text, callback_data=f"tpl:toggle_reply:{template_id}")],
+            [InlineKeyboardButton(text="⬅️ До шаблонів", callback_data="menu:list_templates")],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")],
+        ]
+    )
+
+
+def _render_template_preview_text(template_id: int, template_row: tuple, is_reply: bool) -> str:
+    template_text = str(template_row[1] or "").strip()
+    template_title = str(template_row[5] or f"Template #{template_id}").strip()
+    reply_label = "Так" if is_reply else "Ні"
+    preview_body = template_text[:3000]
+    if len(template_text) > len(preview_body):
+        preview_body = preview_body.rstrip() + "…"
+    return (
+        f"<b>Шаблон #{template_id}</b>\n"
+        f"<b>Назва:</b> {html.escape(template_title)}\n"
+        f"<b>Ответка:</b> {reply_label}\n\n"
+        f"{html.escape(preview_body)}"
+    )
 
 
 def _admins_kb(page: int = 0):
@@ -392,39 +423,7 @@ def _collect_links_from_aiogram(src: Message, plain_text: str) -> List[str]:
                 merged.append(full_s)
         links = merged
 
-    # 4) нормалізація + відрізання HTML-хвостів
-    norm_links: List[str] = []
-    for u in links:
-        s = str(u).strip()
-        if not s:
-            continue
-
-        # базова нормалізація (tg://, @user, tps:// → https://t.me/...)
-        try:
-            s = sanitize_link(s)
-        except Exception:
-            pass
-
-        # якщо після t.me/... є шмат типу "">Текст</a — обрізаємо його
-        low = s.lower()
-        tpos = low.find("t.me/")
-        if tpos != -1:
-            cut = len(s)
-            for ch in ('"', '<'):
-                idx = s.find(ch, tpos)
-                if idx != -1:
-                    cut = min(cut, idx)
-            if cut != len(s):
-                s = s[:cut].rstrip('.,;:)]}>')
-                try:
-                    s = sanitize_link(s)
-                except Exception:
-                    pass
-
-        if s:
-            norm_links.append(s)
-
-    return _unique_preserve(norm_links)
+    return normalize_links_for_watch(links)
 
 
 def _extract_targets_from_message(msg: Message) -> List[str]:
@@ -443,7 +442,7 @@ def _extract_targets_from_message(msg: Message) -> List[str]:
     return _extract_targets(plain_text)
 
 
-async def _create_template_from_source(src: Message) -> Optional[tuple[int, str]]:
+def _extract_template_text_parts(src: Message) -> tuple[str, str, str]:
     html_text = (
         getattr(src, "html_text", None)
         or getattr(src, "text_html", None)
@@ -452,6 +451,75 @@ async def _create_template_from_source(src: Message) -> Optional[tuple[int, str]
     )
     plain_text = (getattr(src, "text", None) or getattr(src, "caption", None) or "").strip()
     text_for_template = (html_text or plain_text or "").strip()
+    return str(html_text or ""), plain_text, text_for_template
+
+
+def _message_has_template_media(src: Message) -> bool:
+    return bool(
+        getattr(src, "photo", None)
+        or getattr(src, "video", None)
+        or getattr(src, "animation", None)
+    )
+
+
+def _build_vault_only_media_payload(chat_id: int, message_id: int) -> str:
+    return (
+        f'{_V2_MEDIA_PREFIX}'
+        f'{{"type":"photo","ids":{{}},"vault":{{"chat_id":{int(chat_id)},"message_id":{int(message_id)}}}}}'
+    )
+
+
+async def _build_template_media_payload_from_source(src: Message) -> Optional[str]:
+    if not _message_has_template_media(src):
+        return None
+
+    target_chat_id = int(TEMPLATE_MEDIA_VAULT_CHAT_ID or 0)
+    if not target_chat_id:
+        log.warning(
+            "create_template: media present but TEMPLATE_MEDIA_VAULT_CHAT_ID is not configured; source=%s:%s",
+            getattr(getattr(src, "chat", None), "id", None),
+            getattr(src, "message_id", None),
+        )
+        return None
+
+    bot = getattr(src, "bot", None)
+    if bot is None:
+        log.warning(
+            "create_template: media present but message.bot is missing; source=%s:%s",
+            getattr(getattr(src, "chat", None), "id", None),
+            getattr(src, "message_id", None),
+        )
+        return None
+
+    try:
+        copied = await bot.copy_message(
+            chat_id=target_chat_id,
+            from_chat_id=int(src.chat.id),
+            message_id=int(src.message_id),
+            disable_notification=True,
+        )
+        copied_message_id = _try_int(getattr(copied, "message_id", None))
+        if not copied_message_id:
+            log.warning(
+                "create_template: media vault copy returned empty message_id; source=%s:%s target=%s",
+                getattr(src.chat, "id", None),
+                getattr(src, "message_id", None),
+                target_chat_id,
+            )
+            return None
+        return _build_vault_only_media_payload(target_chat_id, copied_message_id)
+    except Exception:
+        log.exception(
+            "create_template: media vault copy failed; source=%s:%s target=%s",
+            getattr(src.chat, "id", None),
+            getattr(src, "message_id", None),
+            target_chat_id,
+        )
+        return None
+
+
+async def _create_template_from_source(src: Message) -> Optional[tuple[int, str, bool]]:
+    _html_text, plain_text, text_for_template = _extract_template_text_parts(src)
 
     if not text_for_template:
         log.info("create_template: empty text_for_template (message_id=%s)", getattr(src, "message_id", None))
@@ -465,6 +533,9 @@ async def _create_template_from_source(src: Message) -> Optional[tuple[int, str]
         links_json = None
 
     title = _first_line_title(plain_text or text_for_template)
+    has_media = _message_has_template_media(src)
+    photo_id = await _build_template_media_payload_from_source(src)
+    media_ready = (not has_media) or bool(photo_id)
 
     try:
         from app.DAL import post_templates_operations as pdb
@@ -478,32 +549,32 @@ async def _create_template_from_source(src: Message) -> Optional[tuple[int, str]
         return None
 
     try:
-        res = fn(text=text_for_template, title=title, mode="exact", links=links_json)
+        res = fn(text=text_for_template, title=title, mode="exact", links=links_json, photo_id=photo_id)
         tid = _parse_template_id(res)
         if tid:
             log.info("create_template: created template id=%s title=%s", tid, title)
-            return tid, title
+            return tid, title, media_ready
     except TypeError:
         try:
-            res = fn(text=text_for_template, title=title, links=links_json)
+            res = fn(text=text_for_template, title=title, links=links_json, photo_id=photo_id)
             tid = _parse_template_id(res)
             if tid:
                 log.info("create_template: created template id=%s title=%s (fallback no mode)", tid, title)
-                return tid, title
+                return tid, title, media_ready
         except TypeError:
             try:
                 res = fn(text=text_for_template, title=title)
                 tid = _parse_template_id(res)
                 if tid:
                     log.info("create_template: created template id=%s title=%s (fallback no links)", tid, title)
-                    return tid, title
+                    return tid, title, media_ready
             except TypeError:
                 try:
                     res = fn(text_for_template)
                     tid = _parse_template_id(res)
                     if tid:
                         log.info("create_template: created template id=%s (legacy signature)", tid)
-                        return tid, title
+                        return tid, title, media_ready
                 except Exception:
                     log.exception("create_template: add_template failed (legacy)")
                     return None
@@ -767,7 +838,12 @@ async def pick_admin_for_watch(cb: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "menu:list_templates")
 async def list_templates(cb: CallbackQuery, state: FSMContext):
     templates = post_watch_db.list_templates_full(limit=50)
-    items = [{"id": t[0], "title": t[5]} for t in templates]
+    items = []
+    for t in templates:
+        template_id = int(t[0])
+        template_title = t[5]
+        title_prefix = "💬 " if post_watch_db.is_template_reply(template_id) else ""
+        items.append({"id": template_id, "title": f"{title_prefix}{template_title or f'Template #{template_id}'}"})
     kb = templates_kb(items)
     await state.clear()
     await cb.message.edit_text("Шаблони постів:", reply_markup=kb, disable_web_page_preview=True)
@@ -778,6 +854,54 @@ async def list_templates(cb: CallbackQuery, state: FSMContext):
 async def tpl_add_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(TemplateCreate.title)
     await cb.message.edit_text("Надішли назву для шаблону.", reply_markup=back_to_menu_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("tpl:toggle_reply:"))
+async def toggle_template_reply(cb: CallbackQuery, state: FSMContext):
+    try:
+        template_id = int(cb.data.split(":")[-1])
+    except Exception:
+        await cb.answer()
+        return
+    template_row = post_watch_db.get_template_by_id(template_id)
+    if not template_row:
+        await cb.answer("Шаблон не знайдено", show_alert=False)
+        return
+    current_value = post_watch_db.is_template_reply(template_id)
+    updated_row = post_watch_db.set_template_reply(template_id, not current_value)
+    updated_is_reply = bool(getattr(updated_row, "is_reply", False)) if updated_row is not None else (not current_value)
+    await cb.message.edit_text(
+        _render_template_preview_text(template_id, template_row, updated_is_reply),
+        reply_markup=_template_preview_kb(template_id, updated_is_reply),
+        disable_web_page_preview=True,
+        parse_mode="HTML",
+    )
+    await cb.answer("Ответка включена" if updated_is_reply else "Ответка выключена")
+
+
+@router.callback_query(F.data.startswith("tpl:"))
+async def show_template_preview(cb: CallbackQuery, state: FSMContext):
+    if cb.data == "tpl:add" or cb.data.startswith("tpl:toggle_reply:"):
+        await cb.answer()
+        return
+    try:
+        template_id = int(cb.data.split(":", 1)[1])
+    except Exception:
+        await cb.answer()
+        return
+    template_row = post_watch_db.get_template_by_id(template_id)
+    if not template_row:
+        await cb.answer("Шаблон не знайдено", show_alert=False)
+        return
+    is_reply = post_watch_db.is_template_reply(template_id)
+    await state.clear()
+    await cb.message.edit_text(
+        _render_template_preview_text(template_id, template_row, is_reply),
+        reply_markup=_template_preview_kb(template_id, is_reply),
+        disable_web_page_preview=True,
+        parse_mode="HTML",
+    )
     await cb.answer()
 
 
@@ -794,16 +918,26 @@ async def tpl_add_title(m: Message, state: FSMContext):
 
 @router.message(TemplateCreate.body)
 async def tpl_add_body(m: Message, state: FSMContext):
-    body = m.html_text or m.text or ""
+    _html_text, _plain_text, body = _extract_template_text_parts(m)
     body = body.strip()
     if not body:
         await m.answer("Порожній текст. Надішли пост ще раз.", reply_markup=back_to_menu_kb())
         return
     data = await state.get_data()
     title = data.get("tpl_title") or "Без назви"
-    tpl_id = post_watch_db.add_template(text=body, title=title, mode="exact")
+    has_media = _message_has_template_media(m)
+    parsed_links = _collect_links_from_aiogram(m, str(getattr(m, "text", None) or getattr(m, "caption", None) or ""))
+    links_json = json.dumps(parsed_links, ensure_ascii=False) if parsed_links else None
+    photo_id = await _build_template_media_payload_from_source(m)
+    tpl_id = post_watch_db.add_template(text=body, title=title, mode="exact", links=links_json, photo_id=photo_id)
     await state.clear()
-    await m.answer(f"Шаблон збережено (id={tpl_id}).", reply_markup=back_to_menu_kb())
+    response_text = f"Шаблон збережено (id={tpl_id})."
+    if has_media and not photo_id:
+        response_text += (
+            "\n\n⚠️ Media не збережене у monitoring, бо TEMPLATE_MEDIA_VAULT_CHAT_ID не налаштований "
+            "або vault copy не вдався."
+        )
+    await m.answer(response_text, reply_markup=back_to_menu_kb())
 
 @router.callback_query(CreateWatch.admin_pick, F.data.startswith("watchnet:page:"))
 async def paginate_admins(cb: CallbackQuery):
@@ -885,6 +1019,7 @@ async def step_template_pick_manual(m: Message, state: FSMContext):
     tpl_created = await _create_template_from_source(src)
     tid = tpl_created[0] if tpl_created else None
     tpl_title = tpl_created[1] if tpl_created else None
+    media_ready = bool(tpl_created[2]) if tpl_created else True
 
     if not tid:
         await m.answer("Не зміг створити шаблон. Надішли числовий template_id або інший пост.")
@@ -892,10 +1027,13 @@ async def step_template_pick_manual(m: Message, state: FSMContext):
 
     await state.update_data(template_id=tid, template_title=tpl_title)
     await state.set_state(CreateWatch.day_pick)
-    await m.answer(
-        f"Шаблон додано (id={tid}). Обери день закінчення вікна:",
-        reply_markup=_watch_day_kb(),
-    )
+    response_text = f"Шаблон додано (id={tid}). Обери день закінчення вікна:"
+    if not media_ready:
+        response_text += (
+            "\n\n⚠️ Media не збережене у monitoring, бо TEMPLATE_MEDIA_VAULT_CHAT_ID не налаштований "
+            "або vault copy не вдався."
+        )
+    await m.answer(response_text, reply_markup=_watch_day_kb())
 
 
 @router.callback_query(CreateWatch.day_pick, F.data.startswith("watch_day:"))
@@ -988,6 +1126,7 @@ async def _process_time_window_value(
     targets: List[str] = data.get("targets") or []
     tid = data.get("template_id")
     tpl_title = data.get("template_title")
+    is_reply_template = bool(post_watch_db.is_template_reply(int(tid))) if tid else False
 
     await state.update_data(
         selected_day=selected_day.isoformat(),
@@ -1054,6 +1193,7 @@ async def _process_time_window_value(
         f"targets:\n{targets_txt}\n\n"
         f"template_id: {tid or '—'}\n"
         f"Назва поста: {tpl_title or '—'}\n"
+        f"Ответка: {'Так' if is_reply_template else 'Ні'}\n"
         f"вікно: {mins} хв\n"
         f"до: {tw_end}\n"
     )
@@ -1111,6 +1251,7 @@ async def pick_project(cb: CallbackQuery, state: FSMContext):
     admin_id = data.get("admin_id")
     net_id = data.get("network_id")
     tw_end = data.get("time_window_end")
+    is_reply_template = bool(post_watch_db.is_template_reply(int(tid))) if tid else False
     proj_txt = proj
     cids: List[int] = []
     for t in targets:
@@ -1129,6 +1270,7 @@ async def pick_project(cb: CallbackQuery, state: FSMContext):
         f"Підтверди створення watch:\n\n"
         f"targets:\n{targets_txt}\n\n"
         f"template_id: {tid or '—'}\n"
+        f"Ответка: {'Так' if is_reply_template else 'Ні'}\n"
         f"вікно: {mins} хв\n"
         f"до: {tw_end}\n"
         f"проєкт: {proj_txt}\n"
@@ -1206,6 +1348,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
         tpl_html = None
         tpl_links_json = None
         tpl_plain = None
+        tpl_is_reply = False
         if tid:
             tpl_meta = _load_template(int(tid))
             if not tpl_meta:
@@ -1215,6 +1358,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                 return
             tpl_html = tpl_meta.get("html")
             tpl_links_json = tpl_meta.get("links_json")
+            tpl_is_reply = bool(tpl_meta.get("is_reply"))
         if not tpl_html:
             log.warning("watch_net: template id=%s has empty html", tid)
         else:
@@ -1280,7 +1424,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                     templates = post_watch_db.list_templates_full(limit=200)
                     best_ratio = 0.0
                     best_title = None
-                    for tpl_id, tpl_text, tpl_mode, tpl_threshold, tpl_created_at, tpl_title, tpl_links in templates:
+                    for tpl_id, tpl_text, tpl_mode, tpl_threshold, tpl_created_at, tpl_title, tpl_links, _tpl_photo_id in templates:
                         if not tpl_title:
                             continue
                         ratio = SequenceMatcher(None, tpl_plain, tpl_text or "").ratio()
@@ -1338,6 +1482,7 @@ async def confirm_yes(cb: CallbackQuery, state: FSMContext):
                     network_id=net_id,
                     group_id=group_id,
                     title=watch_title,
+                    is_reply=tpl_is_reply,
                 )
                 log.info(
                     "watch_net: created watch wid=%s cid=%s admin=%s net=%s project=%s links=%s",

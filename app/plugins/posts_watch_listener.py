@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from collections import Counter
 from datetime import datetime, timedelta
 from threading import Lock
@@ -14,6 +15,13 @@ import json
 from sqlalchemy import update
 
 from telethon import events
+from telethon.errors import (
+    FloodWaitError,
+    RpcCallFailError,
+    ServerError,
+    TimedOutError,
+    TimeoutError as TelethonTimeoutError,
+)
 from telethon.tl.types import Message
 
 from app.telethon_client import client as MAIN_CLIENT
@@ -23,7 +31,13 @@ from app.DAL import watch_events_operations as watch_events_db
 from app.DAL import watch_processing_operations as watch_proc_db
 from app.DAL import watch_candidates_operations as watch_candidates_db
 from app.services.html_match import exact_html_equal
-from app.services.account_pool import iter_pool_clients, session_name
+from app.services.account_pool import (
+    bump_cooldown,
+    find_slot_by_session_name,
+    iter_ready_pool_clients,
+    mark_flood,
+    session_name,
+)
 from app.utils.time_utils import MOSCOW_TIME_FORMAT, moscow_now
 from app.services.post_matcher import normalize_text, extract_links_norm
 from app.services import watch_event_reason_codes
@@ -66,6 +80,8 @@ if not trace_logger.handlers:
 
 
 _WATCH_NOTIFIER_GROUP_IDENTIFIER_CACHE: Dict[int, int | None] = {}
+VIEWS_TRANSIENT_RETRY_DELAY_SEC = 4 * 60
+VIEWS_FLOODWAIT_RETRY_BUFFER_SEC = 30
 
 
 def _parse_watch_identifier_from_trace_payload(trace_payload: dict[str, Any]) -> int | None:
@@ -317,6 +333,7 @@ WATCH_REASON_CODE_SUMMARY_SOURCE_EVENT_NAMES = {
     "match_decision_trail",
     "views_done",
     "views_entity_miss",
+    "views_access_lost",
     "views_message_not_found",
     "pending_expired",
     "edited_other_detected",
@@ -405,11 +422,14 @@ def _read_default_coverage_hours() -> float:
             return float(m) / 60.0
         except Exception:
             pass
-    h = os.getenv("WATCH_COVERAGE_HOURS", "24")
-    try:
-        return float(h)
-    except Exception:
-        return 24
+    h = os.getenv("WATCH_COVERAGE_HOURS")
+    if h:
+        try:
+            return float(h)
+        except Exception:
+            pass
+    # Default coverage window: 23 hours 59 minutes
+    return (23.0 * 60.0 + 59.0) / 60.0
 
 
 DEFAULT_COVERAGE_HOURS: float = _read_default_coverage_hours()
@@ -479,6 +499,7 @@ def _db_get_watch_core(wid: int) -> Optional[Dict[str, Any]]:
             "expected_links_json": info.get("expected_links_json"),
             "time_window_start": info.get("time_window_start"),
             "time_window_end": info.get("time_window_end"),
+            "is_reply": bool(info.get("is_reply")),
         }
     except Exception:
         _pylog.exception("_db_get_watch_core failed (wid=%s)", wid)
@@ -488,6 +509,8 @@ def _db_get_watch_core(wid: int) -> Optional[Dict[str, Any]]:
 # --- HTML normalization ------------------------------------------------------
 
 _A_TAG_RE = re.compile(r'<a\s+href=(?P<q1>"|\')(?P<href>.+?)(?P=q1)>(?P<body>.*?)</a>', re.DOTALL | re.IGNORECASE)
+_TG_EMOJI_TAG_RE = re.compile(r"<tg-emoji\b(?P<attrs>[^>]*)>(?P<body>.*?)</tg-emoji>", re.DOTALL | re.IGNORECASE)
+_SPAN_TAG_RE = re.compile(r"<span\b(?P<attrs>[^>]*)>(?P<body>.*?)</span>", re.DOTALL | re.IGNORECASE)
 
 
 def _strip_simple_tags(html_fragment: str) -> str:
@@ -531,6 +554,51 @@ def _collect_links_from_html(text: str) -> list[str]:
     return links
 
 
+def _extract_html_attr_value(attrs_text: str, attr_name: str) -> str:
+    if not attrs_text:
+        return ""
+    attr_pattern = re.compile(
+        rf"\b{re.escape(attr_name)}\s*=\s*(?:\"(?P<dq>[^\"]+)\"|'(?P<sq>[^']+)')",
+        flags=re.IGNORECASE,
+    )
+    match = attr_pattern.search(attrs_text)
+    if not match:
+        return ""
+    value = match.group("dq") or match.group("sq") or ""
+    return str(value).strip()
+
+
+def _normalize_custom_emoji_markup(html_text: str) -> str:
+    """
+    Уніфікує різні HTML-представлення custom/premium emoji:
+      - <tg-emoji emoji-id="...">...</tg-emoji>
+      - <span data-custom-emoji-id="...">...</span>
+    до одного канонічного виду <tg-emoji emoji-id="...">...</tg-emoji>.
+    """
+    if not html_text:
+        return ""
+
+    def _replace_tg_emoji(match: re.Match) -> str:
+        attrs_text = str(match.group("attrs") or "")
+        body_text = str(match.group("body") or "")
+        emoji_id = _extract_html_attr_value(attrs_text, "emoji-id")
+        if not emoji_id:
+            return match.group(0)
+        return f'<tg-emoji emoji-id="{emoji_id}">{body_text}</tg-emoji>'
+
+    def _replace_span(match: re.Match) -> str:
+        attrs_text = str(match.group("attrs") or "")
+        body_text = str(match.group("body") or "")
+        emoji_id = _extract_html_attr_value(attrs_text, "data-custom-emoji-id")
+        if not emoji_id:
+            return match.group(0)
+        return f'<tg-emoji emoji-id="{emoji_id}">{body_text}</tg-emoji>'
+
+    normalized_html_text = _TG_EMOJI_TAG_RE.sub(_replace_tg_emoji, html_text)
+    normalized_html_text = _SPAN_TAG_RE.sub(_replace_span, normalized_html_text)
+    return normalized_html_text
+
+
 def _normalize_html_full(html_text: str) -> str:
     """
     Розширена нормалізація HTML для вотчів:
@@ -556,6 +624,9 @@ def _normalize_html_full(html_text: str) -> str:
 
     # 2) декодуємо HTML-ентіті (&quot; -> ", &nbsp; -> пробіл, &amp; -> &, ...)
     s = _html_mod.unescape(s)
+
+    # 2.05) уніфікуємо різні HTML-представлення premium/custom emoji
+    s = _normalize_custom_emoji_markup(s)
 
     # 2.1) ігноруємо службовий хештег #реклама (будь-який регістр, з/без лінка)
     s = re.sub(r"<a[^>]*>\s*#\s*реклама\s*</a>", "", s, flags=re.IGNORECASE)
@@ -591,6 +662,7 @@ def _normalize_html_for_edit(html_text: str) -> str:
     s = html_text.replace("\r\n", "\n")
     s = _normalize_html_links(s)
     s = _html_mod.unescape(s)
+    s = _normalize_custom_emoji_markup(s)
     s = re.sub(r"<a[^>]*>\s*#\s*реклама\s*</a>", "", s, flags=re.IGNORECASE)
     s = re.sub(r"#\s*реклама\b", "", s, flags=re.IGNORECASE)
     s = re.sub(r"<\s*br\s*/?>", "\n", s, flags=re.IGNORECASE)
@@ -663,6 +735,462 @@ def _normalize_html_links(html: str) -> str:
     return html
 
 
+def _get_watch_source_url_safe(watch_id: int) -> str | None:
+    try:
+        return watch_posts_db.get_watch_source_url(watch_id)
+    except Exception:
+        _pylog.exception("views: get_watch_source_url failed (wid=%s)", watch_id)
+        return None
+
+
+def _get_watch_source_session_safe(source_url: str | None) -> str | None:
+    if not source_url:
+        return None
+    try:
+        return watch_proc_db.get_session_for_source_url(source_url)
+    except Exception:
+        _pylog.exception(
+            "views: get_session_for_source_url failed (source_url=%s)",
+            source_url,
+        )
+        return None
+
+
+def _get_watch_matched_at_safe(watch_id: int) -> str | None:
+    try:
+        watch_information = watch_posts_db.get_watch_info(watch_id)
+    except Exception:
+        _pylog.exception("views: get_watch_info failed (wid=%s)", watch_id)
+        return None
+    matched_at_value = watch_information.get("matched_at") if watch_information else None
+    if matched_at_value is None:
+        return None
+    matched_at_text = str(matched_at_value).strip()
+    return matched_at_text or None
+
+
+def _parse_datetime_safe(datetime_text: str | None) -> datetime | None:
+    if not datetime_text:
+        return None
+    normalized_datetime_text = str(datetime_text).strip()
+    if not normalized_datetime_text:
+        return None
+    try:
+        return datetime.fromisoformat(normalized_datetime_text)
+    except Exception:
+        return None
+
+
+def _is_views_match_too_old(watch_id: int) -> bool:
+    max_match_age_hours = int(getattr(config, "WATCH_VIEWS_MAX_MATCH_AGE_HOURS", 0) or 0)
+    if max_match_age_hours <= 0:
+        return False
+    matched_at_datetime = _parse_datetime_safe(_get_watch_matched_at_safe(watch_id))
+    if matched_at_datetime is None:
+        return False
+    max_match_age_delta = timedelta(hours=max_match_age_hours)
+    return (moscow_now() - matched_at_datetime) > max_match_age_delta
+
+
+def _is_retryable_views_error(error: Exception | None) -> bool:
+    if error is None:
+        return False
+    retryable_error_classes = (
+        asyncio.TimeoutError,
+        TimeoutError,
+        ConnectionError,
+        OSError,
+        FloodWaitError,
+        TelethonTimeoutError,
+        TimedOutError,
+        ServerError,
+        RpcCallFailError,
+    )
+    return isinstance(error, retryable_error_classes)
+
+
+def _is_invite_source_url(source_url: str | None) -> bool:
+    normalized_source_url = (source_url or "").strip().lower()
+    return "/+" in normalized_source_url or "joinchat/" in normalized_source_url
+
+
+def _views_retry_delay_sec(error: Exception | None) -> int:
+    retry_delay_sec = VIEWS_TRANSIENT_RETRY_DELAY_SEC
+    if isinstance(error, FloodWaitError):
+        flood_wait_sec = int(getattr(error, "seconds", 0) or 0)
+        if flood_wait_sec > 0:
+            retry_delay_sec = max(
+                retry_delay_sec,
+                flood_wait_sec + VIEWS_FLOODWAIT_RETRY_BUFFER_SEC,
+            )
+    return retry_delay_sec
+
+
+def _views_retry_at_after_seconds(seconds: int) -> str:
+    return (moscow_now() + timedelta(seconds=max(0, int(seconds)))).strftime(MOSCOW_TIME_FORMAT)
+
+
+def _views_retry_at_str(error: Exception | None = None) -> str:
+    return (moscow_now() + timedelta(seconds=_views_retry_delay_sec(error))).strftime(MOSCOW_TIME_FORMAT)
+
+
+def _schedule_watch_views_retry_at(
+    *,
+    watch_id: int,
+    channel_id: int,
+    message_id: int,
+    matched_session: str | None,
+    session_used: str | None,
+    source_url: str | None,
+    next_retry_at: str,
+    retry_delay_sec: int,
+    error_type: str,
+    error_message: str,
+    flood_wait_sec: int | None = None,
+) -> None:
+    try:
+        watch_proc_db.reschedule_coverage_check(watch_id, next_retry_at)
+        watch_events_db.insert_watch_event(
+            watch_id,
+            "views_retry_scheduled",
+            json.dumps(
+                {
+                    "watch_id": watch_id,
+                    "channel_id": channel_id,
+                    "message_id": message_id,
+                    "matched_session": matched_session,
+                    "session_used": session_used,
+                    "source_url": source_url,
+                    "next_retry_at": next_retry_at,
+                    "retry_delay_sec": retry_delay_sec,
+                    "flood_wait_sec": flood_wait_sec,
+                    "error_type": error_type,
+                    "error_message": error_message,
+                    "reason_code": watch_event_reason_codes.WATCH_EVENT_REASON_CODE_VIEWS_RETRY_SCHEDULED,
+                }
+            ),
+        )
+    except Exception:
+        _pylog.exception(
+            "views: schedule retry failed (wid=%s next_retry_at=%s error=%s)",
+            watch_id,
+            next_retry_at,
+            error_message,
+        )
+    _pylog.warning(
+        "views: transient error, retry scheduled (wid=%s cid=%s mid=%s retry_at=%s delay=%ss sess=%s err=%s: %s)",
+        watch_id,
+        channel_id,
+        message_id,
+        next_retry_at,
+        retry_delay_sec,
+        session_used,
+        error_type,
+        error_message,
+    )
+    _trace(
+        "views_retry_scheduled",
+        watch_id=watch_id,
+        channel_id=channel_id,
+        message_id=message_id,
+        matched_session=matched_session,
+        session_used=session_used,
+        source_url=source_url,
+        next_retry_at=next_retry_at,
+        retry_delay_sec=retry_delay_sec,
+        flood_wait_sec=flood_wait_sec,
+        error_type=error_type,
+        error_message=error_message,
+        reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_VIEWS_RETRY_SCHEDULED,
+    )
+
+
+def _schedule_watch_views_retry(
+    *,
+    watch_id: int,
+    channel_id: int,
+    message_id: int,
+    matched_session: str | None,
+    session_used: str | None,
+    source_url: str | None,
+    error: Exception,
+) -> int:
+    retry_delay_sec = _views_retry_delay_sec(error)
+    next_retry_at = _views_retry_at_str(error)
+    error_type = error.__class__.__name__
+    error_message = str(error or "").strip()
+    flood_wait_sec = int(getattr(error, "seconds", 0) or 0) if isinstance(error, FloodWaitError) else None
+    _schedule_watch_views_retry_at(
+        watch_id=watch_id,
+        channel_id=channel_id,
+        message_id=message_id,
+        matched_session=matched_session,
+        session_used=session_used,
+        source_url=source_url,
+        next_retry_at=next_retry_at,
+        retry_delay_sec=retry_delay_sec,
+        error_type=error_type,
+        error_message=error_message,
+        flood_wait_sec=flood_wait_sec,
+    )
+    return retry_delay_sec
+
+
+def _schedule_watch_views_session_cooldown(
+    *,
+    watch_id: int,
+    channel_id: int,
+    message_id: int,
+    matched_session: str | None,
+    session_used: str | None,
+    source_url: str | None,
+    retry_delay_sec: int,
+    error_message: str,
+) -> None:
+    _schedule_watch_views_retry_at(
+        watch_id=watch_id,
+        channel_id=channel_id,
+        message_id=message_id,
+        matched_session=matched_session,
+        session_used=session_used,
+        source_url=source_url,
+        next_retry_at=_views_retry_at_after_seconds(retry_delay_sec),
+        retry_delay_sec=retry_delay_sec,
+        error_type="SessionCooldown",
+        error_message=error_message,
+        flood_wait_sec=None,
+    )
+
+
+def _apply_views_retry_cooldown(cli, error: Exception) -> int:
+    retry_delay_sec = _views_retry_delay_sec(error)
+    try:
+        if isinstance(error, FloodWaitError):
+            mark_flood(cli, retry_delay_sec)
+        else:
+            bump_cooldown(cli, retry_delay_sec)
+    except Exception:
+        _pylog.exception("views: failed to apply session cooldown (sess=%s)", session_name(cli))
+    return retry_delay_sec
+
+
+async def _resolve_views_message_via_source_url(
+    cli,
+    pool_map: dict[str, Any],
+    watch_id: int,
+    channel_id: int,
+    message_id: int,
+    prior_error: Exception | None = None,
+) -> tuple[str | None, Message | None, str | None, Exception | None]:
+    fallback_url = _get_watch_source_url_safe(watch_id)
+    if not fallback_url:
+        return None, None, None, None
+
+    fallback_cli = cli
+    fallback_session_used = session_name(cli)
+    rerouted_session_name = _get_watch_source_session_safe(fallback_url)
+    if rerouted_session_name:
+        rerouted_cli = pool_map.get(rerouted_session_name)
+        if rerouted_cli is not None and rerouted_cli is not cli:
+            fallback_cli = rerouted_cli
+            fallback_session_used = rerouted_session_name
+            _pylog.info(
+                "views: rerouted fallback session via source_url (wid=%s cid=%s url=%s from=%s to=%s)",
+                watch_id,
+                channel_id,
+                fallback_url,
+                session_name(cli),
+                rerouted_session_name,
+            )
+            _trace(
+                "views_fallback_session_reroute",
+                watch_id=watch_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                fallback_url=fallback_url,
+                session_used=session_name(cli),
+                rerouted_session=rerouted_session_name,
+            )
+
+    direct_session_error: Exception | None = None
+    if fallback_cli is not cli:
+        try:
+            message = await fallback_cli.get_messages(entity=channel_id, ids=message_id)
+            if message is not None:
+                _pylog.info(
+                    "views: resolved message via rerouted session/channel_id (wid=%s cid=%s mid=%s sess=%s)",
+                    watch_id,
+                    channel_id,
+                    message_id,
+                    fallback_session_used,
+                )
+                _trace(
+                    "views_fallback_rerouted_direct_message",
+                    watch_id=watch_id,
+                    channel_id=channel_id,
+                    message_id=message_id,
+                    fallback_url=fallback_url,
+                    session_used=fallback_session_used,
+                )
+                return fallback_url, message, fallback_session_used, None
+            _pylog.warning(
+                "views: rerouted direct get_messages returned no message (wid=%s cid=%s mid=%s sess=%s)",
+                watch_id,
+                channel_id,
+                message_id,
+                fallback_session_used,
+            )
+            _trace(
+                "views_fallback_rerouted_message_not_found",
+                watch_id=watch_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                fallback_url=fallback_url,
+                session_used=fallback_session_used,
+                reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_VIEWS_MESSAGE_NOT_FOUND,
+            )
+        except Exception as error:
+            direct_session_error = error
+            _pylog.exception(
+                "views: rerouted direct get_messages failed (wid=%s cid=%s mid=%s sess=%s): %s",
+                watch_id,
+                channel_id,
+                message_id,
+                fallback_session_used,
+                error,
+            )
+            _trace(
+                "views_fallback_rerouted_error",
+                watch_id=watch_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                fallback_url=fallback_url,
+                session_used=fallback_session_used,
+                error=str(error),
+            )
+
+    if _is_invite_source_url(fallback_url):
+        skipped_error = direct_session_error or prior_error
+        _pylog.info(
+            "views: skip invite source_url entity resolve to avoid CheckChatInvite flood (wid=%s cid=%s url=%s sess=%s)",
+            watch_id,
+            channel_id,
+            fallback_url,
+            fallback_session_used,
+        )
+        _trace(
+            "views_fallback_invite_skip",
+            watch_id=watch_id,
+            channel_id=channel_id,
+            message_id=message_id,
+            fallback_url=fallback_url,
+            session_used=fallback_session_used,
+            error=str(skipped_error) if skipped_error is not None else None,
+        )
+        return fallback_url, None, fallback_session_used, skipped_error
+
+    try:
+        entity = await fallback_cli.get_entity(fallback_url)
+        message = await fallback_cli.get_messages(entity=entity, ids=message_id)
+        if message is None:
+            _pylog.warning(
+                "views: fallback get_messages returned no message (wid=%s cid=%s mid=%s url=%s sess=%s)",
+                watch_id,
+                channel_id,
+                message_id,
+                fallback_url,
+                fallback_session_used,
+            )
+            _trace(
+                "views_fallback_message_not_found",
+                watch_id=watch_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                fallback_url=fallback_url,
+                session_used=fallback_session_used,
+                reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_VIEWS_MESSAGE_NOT_FOUND,
+            )
+        else:
+            _pylog.info(
+                "views: resolved entity via source_url (wid=%s cid=%s url=%s sess=%s)",
+                watch_id,
+                channel_id,
+                fallback_url,
+                fallback_session_used,
+            )
+            _trace(
+                "views_fallback_entity",
+                watch_id=watch_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                fallback_url=fallback_url,
+                session_used=fallback_session_used,
+            )
+        return fallback_url, message, fallback_session_used, None
+    except Exception as error:
+        _pylog.exception(
+            "views: fallback get_messages failed (wid=%s cid=%s url=%s sess=%s): %s",
+            watch_id,
+            channel_id,
+            fallback_url,
+            fallback_session_used,
+            error,
+        )
+        _trace(
+            "views_fallback_error",
+            watch_id=watch_id,
+            channel_id=channel_id,
+            message_id=message_id,
+            fallback_url=fallback_url,
+            session_used=fallback_session_used,
+            error=str(error),
+        )
+        return fallback_url, None, fallback_session_used, error
+
+
+def _mark_watch_views_access_lost(
+    *,
+    watch_id: int,
+    channel_id: int,
+    message_id: int,
+    matched_session: str | None,
+    session_used: str | None,
+    source_url: str | None,
+    detail_status: str,
+) -> None:
+    try:
+        watch_proc_db.mark_views_access_lost(watch_id)
+        watch_events_db.insert_watch_event(
+            watch_id,
+            "views_access_lost",
+            json.dumps(
+                {
+                    "watch_id": watch_id,
+                    "channel_id": channel_id,
+                    "message_id": message_id,
+                    "status": detail_status,
+                    "matched_session": matched_session,
+                    "session_used": session_used,
+                    "source_url": source_url,
+                    "reason_code": watch_event_reason_codes.WATCH_EVENT_REASON_CODE_VIEWS_ACCESS_LOST,
+                }
+            ),
+        )
+    except Exception:
+        _pylog.exception("views: mark_views_access_lost failed (wid=%s status=%s)", watch_id, detail_status)
+    _trace(
+        "views_access_lost",
+        watch_id=watch_id,
+        channel_id=channel_id,
+        message_id=message_id,
+        matched_session=matched_session,
+        session_used=session_used,
+        source_url=source_url,
+        detail_status=detail_status,
+        reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_VIEWS_ACCESS_LOST,
+    )
+
+
 # --- Workers -----------------------------------------------------------------
 
 
@@ -674,17 +1202,77 @@ async def _views_worker():
     log.info("posts_watch_listener: views worker started (tick=%ss)", COVERAGE_POLL_TICK_SEC)
     while True:
         try:
-            slots = iter_pool_clients()
+            slots = iter_ready_pool_clients()
             if not slots:
                 await asyncio.sleep(COVERAGE_POLL_TICK_SEC)
                 continue
             pool_map = {session_name(s.client): s.client for s in slots}
             any_cli = next(iter(pool_map.values()))
+            session_retry_blocked_until_epoch_map: dict[str, float] = {}
 
             due = watch_proc_db.list_due_coverage()
             for watch_id, channel_id, msg_id, matched_session in due:
-                cli = pool_map.get(matched_session) if matched_session else None
-                if cli is None:
+                if _is_views_match_too_old(watch_id):
+                    _mark_watch_views_access_lost(
+                        watch_id=watch_id,
+                        channel_id=channel_id,
+                        message_id=msg_id,
+                        matched_session=matched_session,
+                        session_used=matched_session,
+                        source_url=_get_watch_source_url_safe(watch_id),
+                        detail_status="matched_too_old",
+                    )
+                    continue
+
+                cli = None
+                blocked_until_epoch = (
+                    session_retry_blocked_until_epoch_map.get(matched_session)
+                    if matched_session
+                    else None
+                )
+                if blocked_until_epoch and blocked_until_epoch > time.time():
+                    retry_delay_sec = max(1, int(blocked_until_epoch - time.time()))
+                    _schedule_watch_views_session_cooldown(
+                        watch_id=watch_id,
+                        channel_id=channel_id,
+                        message_id=msg_id,
+                        matched_session=matched_session,
+                        session_used=matched_session,
+                        source_url=_get_watch_source_url_safe(watch_id),
+                        retry_delay_sec=retry_delay_sec,
+                        error_message="matched session is still cooling down",
+                    )
+                    continue
+
+                if matched_session:
+                    cli = pool_map.get(matched_session)
+                    if cli is None:
+                        matched_slot = find_slot_by_session_name(matched_session)
+                        if matched_slot and matched_slot.next_ready > time.time():
+                            retry_delay_sec = max(1, int(matched_slot.next_ready - time.time()))
+                            session_retry_blocked_until_epoch_map[matched_session] = matched_slot.next_ready
+                            _schedule_watch_views_session_cooldown(
+                                watch_id=watch_id,
+                                channel_id=channel_id,
+                                message_id=msg_id,
+                                matched_session=matched_session,
+                                session_used=matched_session,
+                                source_url=_get_watch_source_url_safe(watch_id),
+                                retry_delay_sec=retry_delay_sec,
+                                error_message="matched session is temporarily cooling down",
+                            )
+                            continue
+                        _mark_watch_views_access_lost(
+                            watch_id=watch_id,
+                            channel_id=channel_id,
+                            message_id=msg_id,
+                            matched_session=matched_session,
+                            session_used=matched_session,
+                            source_url=_get_watch_source_url_safe(watch_id),
+                            detail_status="session_unavailable",
+                        )
+                        continue
+                else:
                     cli = any_cli
                 _trace(
                     "views_due",
@@ -695,6 +1283,9 @@ async def _views_worker():
                     session_used=session_name(cli),
                 )
                 msg: Message | None = None
+                fallback_url: str | None = None
+                fallback_session_used: str | None = None
+                fallback_error: Exception | None = None
                 try:
                     msg = await cli.get_messages(entity=channel_id, ids=msg_id)
                 except Exception as e:
@@ -707,75 +1298,44 @@ async def _views_worker():
                         message_id=msg_id,
                         error=str(e),
                     )
-                    # Спроба підвантажити entity через source_url (username/інвайт)
-                    fallback_url: str | None = None
-                    try:
-                        fallback_url = watch_posts_db.get_watch_source_url(watch_id)
-                    except Exception:
-                        _pylog.exception("views: get_watch_source_url failed (wid=%s)", watch_id)
-
-                    if fallback_url:
-                        try:
-                            ent = await cli.get_entity(fallback_url)
-                            msg = await cli.get_messages(entity=ent, ids=msg_id)
-                            _pylog.info(
-                                "views: resolved entity via source_url (wid=%s cid=%s url=%s)",
-                                watch_id,
-                                channel_id,
-                                fallback_url,
-                            )
-                            _trace(
-                                "views_fallback_entity",
-                                watch_id=watch_id,
-                                channel_id=channel_id,
-                                message_id=msg_id,
-                                fallback_url=fallback_url,
-                            )
-                        except Exception as e2:
-                            _pylog.exception(
-                                "views: fallback get_messages failed (wid=%s cid=%s url=%s): %s",
-                                watch_id,
-                                channel_id,
-                                fallback_url,
-                                e2,
-                            )
-                            _trace(
-                                "views_fallback_error",
-                                watch_id=watch_id,
-                                channel_id=channel_id,
-                                message_id=msg_id,
-                                fallback_url=fallback_url,
-                                error=str(e2),
-                            )
-
-                    # якщо не змогли отримати entity — вважаємо покритим, щоб не зациклитись
-                    if msg is None:
-                        try:
-                            watch_proc_db.mark_done_views(watch_id, 0)
-                            watch_events_db.insert_watch_event(
-                                watch_id,
-                                "views",
-                                json.dumps(
-                                    {
-                                        "watch_id": watch_id,
-                                        "channel_id": channel_id,
-                                        "message_id": msg_id,
-                                        "views": 0,
-                                        "status": "entity_miss",
-                                        "reason_code": watch_event_reason_codes.WATCH_EVENT_REASON_CODE_VIEWS_ENTITY_MISS,
-                                    }
-                                ),
-                            )
-                        except Exception:
-                            _pylog.exception("views: mark_done_views failed (wid=%s) after entity miss", watch_id)
-                        msg = None
-                        _trace(
-                            "views_entity_miss",
+                    if config.WATCH_VIEWS_SOURCE_FALLBACK_ENABLED:
+                        fallback_url, msg, fallback_session_used, fallback_error = await _resolve_views_message_via_source_url(
+                            cli=cli,
+                            pool_map=pool_map,
                             watch_id=watch_id,
                             channel_id=channel_id,
                             message_id=msg_id,
-                            reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_VIEWS_ENTITY_MISS,
+                            prior_error=e,
                         )
+
+                    if msg is None:
+                        retry_error = fallback_error if _is_retryable_views_error(fallback_error) else (
+                            e if not fallback_url and _is_retryable_views_error(e) else None
+                        )
+                        if retry_error is not None:
+                            _schedule_watch_views_retry(
+                                watch_id=watch_id,
+                                channel_id=channel_id,
+                                message_id=msg_id,
+                                matched_session=matched_session,
+                                session_used=fallback_session_used or session_name(cli),
+                                source_url=fallback_url,
+                                error=retry_error,
+                            )
+                            session_retry_blocked_until_epoch_map[session_name(cli)] = (
+                                time.time() + _apply_views_retry_cooldown(cli, retry_error)
+                            )
+                            continue
+                        _mark_watch_views_access_lost(
+                            watch_id=watch_id,
+                            channel_id=channel_id,
+                            message_id=msg_id,
+                            matched_session=matched_session,
+                            session_used=fallback_session_used or session_name(cli),
+                            source_url=fallback_url,
+                            detail_status="access_lost",
+                        )
+                        continue
 
                 if msg is None:
                     _pylog.warning(
@@ -794,7 +1354,39 @@ async def _views_worker():
                         session_used=session_name(cli),
                         reason_code=watch_event_reason_codes.WATCH_EVENT_REASON_CODE_VIEWS_MESSAGE_NOT_FOUND,
                     )
-                    continue
+                    if config.WATCH_VIEWS_SOURCE_FALLBACK_ENABLED:
+                        fallback_url, msg, fallback_session_used, fallback_error = await _resolve_views_message_via_source_url(
+                            cli=cli,
+                            pool_map=pool_map,
+                            watch_id=watch_id,
+                            channel_id=channel_id,
+                            message_id=msg_id,
+                        )
+                    if msg is None:
+                        if _is_retryable_views_error(fallback_error):
+                            _schedule_watch_views_retry(
+                                watch_id=watch_id,
+                                channel_id=channel_id,
+                                message_id=msg_id,
+                                matched_session=matched_session,
+                                session_used=fallback_session_used or session_name(cli),
+                                source_url=fallback_url,
+                                error=fallback_error,
+                            )
+                            session_retry_blocked_until_epoch_map[session_name(cli)] = (
+                                time.time() + _apply_views_retry_cooldown(cli, fallback_error)
+                            )
+                            continue
+                        _mark_watch_views_access_lost(
+                            watch_id=watch_id,
+                            channel_id=channel_id,
+                            message_id=msg_id,
+                            matched_session=matched_session,
+                            session_used=fallback_session_used or session_name(cli),
+                            source_url=fallback_url,
+                            detail_status="message_not_found",
+                        )
+                        continue
 
                 views = int(getattr(msg, "views", 0) or 0)
                 _trace(
@@ -1528,7 +2120,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                     continue
 
             # exact match пройшов — фіксуємо matched
-            coverage_at = _calc_coverage_at()
+            coverage_at = None if bool(row.get("is_reply")) else _calc_coverage_at()
             matched_session = tag
             matched_ok = True
             try:
@@ -1542,6 +2134,7 @@ def _attach_listener_for_client(tag: str, cli) -> None:
                             "channel_id": cid,
                             "message_id": mid,
                             "session": matched_session,
+                            "is_reply": bool(row.get("is_reply")),
                             "reason_code": matched_reason_code,
                         }
                     ),
@@ -1606,6 +2199,8 @@ def _attach_listener_for_client(tag: str, cli) -> None:
         for wid in target_wids:
             wc = _db_get_watch_core(int(wid))
             if not wc:
+                continue
+            if bool(wc.get("is_reply")):
                 continue
             expected_html = wc.get("expected_text_hash")
             if not expected_html:

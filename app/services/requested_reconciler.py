@@ -19,9 +19,12 @@ from app.DAL import requested_operations as rdb
 from app.services import link_queue
 from app.services.account_pool import iter_pool_clients, session_name
 from app.DAL import SessionLocal
+from app.DAL import channel_session_assignment_operations as assignment_ops
+from app.DAL import channel_subscription_audit_operations as audit_ops
 from app.DAL import channels_operations as cho
 from app.DAL import invite_owners_operations as ioo
 from app.DAL.membership_operations import MembershipDAO
+from app.services.channel_session_cleanup import enforce_single_session_per_channel
 
 log = logging.getLogger("services.requested_reconciler")
 
@@ -96,6 +99,107 @@ def _get_invite_owner(invite_hash: str):
         return ioo.get_invite_owner(db, invite_hash)
     finally:
         db.close()
+
+
+def _should_bypass_positive_channel_cache(channel_id: int | None) -> bool:
+    if not channel_id:
+        return False
+    try:
+        return audit_ops.should_bypass_positive_channel_cache(int(channel_id))
+    except Exception:
+        return False
+
+
+def _repair_missing_channel_binding(
+    *,
+    channel_id: int | None,
+    current_session_name: str | None,
+    membership_db: MembershipDAO,
+    assignment_source: str,
+) -> bool:
+    if not channel_id or not current_session_name:
+        return False
+    if not _should_bypass_positive_channel_cache(channel_id):
+        return False
+
+    existing_assignment = None
+    try:
+        existing_assignment = assignment_ops.get_channel_session_assignment(int(channel_id))
+    except Exception:
+        log.debug(
+            "[reconciler] assignment lookup before missing repair failed cid=%s",
+            channel_id,
+            exc_info=True,
+        )
+
+    try:
+        assignment_ops.upsert_channel_session_assignment(
+            channel_id=int(channel_id),
+            session_name=current_session_name,
+            admin_id=(existing_assignment.admin_id if existing_assignment else None),
+            assignment_source=assignment_source,
+        )
+    except Exception:
+        log.exception(
+            "[reconciler] missing repair assignment upsert failed cid=%s sess=%s source=%s",
+            channel_id,
+            current_session_name,
+            assignment_source,
+        )
+
+    try:
+        audit_ops.refresh_channel_subscription_audit_for_channel(
+            int(channel_id),
+            present_session_name_list=[current_session_name],
+            audit_reason=assignment_source,
+        )
+    except Exception:
+        log.exception(
+            "[reconciler] missing repair audit refresh failed cid=%s sess=%s source=%s",
+            channel_id,
+            current_session_name,
+            assignment_source,
+        )
+    return True
+
+
+def _resolve_single_session_keep_session_name(
+    *,
+    channel_id: int | None,
+    current_session_name: str | None,
+    membership_db: MembershipDAO,
+    prefer_current_session: bool,
+) -> str | None:
+    if not channel_id or not current_session_name:
+        return current_session_name
+    if prefer_current_session:
+        return current_session_name
+
+    try:
+        assigned_session_name = assignment_ops.get_assigned_session_for_channel(
+            int(channel_id)
+        )
+        if assigned_session_name:
+            return assigned_session_name
+    except Exception:
+        log.debug(
+            "[reconciler] authoritative assignment lookup failed cid=%s",
+            channel_id,
+            exc_info=True,
+        )
+
+    try:
+        existing_session_name = membership_db.get_session_by_channel(int(channel_id))
+        if existing_session_name:
+            return existing_session_name
+    except Exception:
+        log.debug(
+            "[reconciler] authoritative membership lookup failed cid=%s",
+            channel_id,
+            exc_info=True,
+        )
+
+    return current_session_name
 
 
 def _find_channel(cid: int):
@@ -475,11 +579,33 @@ async def run_requested_reconciler() -> None:
                     if isinstance(ch_obj, (types.Channel, types.Chat)):
                         cid = int(ch_obj.id)
                         title = getattr(ch_obj, "title", None)
+                        repaired_missing_channel = False
+                        keep_session_name = sess
                         try:
                             with _membership_db() as membership_db:
                                 membership_db.map_invite_set(invite_hash, cid, title)
                                 membership_db.upsert_membership(sess, cid, "already")
                                 membership_db.invite_status_put(invite_hash, "already")
+                                repaired_missing_channel = _repair_missing_channel_binding(
+                                    channel_id=cid,
+                                    current_session_name=sess,
+                                    membership_db=membership_db,
+                                    assignment_source="requested_reconciler:invite_visible",
+                                )
+                                keep_session_name = (
+                                    _resolve_single_session_keep_session_name(
+                                        channel_id=cid,
+                                        current_session_name=sess,
+                                        membership_db=membership_db,
+                                        prefer_current_session=repaired_missing_channel,
+                                    )
+                                )
+                            if keep_session_name:
+                                await enforce_single_session_per_channel(
+                                    channel_id=cid,
+                                    keep_session_name=keep_session_name,
+                                    reason="requested_reconciler:invite_visible",
+                                )
                         except Exception:
                             pass
 
@@ -547,7 +673,28 @@ async def run_requested_reconciler() -> None:
                     for row in rows:
                         cid = row.channel_id
                         st = membership_db.get_membership(sess, cid)
+                        if st in ("joined", "already") and _should_bypass_positive_channel_cache(cid):
+                            log.info(
+                                "[reconciler.requested] ignore stale positive membership(%s,%s)=%s due to audit missing",
+                                sess,
+                                cid,
+                                st,
+                            )
+                            st = None
                         if st in ("joined", "already", "invalid", "blocked", "too_many"):
+                            if st in ("joined", "already"):
+                                keep_session_name = _resolve_single_session_keep_session_name(
+                                    channel_id=cid,
+                                    current_session_name=sess,
+                                    membership_db=membership_db,
+                                    prefer_current_session=False,
+                                )
+                                if keep_session_name:
+                                    await enforce_single_session_per_channel(
+                                        channel_id=cid,
+                                        keep_session_name=keep_session_name,
+                                        reason="requested_reconciler:finalized_membership",
+                                    )
                             rdb.clear(sess, cid)
                             log.debug("[reconciler.requested] finalized via membership(%s,%s)=%s -> cleared", sess, cid, st)
                             await asyncio.sleep(_sleep_delay(INTER_DELAY_REQ))
@@ -556,14 +703,36 @@ async def run_requested_reconciler() -> None:
                         mstat = await _is_member(client, cid)
 
                         if mstat is MemberStatus.MEMBER:
+                            repaired_missing_channel = False
+                            keep_session_name = sess
                             try:
                                 membership_db.upsert_membership(sess, cid, "already")
+                                repaired_missing_channel = _repair_missing_channel_binding(
+                                    channel_id=cid,
+                                    current_session_name=sess,
+                                    membership_db=membership_db,
+                                    assignment_source="requested_reconciler:member_check",
+                                )
+                                keep_session_name = (
+                                    _resolve_single_session_keep_session_name(
+                                        channel_id=cid,
+                                        current_session_name=sess,
+                                        membership_db=membership_db,
+                                        prefer_current_session=repaired_missing_channel,
+                                    )
+                                )
                             except Exception:
-                                pass
+                                repaired_missing_channel = False
                             try:
                                 membership_db.invite_status_put_for_channel(cid, "already")
                             except Exception:
                                 pass
+                            if keep_session_name:
+                                await enforce_single_session_per_channel(
+                                    channel_id=cid,
+                                    keep_session_name=keep_session_name,
+                                    reason="requested_reconciler:member_check",
+                                )
                             rdb.clear(sess, cid)
                             log.debug("[reconciler.requested] accepted -> already (sess=%s, cid=%s) -> cleared", sess, cid)
 

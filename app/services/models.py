@@ -10,7 +10,13 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 # Використовуємо спільний engine/Base/SessionLocal з admin_bot, щоб уникнути дублювання моделей
-from app.admin_bot.db.session import engine as _engine, SessionLocal, Base
+from app.admin_bot.db.session import (
+    engine as _engine,
+    SessionLocal,
+    Base,
+    migrate_post_template_media,
+    migrate_reply_flags,
+)
 from app.admin_bot.db import models as admin_models
 
 log = logging.getLogger("services.models")
@@ -145,4 +151,6 @@ def init_db() -> None:
     """
     log.info("[models] Initializing ORM metadata… (create_all)")
     Base.metadata.create_all(bind=_engine)
+    migrate_reply_flags()
+    migrate_post_template_media()
     log.info("[models] ORM metadata init done")

@@ -54,3 +54,28 @@ def migrate_admins_nullable() -> None:
         )
         conn.exec_driver_sql("DROP TABLE admins;")
         conn.exec_driver_sql("ALTER TABLE admins_new RENAME TO admins;")
+
+
+def migrate_reply_flags() -> None:
+    with engine.begin() as conn:
+        for table_name in ("post_template", "watch_posts"):
+            info = list(conn.exec_driver_sql(f"PRAGMA table_info('{table_name}')"))
+            if not info:
+                continue
+            column_names = {str(col[1]) for col in info}
+            if "is_reply" in column_names:
+                continue
+            conn.exec_driver_sql(
+                f"ALTER TABLE {table_name} ADD COLUMN is_reply INTEGER NOT NULL DEFAULT 0"
+            )
+
+
+def migrate_post_template_media() -> None:
+    with engine.begin() as conn:
+        info = list(conn.exec_driver_sql("PRAGMA table_info('post_template')"))
+        if not info:
+            return
+        column_names = {str(col[1]) for col in info}
+        if "photo_id" in column_names:
+            return
+        conn.exec_driver_sql("ALTER TABLE post_template ADD COLUMN photo_id TEXT")

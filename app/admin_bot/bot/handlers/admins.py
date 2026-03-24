@@ -18,12 +18,11 @@ from app.admin_bot.bot.states import AddAdminFlow, RefreshChannelsFlow
 from app.admin_bot.bot.keyboards import main_menu_kb
 from app.admin_bot.services.queue_worker import process_batch
 from app.admin_bot.services.subscription import refresh_channels_for_admin, finalize_refresh_confirmation
+from app.admin_bot.services.subscription import dedup_sessions_cleanup as dedup_cleanup
 from app.admin_bot.utils.messages import extract_links_from_message
 from app.services import link_queue
 from app.utils.link_parser import extract_bot_username
 from app.services import account_pool
-from app.services.account_pool import iter_pool_clients
-from telethon.tl import types as tl_types
 
 router = Router()
 log = logging.getLogger("admin_bot.handlers.admins")
@@ -117,85 +116,42 @@ async def cb_dedup_sessions(cb: CallbackQuery):
         return
     msg = await cb.message.answer("🔁 Сканую підписки сесій у пулі, шукаю дублікати...")
 
-    slots = iter_pool_clients()
-    if not slots:
+    scan_result = await dedup_cleanup.collect_duplicate_cleanup_scan_result()
+    if not scan_result.plan_item_list and not scan_result.error_text_list:
         await msg.edit_text("Пул сесій порожній (ACCOUNTS не налаштовані).")
         await cb.answer()
         return
 
-    session_channels: dict[str, dict[int, str]] = {}
-    errors = []
-
-    async def _collect(slot):
-        chans: dict[int, str] = {}
-        try:
-            async for dlg in slot.client.iter_dialogs():
-                ent = dlg.entity
-                if isinstance(ent, tl_types.Channel):
-                    cid = int(ent.id)
-                    title = getattr(ent, "title", "") or dlg.name or ""
-                    chans[cid] = title
-        except Exception as e:
-            errors.append(f"{slot.name}: {e}")
-        return chans
-
-    # зібрати канали для кожної сесії
-    for slot in slots:
-        chans = await _collect(slot)
-        session_channels[slot.name] = chans
-
-    # будуємо cid -> сесії
-    cid_map: dict[int, list[tuple[str, str]]] = {}
-    for sess, cid_title in session_channels.items():
-        for cid, title in cid_title.items():
-            cid_map.setdefault(cid, []).append((sess, title))
-
-    leave_plan: dict[str, set[int]] = {}
-    keep_map: dict[int, str] = {}
-    title_map: dict[int, str] = {}
-    for cid, sess_list in cid_map.items():
-        if len(sess_list) <= 1:
-            continue
-        # Залишаємо сесію з кінця відсортованого списку, а решту відписуємо.
-        keep = sorted(s for s, _ in sess_list)[-1]
-        keep_map[cid] = keep
-        title_map[cid] = sess_list[0][1] or ""
-        for sess, _ in sess_list:
-            if sess == keep:
-                continue
-            leave_plan.setdefault(sess, set()).add(cid)
-
-    if not leave_plan:
+    plan_item_list = scan_result.plan_item_list
+    if not plan_item_list:
         lines = ["Дублікатів не знайдено."]
-        if errors:
-            lines.append("Помилки збору: " + "; ".join(errors))
+        if scan_result.error_text_list:
+            lines.append("Помилки збору: " + "; ".join(scan_result.error_text_list))
         await msg.edit_text("\n".join(lines))
         await cb.answer()
         return
 
     # Формуємо попередній огляд
     preview = ["Знайдені дублікати підписок:"]
-    dup_cids = [cid for cid, lst in cid_map.items() if len(lst) > 1]
-    preview.append(f"Каналів з дублями: {len(dup_cids)}")
-    for cid in sorted(dup_cids)[:50]:
-        keep = keep_map.get(cid)
-        leave = []
-        for sess, _ in cid_map.get(cid, []):
-            if sess != keep:
-                leave.append(account_pool.session_display(sess))
-        title = title_map.get(cid) or ""
-        title_txt = title or f"channel_id={cid}"
-        preview.append(f"• {title_txt} (ID: {cid}) — keep {account_pool.session_display(keep) if keep else '?'}; leave {', '.join(leave) if leave else '—'}")
-    if len(dup_cids) > 50:
-        preview.append(f"... ще {len(dup_cids)-50} каналів")
-    if errors:
-        preview.append("Помилки збору: " + "; ".join(errors))
+    preview.append(f"Каналів з дублями: {len(plan_item_list)}")
+    for plan_item in plan_item_list[:50]:
+        title_text = plan_item.title or f"channel_id={plan_item.channel_id}"
+        keep_text = account_pool.session_display(plan_item.keep_session_name)
+        leave_text = dedup_cleanup.session_display_list(
+            plan_item.leave_session_name_list
+        ) or "—"
+        preview.append(
+            f"• {title_text} (ID: {plan_item.channel_id}) — keep {keep_text}"
+            f" [{dedup_cleanup.render_keep_reason(plan_item.keep_reason)}]; leave {leave_text}"
+        )
+    if len(plan_item_list) > 50:
+        preview.append(f"... ще {len(plan_item_list)-50} каналів")
+    if scan_result.error_text_list:
+        preview.append("Помилки збору: " + "; ".join(scan_result.error_text_list))
 
     token = str(uuid.uuid4())
     _DEDUP_PENDING[token] = {
-        "leave_plan": leave_plan,
-        "title_map": title_map,
-        "keep_map": keep_map,
+        "plan_item_list": plan_item_list,
     }
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -225,22 +181,43 @@ async def cb_dedup_confirm_yes(cb: CallbackQuery):
         await cb.message.edit_text("Дані для відписки не знайдено. Запусти дедуп знову.")
         await cb.answer()
         return
-    leave_plan: dict[str, set[int]] = plan.get("leave_plan") or {}
-    title_map: dict[int, str] = plan.get("title_map") or {}
-    keep_map: dict[int, str] = plan.get("keep_map") or {}
+    plan_item_list = plan.get("plan_item_list") or []
 
-    stats_lines = []
-    left_total = 0
-    errors_total = 0
-    for sess, cids in leave_plan.items():
-        res = await account_pool.leave_channels(sess, list(cids))
-        left_total += res.get("left", 0) or 0
-        errors_total += res.get("errors", 0) or 0
-        stats_lines.append(f"{account_pool.session_display(sess)}: left={res.get('left',0)} errors={res.get('errors',0)}")
+    execution_item_list = await dedup_cleanup.execute_duplicate_cleanup_plan(
+        plan_item_list
+    )
 
-    summary = [f"Відписка завершена. Каналів з дублями: {len(keep_map)}"]
-    summary.extend(stats_lines or ["Не було що відписувати"])
-    summary.append(f"Сумарно відписок: {left_total}, помилок: {errors_total}")
+    left_total = sum(
+        int((execution_item.cleanup_stats or {}).get("left", 0) or 0)
+        for execution_item in execution_item_list
+    )
+    deleted_total = sum(
+        int((execution_item.cleanup_stats or {}).get("deleted", 0) or 0)
+        for execution_item in execution_item_list
+    )
+    errors_total = sum(
+        int((execution_item.cleanup_stats or {}).get("errors", 0) or 0)
+        for execution_item in execution_item_list
+    )
+
+    summary = [
+        f"Відписка завершена. Каналів з дублями: {len(execution_item_list)}"
+    ]
+    for execution_item in execution_item_list[:50]:
+        cleanup_stats = execution_item.cleanup_stats or {}
+        summary.append(
+            f"• {execution_item.title or f'channel_id={execution_item.channel_id}'}"
+            f" — keep {account_pool.session_display(execution_item.keep_session_name)}"
+            f" [{dedup_cleanup.render_keep_reason(execution_item.keep_reason)}];"
+            f" left={cleanup_stats.get('left', 0)}"
+            f" deleted={cleanup_stats.get('deleted', 0)}"
+            f" errors={cleanup_stats.get('errors', 0)}"
+        )
+    if len(execution_item_list) > 50:
+        summary.append(f"... ще {len(execution_item_list)-50} каналів")
+    summary.append(
+        f"Сумарно: left={left_total}, deleted={deleted_total}, errors={errors_total}"
+    )
     await cb.message.edit_text("\n".join(summary))
     await cb.answer()
 
@@ -250,15 +227,20 @@ async def cmd_list_admins(m: Message):
     if not _is_allowed(m.from_user.id if m.from_user else None):
         return
     db = next(_db())
-    admins = svc_admins.list_admins(db)
+    admins = sorted(svc_admins.list_admins(db), key=lambda a: (a.display or "").lower())
     if not admins:
         await m.answer("Адмінів поки немає.")
         return
     lines = []
-    for a in admins:
-        disp = a.display or ""
-        uname = f"@{a.username}" if a.username else ""
-        lines.append(f"{a.id}. {disp} {uname} (tg_id={a.tg_id})")
+    for idx, a in enumerate(admins, start=1):
+        display = (a.display or "").strip() or f"id={a.id}"
+        details = []
+        if a.username:
+            details.append(f"@{a.username}")
+        details.append(f"id={a.id}")
+        if a.tg_id is not None:
+            details.append(f"tg_id={a.tg_id}")
+        lines.append(f"{idx}. {display} ({', '.join(details)})")
     await m.answer("\n".join(lines))
 
 
@@ -467,13 +449,52 @@ async def cb_refresh_collect_go(cb: CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
+    add_only = bool(data.get("add_only"))
     raw_texts: list[str] = data.get("raw_texts") or []
     raw_htmls: list[str] = data.get("raw_htmls") or raw_texts
     raw_text = "\n".join(raw_texts) if raw_texts else ""
     raw_html = "\n".join(raw_htmls) if raw_htmls else raw_text
     entities = data.get("entities") or []
-    batch_id = f"refresh:{cb.message.chat.id}:{int(time.time())}"
+    if add_only:
+        batch_id = f"missing-add:{cb.message.chat.id}:{int(time.time())}"
+        log.info(
+            "missing_add_collect_go: enqueue batch_id=%s admin_id=%s urls=%s",
+            batch_id,
+            admin.id,
+            len(urls),
+        )
+        added = link_queue.enqueue(
+            urls,
+            batch_id=batch_id,
+            origin_chat=cb.message.chat.id if cb.message else None,
+            origin_msg=getattr(cb.message, "message_id", None),
+            owner_display=admin.display,
+            owner_username=admin.username,
+            adopt_existing=True,
+            reset_next_try=True,
+        )
+        progress_anchor = await cb.message.answer(
+            f"Додано у чергу {added}/{len(urls)} посилань. Починаю обробку…"
+        )
+        await state.clear()
+        await cb.answer("Запускаю підписку…", show_alert=False)
+        asyncio.create_task(
+            process_batch(
+                batch_id=batch_id,
+                chat_id=cb.message.chat.id if cb.message else 0,
+                reply_msg=progress_anchor,
+                admin_display=admin.display or "",
+                admin_username=admin.username,
+                admin_tg_id=admin.tg_id,
+                raw_text=raw_text,
+                raw_html=raw_html,
+                entities=entities,
+                original_urls=urls,
+            )
+        )
+        return
 
+    batch_id = f"refresh:{cb.message.chat.id}:{int(time.time())}"
     await state.clear()
     await cb.answer("Запускаю підписку…", show_alert=False)
     asyncio.create_task(

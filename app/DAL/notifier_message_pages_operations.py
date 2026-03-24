@@ -147,6 +147,22 @@ def count_notification_pages_for_message_session(
         database_session.close()
 
 
+def count_notification_pages_for_session(
+    notification_page_session_identifier: str,
+) -> int:
+    database_session = SessionLocal()
+    try:
+        notification_page_rows = database_session.execute(
+            select(NotifierMessagePage.page_number).where(
+                NotifierMessagePage.notification_page_session_identifier
+                == str(notification_page_session_identifier),
+            )
+        ).all()
+        return len(notification_page_rows)
+    finally:
+        database_session.close()
+
+
 def get_notification_page_text_for_message(
     notification_page_session_identifier: str,
     chat_id: int,
@@ -161,6 +177,26 @@ def get_notification_page_text_for_message(
                 == str(notification_page_session_identifier),
                 NotifierMessagePage.chat_id == int(chat_id),
                 NotifierMessagePage.message_id == int(message_id),
+                NotifierMessagePage.page_number == int(requested_page_number),
+            )
+        ).scalar_one_or_none()
+        if notification_page_text_value is None:
+            return None
+        return str(notification_page_text_value)
+    finally:
+        database_session.close()
+
+
+def get_notification_page_text_for_session(
+    notification_page_session_identifier: str,
+    requested_page_number: int,
+) -> str | None:
+    database_session = SessionLocal()
+    try:
+        notification_page_text_value = database_session.execute(
+            select(NotifierMessagePage.page_text).where(
+                NotifierMessagePage.notification_page_session_identifier
+                == str(notification_page_session_identifier),
                 NotifierMessagePage.page_number == int(requested_page_number),
             )
         ).scalar_one_or_none()

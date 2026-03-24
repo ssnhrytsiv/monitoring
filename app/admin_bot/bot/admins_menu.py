@@ -18,8 +18,14 @@ from app.admin_bot.db.session import SessionLocal
 from app.admin_bot.services import admins as svc_admins
 from app.admin_bot.services import networks as svc_networks
 from app.admin_bot.bot.keyboards import page_kb
-from app.admin_bot.bot.states import NetworkFlow, AdminParamsFlow, AdminResultsFlow, AddAdminFlow
-from app.admin_bot.bot.handlers.admins import _is_allowed, _clean_urls
+from app.admin_bot.bot.states import (
+    NetworkFlow,
+    AdminParamsFlow,
+    AdminResultsFlow,
+    AddAdminFlow,
+    RefreshChannelsFlow,
+)
+from app.admin_bot.bot.handlers.admins import _is_allowed, _clean_urls, _refresh_collect_kb
 from app.admin_bot.utils.messages import extract_links_from_message
 from app.admin_bot.services.networks import channel_hyperlink
 from app.services import account_pool
@@ -129,6 +135,31 @@ def _format_audit_datetime(timestamp_seconds: Optional[int]) -> str:
         return "—"
 
 
+def _build_missing_channels_checked_at_footer(
+    missing_channel_record_list: List[Dict[str, Any]],
+) -> Optional[str]:
+    checked_at_timestamp_set = set()
+    for missing_channel_record in missing_channel_record_list:
+        checked_at_timestamp_value = missing_channel_record.get("checked_at")
+        if checked_at_timestamp_value is None:
+            continue
+        try:
+            checked_at_timestamp_set.add(int(checked_at_timestamp_value))
+        except Exception:
+            continue
+
+    if not checked_at_timestamp_set:
+        return None
+    if len(checked_at_timestamp_set) == 1:
+        checked_at_timestamp = next(iter(checked_at_timestamp_set))
+        return f"Перевірено: <code>{_format_audit_datetime(checked_at_timestamp)}</code>"
+
+    latest_checked_at_timestamp = max(checked_at_timestamp_set)
+    return (
+        f"Остання перевірка: <code>{_format_audit_datetime(latest_checked_at_timestamp)}</code>"
+    )
+
+
 def _build_missing_channels_view(admin_id: int, page_number: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     safe_page_number = max(0, int(page_number))
     missing_channel_record_list, total_missing_channel_count = (
@@ -169,17 +200,14 @@ def _build_missing_channels_view(admin_id: int, page_number: int = 0) -> tuple[s
                 channel_label_with_hyperlink = (
                     f'<a href="{html.escape(channel_url)}">{channel_label}</a>'
                 )
-            audit_status_value = html.escape(str(missing_channel_record.get("audit_status") or "unknown"))
-            checked_at_value = _format_audit_datetime(missing_channel_record.get("checked_at"))
-            missing_detected_at_value = _format_audit_datetime(
-                missing_channel_record.get("missing_detected_at")
-            )
-            lines.append(
-                f"• {channel_label_with_hyperlink}\n"
-                f"  Статус: <b>{audit_status_value}</b>\n"
-                f"  Missing з: <code>{missing_detected_at_value}</code>\n"
-                f"  Перевірено: <code>{checked_at_value}</code>"
-            )
+            lines.append(f"• {channel_label_with_hyperlink}")
+
+        checked_at_footer_text = _build_missing_channels_checked_at_footer(
+            missing_channel_record_list
+        )
+        if checked_at_footer_text:
+            lines.append("")
+            lines.append(checked_at_footer_text)
 
     keyboard_rows = []
     if total_page_count > 1:
@@ -201,6 +229,14 @@ def _build_missing_channels_view(admin_id: int, page_number: int = 0) -> tuple[s
                 ),
             ]
         )
+    keyboard_rows.append(
+        [
+            InlineKeyboardButton(
+                text="Добавить каналы",
+                callback_data=f"admin_missing_add_channels:{admin_id}",
+            )
+        ]
+    )
     keyboard_rows.append(
         [
             InlineKeyboardButton(
@@ -1820,6 +1856,34 @@ async def cb_admin_missing_channels(cb: CallbackQuery):
         return
     text, keyboard = _build_missing_channels_view(admin_id=admin_id, page_number=page_number)
     await _edit_text_safe(cb, text, keyboard, parse_mode="HTML")
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("admin_missing_add_channels:"))
+async def cb_admin_missing_add_channels(cb: CallbackQuery, state: FSMContext):
+    if not _is_allowed(cb.from_user.id if cb.from_user else None):
+        await cb.answer()
+        return
+    try:
+        admin_id = int((cb.data or "").split(":", 1)[1])
+    except Exception:
+        await cb.answer()
+        return
+    database_session = next(_db())
+    admin = svc_admins.get_admin_by_id(database_session, admin_id)
+    if not admin:
+        await cb.answer("Адміна не знайдено", show_alert=True)
+        return
+
+    await state.clear()
+    await state.set_state(RefreshChannelsFlow.waiting_links)
+    await state.update_data(admin_id=admin.id, add_only=True)
+    await cb.message.answer(
+        "Надішли список посилань каналів. Я добавлю тільки відсутні канали для цього адміна, "
+        "без очищення вже прив'язаних. Можна надсилати посилання кількома повідомленнями, "
+        "після цього натисни «Перейти до підписки».",
+        reply_markup=_refresh_collect_kb(),
+    )
     await cb.answer()
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy import (
     Column,
+    Boolean,
     Integer,
     BigInteger,
     String,
@@ -270,6 +271,19 @@ class Subscription(Base):
     join_error = Column(Text)
 
 
+class ChannelSessionAssignment(Base):
+    __tablename__ = "channel_session_assignments"
+
+    channel_id = Column(BigInteger, primary_key=True)
+    session_name = Column(Text, nullable=False, index=True)
+    admin_id = Column(Integer, index=True)
+    assigned_at = Column(Integer, nullable=False)
+    updated_at = Column(Integer, nullable=False, index=True)
+    last_ok_at = Column(Integer)
+    last_repair_at = Column(Integer)
+    assignment_source = Column(Text)
+
+
 class ChannelSubscriptionAudit(Base):
     __tablename__ = "channel_subscription_audit"
 
@@ -307,6 +321,8 @@ class PostTemplate(Base):
     created_at = Column(Integer, nullable=False)
     title = Column(Text)
     links = Column(Text)
+    photo_id = Column(Text)
+    is_reply = Column(Boolean, nullable=False, default=False)
 
 
 class SheetProject(Base):
@@ -433,6 +449,7 @@ class WatchPost(Base):
     cpm_at_post = Column(Float, nullable=True)
     price_at_post = Column(Float, nullable=True)
     title = Column(Text, nullable=True)
+    is_reply = Column(Boolean, nullable=False, default=False)
 
     __table_args__ = (
         Index(
@@ -440,6 +457,7 @@ class WatchPost(Base):
             "channel_id",
             "template_id",
             "expected_text_hash",
+            "time_window_end",
             unique=True,
             sqlite_where=text("status IN ('pending','matched')"),
         ),
@@ -505,6 +523,19 @@ def delete_memberships_by_channels(db: Session, chan_ids: List[int]) -> int:
     if not chan_ids:
         return 0
     return db.execute(delete(Membership).where(Membership.channel_id.in_(chan_ids))).rowcount or 0
+
+
+def delete_channel_session_assignments_by_channels(db: Session, chan_ids: List[int]) -> int:
+    if not chan_ids:
+        return 0
+    return (
+        db.execute(
+            delete(ChannelSessionAssignment).where(
+                ChannelSessionAssignment.channel_id.in_(chan_ids)
+            )
+        ).rowcount
+        or 0
+    )
 
 
 def delete_membership_status_by_channels(db: Session, chan_ids: List[int]) -> int:

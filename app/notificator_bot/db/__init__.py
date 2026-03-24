@@ -9,16 +9,16 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
+from app.utils.project_paths import resolve_project_path
+
 log = logging.getLogger("notificator.db")
 
 # База для нотифікатора (історично post_watchdog.sqlite3)
-DB_PATH = os.getenv("DB_PATH", "post_watchdog.sqlite3")
+DB_PATH = str(resolve_project_path(os.getenv("DB_PATH", "post_watchdog.sqlite3")))
 
 
 def _mk_sqlite_url(path: str) -> str:
-    if os.path.isabs(path):
-        return f"sqlite:///{path}"
-    return f"sqlite:///{os.path.abspath(path)}"
+    return f"sqlite:///{resolve_project_path(path)}"
 
 
 SQLALCHEMY_DATABASE_URI = _mk_sqlite_url(DB_PATH)

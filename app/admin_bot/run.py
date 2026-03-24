@@ -9,7 +9,13 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramNetworkError
 
 from app.admin_bot.config import ADMIN_BOT_TOKEN
-from app.admin_bot.db.session import Base, engine, migrate_admins_nullable
+from app.admin_bot.db.session import (
+    Base,
+    engine,
+    migrate_admins_nullable,
+    migrate_post_template_media,
+    migrate_reply_flags,
+)
 from app.admin_bot.bot import router
 
 
@@ -24,6 +30,8 @@ async def run_admin_bot():
     log = logging.getLogger("admin_bot.run")
     migrate_admins_nullable()
     Base.metadata.create_all(bind=engine)
+    migrate_reply_flags()
+    migrate_post_template_media()
 
     bot = Bot(token=ADMIN_BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())

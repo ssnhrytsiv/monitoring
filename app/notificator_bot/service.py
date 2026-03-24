@@ -31,6 +31,7 @@ from app.DAL.watch_events_operations import (
     mark_event_sent,
 )
 from app.DAL import watch_posts_operations as watch_posts_db
+from app.services.account_pool import session_display
 from app.utils.link_parser import extract_bot_username
 
 log = logging.getLogger("notificator.service")
@@ -45,6 +46,8 @@ PRIORITY = {
     "edited_candidate": 1,
     "matched": 1,
     "views": 1,
+    "views_access_lost": 1,
+    "views_retry_scheduled": 1,
     "edited_other": 1,
     "deleted": 1,
     "cancelled": 2,
@@ -96,6 +99,16 @@ def _admin_label(admin_id: int | None) -> str | None:
 
 def _get_watch_info(watch_id: int) -> dict:
     return watch_posts_db.get_watch_info(watch_id)
+
+
+def _humanize_session_label(raw_session_label: str | None) -> str | None:
+    normalized_session_label = str(raw_session_label or "").strip()
+    if not normalized_session_label:
+        return None
+    try:
+        return str(session_display(normalized_session_label)).strip() or normalized_session_label
+    except Exception:
+        return normalized_session_label
 
 
 def _channel_meta(channel_id: int, fallback_url: str | None) -> Tuple[str, str]:
@@ -196,6 +209,7 @@ def _admin_name(channel_info: dict | None, watch_info: dict) -> str:
 
 def _build_line(event_type: str, payload: dict, watch_info: dict, title: str, link: str, created_at: str) -> str:
     desc = event_type
+    is_reply_watch = bool(payload.get("is_reply") or watch_info.get("is_reply"))
     if event_type == "views":
         views = payload.get("views")
         if views is None:
@@ -205,18 +219,65 @@ def _build_line(event_type: str, payload: dict, watch_info: dict, title: str, li
             desc = f"Отстоял ✅ (просмотры: {views_fmt})"
         else:
             desc = "Отстоял ✅ (просмотры: —)"
+    elif event_type == "views_access_lost":
+        detail_status = str(payload.get("status") or "").strip().lower()
+        session_label = _humanize_session_label(
+            payload.get("matched_session")
+            or payload.get("session_used")
+            or watch_info.get("matched_session")
+        )
+        if detail_status == "message_not_found":
+            if session_label:
+                desc = (
+                    f"Не удалось снять просмотры ❗️ "
+                    f"Сообщение уже недоступно через сессию {session_label}"
+                )
+            else:
+                desc = "Не удалось снять просмотры ❗️ Сообщение уже недоступно"
+        elif detail_status == "matched_too_old":
+            desc = "Снятие просмотров пропущено ⚠️ Вотч слишком старый для catch-up"
+        elif detail_status == "session_unavailable":
+            if session_label:
+                desc = f"Не удалось снять просмотры ❗️ Сессия {session_label} недоступна"
+            else:
+                desc = "Не удалось снять просмотры ❗️ Сессия недоступна"
+        elif session_label:
+            desc = (
+                f"Не удалось снять просмотры ❗️ "
+                f"Сессия {session_label} потеряла доступ, обновите ссылку"
+            )
+        else:
+            desc = "Не удалось снять просмотры ❗️ Потерян доступ к каналу, обновите ссылку"
+    elif event_type == "views_retry_scheduled":
+        session_label = _humanize_session_label(
+            payload.get("session_used")
+            or payload.get("matched_session")
+            or watch_info.get("matched_session")
+        )
+        error_type = str(payload.get("error_type") or "TechnicalError").strip()
+        error_message = str(payload.get("error_message") or "").strip()
+        next_retry_at = str(payload.get("next_retry_at") or "").strip()
+        retry_suffix = f" Повтор: {next_retry_at}" if next_retry_at else ""
+        session_prefix = f" на сессии {session_label}" if session_label else ""
+        message_suffix = ""
+        if error_message:
+            message_suffix = f" ({error_message[:120]})"
+        desc = (
+            f"Не удалось снять просмотры сейчас ⚠️ "
+            f"{error_type}{session_prefix}{message_suffix}.{retry_suffix}".rstrip()
+        )
     elif event_type == "deleted":
-        desc = "Пост удалён❗️"
+        desc = "Ответка удалена ❗️" if is_reply_watch else "Пост удалён❗️"
     elif event_type == "edited_other":
-        desc = "Пост отредактирован❗️"
+        desc = "Ответка отредактирована ❗️" if is_reply_watch else "Пост отредактирован❗️"
     elif event_type == "matched":
-        desc = "Опубликован ☑️"
+        desc = "Ответка опубликована ☑️" if is_reply_watch else "Опубликован ☑️"
     elif event_type == "expired":
         desc = "Не вышел ❌"
     elif event_type == "cancelled":
         desc = "Вотч отменён"
-    elif event_type == "created":
-        desc = "Вотч создан"
+    elif event_type in {"created", "batch_created"}:
+        desc = "Ответка создана" if is_reply_watch else "Вотч создан"
     elif event_type == "pending":
         desc = "Ожидает публикации"
     elif event_type == "pending_candidate":
@@ -299,10 +360,14 @@ def _format_views_capture_datetime(dt_value: datetime | None) -> str | None:
 
 
 def _resolve_group_row_line_time_text(ev_type: str, group_row: dict) -> str:
-    if ev_type == "views":
+    if ev_type in {"views", "views_access_lost"}:
         views_capture_datetime_text = group_row.get("coverage_check_at")
         if views_capture_datetime_text:
             return str(views_capture_datetime_text)
+    if ev_type == "deleted":
+        deleted_at_datetime_text = group_row.get("deleted_at")
+        if deleted_at_datetime_text:
+            return str(deleted_at_datetime_text)
     updated_at_datetime_text = group_row.get("updated_at")
     if updated_at_datetime_text:
         return str(updated_at_datetime_text)
@@ -590,6 +655,74 @@ def _build_notification_pages_with_length_limit(
     return [page_without_lines_and_post_title[: message_max_length - 3] + "..."]
 
 
+def _build_page_index_footer(page_number: int, total_page_count: int) -> str:
+    return ""
+
+
+def _append_page_index_footers_if_fit(
+    notification_page_texts: List[str],
+    *,
+    message_max_length: int = TELEGRAM_MESSAGE_MAX_LENGTH,
+) -> List[str] | None:
+    total_page_count = len(notification_page_texts)
+    if total_page_count <= 1:
+        return notification_page_texts
+
+    notification_page_texts_with_index: List[str] = []
+    for page_number, page_text in enumerate(notification_page_texts, 1):
+        page_index_footer = _build_page_index_footer(page_number, total_page_count)
+        candidate_page_text = page_text + page_index_footer
+        if len(candidate_page_text) > message_max_length:
+            return None
+        notification_page_texts_with_index.append(candidate_page_text)
+
+    return notification_page_texts_with_index
+
+
+def _build_notification_pages_with_visible_index(
+    project: str,
+    admin: str,
+    lines: List[str],
+    total_views: int | None,
+    post_title: str | None,
+    group_id: int | None,
+    post_publish_date_text: str | None = None,
+    views_capture_date_time_text: str | None = None,
+    message_max_length: int = TELEGRAM_MESSAGE_MAX_LENGTH,
+) -> List[str]:
+    current_split_limit = message_max_length
+    last_notification_page_texts: List[str] = []
+
+    for _ in range(6):
+        last_notification_page_texts = _build_notification_pages_with_length_limit(
+            project,
+            admin,
+            lines,
+            total_views,
+            post_title,
+            group_id,
+            post_publish_date_text=post_publish_date_text,
+            views_capture_date_time_text=views_capture_date_time_text,
+            message_max_length=current_split_limit,
+        )
+
+        notification_page_texts_with_index = _append_page_index_footers_if_fit(
+            last_notification_page_texts,
+            message_max_length=message_max_length,
+        )
+        if notification_page_texts_with_index is not None:
+            return notification_page_texts_with_index
+
+        total_page_count = max(1, len(last_notification_page_texts))
+        max_page_index_footer_length = len(_build_page_index_footer(total_page_count, total_page_count))
+        next_split_limit = message_max_length - max_page_index_footer_length
+        if next_split_limit <= 0 or next_split_limit >= current_split_limit:
+            break
+        current_split_limit = next_split_limit
+
+    return last_notification_page_texts
+
+
 def collect_grouped_events(
     exclude_ids: set[int] | None = None,
 ) -> Tuple[
@@ -632,7 +765,7 @@ def collect_grouped_events(
         ts = _parse_ts(created_at)
 
         views_val = None
-        if ev_type == "views":
+        if ev_type in {"views", "views_access_lost"}:
             try:
                 views_val = int(payload.get("views"))
             except Exception:
@@ -652,7 +785,7 @@ def collect_grouped_events(
                 "matched_at_datetime_text": watch_info.get("matched_at"),
                 "views_capture_datetime_text": (
                     created_at
-                    if ev_type == "views"
+                    if ev_type in {"views", "views_access_lost"}
                     else watch_info.get("coverage_check_at")
                 ),
             },
@@ -690,6 +823,7 @@ def collect_grouped_events(
                     "edited": "edited_other",
                     # done після переглядів показуємо як “Отстоял просмотры”
                     "done": "views",
+                    "views_access_lost": "views_access_lost",
                 }.get(status, "pending")
                 chan_info = _fetch_channel(chan_id)
                 title, link = _channel_meta(chan_id, row.get("source_url"))
@@ -702,7 +836,10 @@ def collect_grouped_events(
                 line_time_text = _resolve_group_row_line_time_text(ev_type=ev_type, group_row=row)
                 line = _build_line(
                     ev_type,
-                    {"views": row.get("final_views")},
+                    {
+                        "views": row.get("final_views"),
+                        "matched_session": row.get("matched_session"),
+                    },
                     {
                         "source_url": row.get("source_url"),
                         "matched_at": row.get("matched_at"),
@@ -712,6 +849,8 @@ def collect_grouped_events(
                         "status": status,
                         "final_views": row.get("final_views"),
                         "title": row.get("title"),
+                        "is_reply": row.get("is_reply"),
+                        "matched_session": row.get("matched_session"),
                     },
                     title,
                     link,
@@ -868,7 +1007,7 @@ async def send_notifications(bot: Bot, debounce_sec: int = 60) -> None:
 
         post_publish_date_text, views_capture_date_time_text = _extract_notification_footer_datetime_texts(entries)
 
-        notification_page_texts = _build_notification_pages_with_length_limit(
+        notification_page_texts = _build_notification_pages_with_visible_index(
             project,
             admin,
             lines,
@@ -917,15 +1056,12 @@ async def send_notifications(bot: Bot, debounce_sec: int = 60) -> None:
                     finally:
                         remove_notification_page_session_for_message(chat_id, prev_msg_id)
 
-            notification_page_session_identifier: str | None = None
-            navigation_markup = None
-            if len(notification_page_texts) > 1:
-                notification_page_session_identifier = create_notification_page_session(notification_page_texts)
-                navigation_markup = build_notification_navigation_markup(
-                    notification_page_session_identifier,
-                    current_page_number=0,
-                    total_page_count=len(notification_page_texts),
-                )
+            notification_page_session_identifier: str | None = create_notification_page_session(notification_page_texts)
+            navigation_markup = build_notification_navigation_markup(
+                notification_page_session_identifier,
+                current_page_number=0,
+                total_page_count=len(notification_page_texts),
+            )
 
             try:
                 sent_msg = await bot.send_message(
